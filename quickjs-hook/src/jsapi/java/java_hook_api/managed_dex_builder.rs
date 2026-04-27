@@ -211,6 +211,24 @@ impl DexIrBuilder {
         self.instrs.push(IrInstr::Goto16 { target });
     }
 
+    pub(super) fn packed_switch(&mut self, reg: u8, first_key: i32, targets: Vec<DexLabel>, default_target: DexLabel) {
+        self.instrs.push(IrInstr::PackedSwitch {
+            reg,
+            first_key,
+            targets,
+            default_target,
+        });
+    }
+
+    pub(super) fn sparse_switch(&mut self, reg: u8, keys: Vec<i32>, targets: Vec<DexLabel>, default_target: DexLabel) {
+        self.instrs.push(IrInstr::SparseSwitch {
+            reg,
+            keys,
+            targets,
+            default_target,
+        });
+    }
+
     pub(super) fn new_instance(&mut self, dst: u8, ty: impl Into<String>) {
         self.instrs.push(IrInstr::NewInstance { dst, ty: ty.into() });
     }
@@ -362,7 +380,7 @@ impl DexIrBuilder {
         let mut offset = 0usize;
         for instr in &self.instrs {
             offsets.push(offset);
-            offset += instr.width();
+            offset += instr.width_at(offset);
         }
 
         for (idx, label) in self.labels.iter().enumerate() {
@@ -379,7 +397,11 @@ impl DexIrBuilder {
     }
 
     fn current_offset(&self) -> usize {
-        self.instrs.iter().map(IrInstr::width).sum()
+        let mut offset = 0usize;
+        for instr in &self.instrs {
+            offset += instr.width_at(offset);
+        }
+        offset
     }
 }
 
@@ -417,6 +439,18 @@ enum IrInstr {
     },
     Goto16 {
         target: DexLabel,
+    },
+    PackedSwitch {
+        reg: u8,
+        first_key: i32,
+        targets: Vec<DexLabel>,
+        default_target: DexLabel,
+    },
+    SparseSwitch {
+        reg: u8,
+        keys: Vec<i32>,
+        targets: Vec<DexLabel>,
+        default_target: DexLabel,
     },
     NewInstance {
         dst: u8,
@@ -586,7 +620,7 @@ impl IfCmpOp {
 }
 
 impl IrInstr {
-    fn width(&self) -> usize {
+    fn width_at(&self, offset: usize) -> usize {
         match self {
             IrInstr::Const4 { .. } => 1,
             IrInstr::Const16 { .. } => 2,
@@ -595,6 +629,8 @@ impl IrInstr {
             IrInstr::IfCmp { .. } => 2,
             IrInstr::IfEqz { .. } | IrInstr::IfNez { .. } => 2,
             IrInstr::Goto16 { .. } => 2,
+            IrInstr::PackedSwitch { targets, .. } => 5 + switch_payload_padding(offset + 5) + 4 + targets.len() * 2,
+            IrInstr::SparseSwitch { keys, .. } => 5 + switch_payload_padding(offset + 5) + 2 + keys.len() * 4,
             IrInstr::NewInstance { .. } => 2,
             IrInstr::CheckCast { .. } => 2,
             IrInstr::InstanceOf { .. } => 2,
@@ -675,6 +711,55 @@ impl IrInstr {
             IrInstr::Goto16 { target } => {
                 code.raw(0x0029);
                 code.raw(branch_offset(offset, target, labels, "goto/16")? as u16);
+            }
+            IrInstr::PackedSwitch {
+                reg,
+                first_key,
+                targets,
+                default_target,
+            } => {
+                require_byte(reg, "packed-switch reg")?;
+                code.raw(0x002b | ((reg as u16) << 8));
+                let payload_offset = 5 + switch_payload_padding(offset + 5);
+                write_i32_code_units(code, payload_offset as i32);
+                code.raw(0x0029);
+                code.raw(branch_offset(offset + 3, default_target, labels, "packed-switch default goto")? as u16);
+                if payload_offset > 5 {
+                    code.raw(0x0000);
+                }
+                code.raw(0x0100);
+                code.raw(targets.len() as u16);
+                write_i32_code_units(code, first_key);
+                for target in targets {
+                    write_i32_code_units(code, branch_offset_i32(offset, target, labels, "packed-switch target")?);
+                }
+            }
+            IrInstr::SparseSwitch {
+                reg,
+                keys,
+                targets,
+                default_target,
+            } => {
+                require_byte(reg, "sparse-switch reg")?;
+                if keys.len() != targets.len() {
+                    return Err("sparse-switch key/target count mismatch".to_string());
+                }
+                code.raw(0x002c | ((reg as u16) << 8));
+                let payload_offset = 5 + switch_payload_padding(offset + 5);
+                write_i32_code_units(code, payload_offset as i32);
+                code.raw(0x0029);
+                code.raw(branch_offset(offset + 3, default_target, labels, "sparse-switch default goto")? as u16);
+                if payload_offset > 5 {
+                    code.raw(0x0000);
+                }
+                code.raw(0x0200);
+                code.raw(keys.len() as u16);
+                for key in &keys {
+                    write_i32_code_units(code, *key);
+                }
+                for target in targets {
+                    write_i32_code_units(code, branch_offset_i32(offset, target, labels, "sparse-switch target")?);
+                }
             }
             IrInstr::NewInstance { dst, ty } => {
                 require_byte(dst, "new-instance dst")?;
@@ -954,6 +1039,33 @@ fn branch_offset(
         return Err(format!("{} branch offset out of range: {}", opname, delta));
     }
     Ok(delta as i16)
+}
+
+fn branch_offset_i32(
+    source_offset: usize,
+    target: DexLabel,
+    labels: &[Option<usize>],
+    opname: &str,
+) -> Result<i32, String> {
+    let target_offset = labels
+        .get(target.0)
+        .and_then(|v| *v)
+        .ok_or_else(|| format!("{} target label {} is not bound", opname, target.0))?;
+    let delta = target_offset as isize - source_offset as isize;
+    if delta < i32::MIN as isize || delta > i32::MAX as isize {
+        return Err(format!("{} branch offset out of range: {}", opname, delta));
+    }
+    Ok(delta as i32)
+}
+
+fn switch_payload_padding(offset_after_goto: usize) -> usize {
+    offset_after_goto & 1
+}
+
+fn write_i32_code_units(code: &mut DexCode, value: i32) {
+    let value = value as u32;
+    code.raw((value & 0xffff) as u16);
+    code.raw((value >> 16) as u16);
 }
 
 fn require_nibble(value: u8, what: &str) -> Result<(), String> {
@@ -2502,6 +2614,73 @@ fn emit_if_cmp(
     Ok(then_returns && else_returns)
 }
 
+fn emit_switch(
+    ir: &mut DexIrBuilder,
+    value: &DslValue,
+    cases: &[(i16, Vec<DslStmt>)],
+    default_stmts: Option<&[DslStmt]>,
+    emit_ctx: &mut EmitContext<'_>,
+) -> Result<bool, String> {
+    if cases.is_empty() {
+        return Err("switch requires at least one case".to_string());
+    }
+    let mut seen = BTreeSet::new();
+    for (literal, _) in cases {
+        if !seen.insert(*literal) {
+            return Err(format!("duplicate switch case {}", literal));
+        }
+    }
+
+    let switch_reg = emit_load_cmp_value(ir, value, "I", REG_TMP0, emit_ctx.layout, emit_ctx.dsl_ctx)?;
+    let default_label = ir.new_label();
+    let done_label = ir.new_label();
+    let case_labels = cases.iter().map(|_| ir.new_label()).collect::<Vec<_>>();
+
+    let mut label_by_key = BTreeMap::new();
+    for ((literal, _), label) in cases.iter().zip(case_labels.iter()) {
+        label_by_key.insert(*literal, *label);
+    }
+    let min_key = *seen.iter().next().ok_or_else(|| "switch requires at least one case".to_string())?;
+    let max_key = *seen.iter().next_back().ok_or_else(|| "switch requires at least one case".to_string())?;
+    let range_len = (max_key as i32 - min_key as i32 + 1) as usize;
+    if range_len <= cases.len() * 2 {
+        let targets = (min_key..=max_key)
+            .map(|key| *label_by_key.get(&key).unwrap_or(&default_label))
+            .collect::<Vec<_>>();
+        ir.packed_switch(switch_reg, min_key as i32, targets, default_label);
+    } else {
+        let keys = seen.iter().map(|key| *key as i32).collect::<Vec<_>>();
+        let targets = seen
+            .iter()
+            .map(|key| *label_by_key.get(key).unwrap_or(&default_label))
+            .collect::<Vec<_>>();
+        ir.sparse_switch(switch_reg, keys, targets, default_label);
+    }
+
+    ir.bind(default_label)?;
+    let default_returns = if let Some(stmts) = default_stmts {
+        emit_statements(ir, stmts, emit_ctx)?
+    } else {
+        false
+    };
+    if !default_returns {
+        ir.goto16(done_label);
+    }
+
+    let mut cases_all_return = true;
+    for ((_, stmts), label) in cases.iter().zip(case_labels.iter()) {
+        ir.bind(*label)?;
+        let case_returns = emit_statements(ir, stmts, emit_ctx)?;
+        if !case_returns {
+            ir.goto16(done_label);
+        }
+        cases_all_return &= case_returns;
+    }
+
+    ir.bind(done_label)?;
+    Ok(default_stmts.is_some() && default_returns && cases_all_return)
+}
+
 fn emit_cast(
     ir: &mut DexIrBuilder,
     value: &DslValue,
@@ -2844,6 +3023,20 @@ fn statements_max_invoke_words(stmts: &[DslStmt]) -> Result<u16, String> {
             } => value_max_invoke_words(value)?
                 .max(statements_max_invoke_words(then_stmts)?)
                 .max(statements_max_invoke_words(else_stmts)?),
+            DslStmt::Switch {
+                value,
+                cases,
+                default_stmts,
+            } => {
+                let mut words = value_max_invoke_words(value)?;
+                for (_, stmts) in cases {
+                    words = words.max(statements_max_invoke_words(stmts)?);
+                }
+                if let Some(stmts) = default_stmts {
+                    words = words.max(statements_max_invoke_words(stmts)?);
+                }
+                words
+            }
             DslStmt::Cast { value, .. } => value_max_invoke_words(value)?,
             DslStmt::ArrayLength { array } => value_max_invoke_words(array)?,
             DslStmt::ArrayGet { array, index, .. } => {
@@ -2928,6 +3121,17 @@ fn stmt_uses_orig(stmt: &DslStmt) -> bool {
         | DslStmt::IfInstanceOf {
             then_stmts, else_stmts, ..
         } => statements_use_orig(then_stmts) || statements_use_orig(else_stmts),
+        DslStmt::Switch {
+            cases,
+            default_stmts,
+            ..
+        } => {
+            cases.iter().any(|(_, stmts)| statements_use_orig(stmts))
+                || default_stmts
+                    .as_ref()
+                    .map(|stmts| statements_use_orig(stmts))
+                    .unwrap_or(false)
+        }
         _ => false,
     }
 }
@@ -2971,6 +3175,36 @@ fn analyze_return_flow(stmts: &[DslStmt]) -> ReturnFlow {
                     };
                 }
                 if !then_flow.falls_through && !else_flow.falls_through {
+                    return ReturnFlow {
+                        falls_through: false,
+                        has_non_orig_return: false,
+                    };
+                }
+            }
+            DslStmt::Switch {
+                cases,
+                default_stmts,
+                ..
+            } => {
+                let mut falls_through = default_stmts.is_none();
+                let mut has_non_orig_return = false;
+                for (_, stmts) in cases {
+                    let flow = analyze_return_flow(stmts);
+                    falls_through |= flow.falls_through;
+                    has_non_orig_return |= flow.has_non_orig_return;
+                }
+                if let Some(stmts) = default_stmts {
+                    let flow = analyze_return_flow(stmts);
+                    falls_through |= flow.falls_through;
+                    has_non_orig_return |= flow.has_non_orig_return;
+                }
+                if has_non_orig_return {
+                    return ReturnFlow {
+                        falls_through,
+                        has_non_orig_return: true,
+                    };
+                }
+                if !falls_through {
                     return ReturnFlow {
                         falls_through: false,
                         has_non_orig_return: false,
@@ -3022,6 +3256,18 @@ fn program_uses_orig_value(program: &DslProgram) -> Result<bool, String> {
                     visit(then_stmts, true, count)?;
                     visit(else_stmts, true, count)?;
                 }
+                DslStmt::Switch {
+                    cases,
+                    default_stmts,
+                    ..
+                } => {
+                    for (_, stmts) in cases {
+                        visit(stmts, true, count)?;
+                    }
+                    if let Some(stmts) = default_stmts {
+                        visit(stmts, true, count)?;
+                    }
+                }
                 _ => {}
             }
         }
@@ -3048,6 +3294,17 @@ fn statements_contain_return_orig(stmts: &[DslStmt]) -> bool {
         | DslStmt::IfInstanceOf {
             then_stmts, else_stmts, ..
         } => statements_contain_return_orig(then_stmts) || statements_contain_return_orig(else_stmts),
+        DslStmt::Switch {
+            cases,
+            default_stmts,
+            ..
+        } => {
+            cases.iter().any(|(_, stmts)| statements_contain_return_orig(stmts))
+                || default_stmts
+                    .as_ref()
+                    .map(|stmts| statements_contain_return_orig(stmts))
+                    .unwrap_or(false)
+        }
         _ => false,
     })
 }
@@ -3113,6 +3370,18 @@ fn collect_local_slots_from_stmts(
             } => {
                 collect_local_slots_from_stmts(then_stmts, slots, next)?;
                 collect_local_slots_from_stmts(else_stmts, slots, next)?;
+            }
+            DslStmt::Switch {
+                cases,
+                default_stmts,
+                ..
+            } => {
+                for (_, stmts) in cases {
+                    collect_local_slots_from_stmts(stmts, slots, next)?;
+                }
+                if let Some(stmts) = default_stmts {
+                    collect_local_slots_from_stmts(stmts, slots, next)?;
+                }
             }
             _ => {}
         }
@@ -3301,6 +3570,11 @@ fn emit_statement(ir: &mut DexIrBuilder, stmt: &DslStmt, emit_ctx: &mut EmitCont
             then_stmts,
             else_stmts,
         } => emit_if_instance_of(ir, value, class_name, then_stmts, else_stmts, emit_ctx),
+        DslStmt::Switch {
+            value,
+            cases,
+            default_stmts,
+        } => emit_switch(ir, value, cases, default_stmts.as_deref(), emit_ctx),
         DslStmt::ReturnOrig => {
             emit_return_orig(ir, emit_ctx)?;
             Ok(true)
@@ -3499,6 +3773,11 @@ enum DslStmt {
         class_name: String,
         then_stmts: Vec<DslStmt>,
         else_stmts: Vec<DslStmt>,
+    },
+    Switch {
+        value: DslValue,
+        cases: Vec<(i16, Vec<DslStmt>)>,
+        default_stmts: Option<Vec<DslStmt>>,
     },
     ReturnOrig,
     ReturnValue {
@@ -3978,17 +4257,11 @@ impl<'a> DslParser<'a> {
             return Err(self.err("switch requires at least one case"));
         }
 
-        let mut else_stmts = default_stmts.unwrap_or_default();
-        for (literal, then_stmts) in cases.into_iter().rev() {
-            else_stmts = vec![DslStmt::IfCmp {
-                op: IfCmpOp::Eq,
-                left: value.clone(),
-                right: DslValue::Int(literal),
-                then_stmts,
-                else_stmts,
-            }];
-        }
-        Ok(else_stmts.remove(0))
+        Ok(DslStmt::Switch {
+            value,
+            cases,
+            default_stmts,
+        })
     }
 }
 

@@ -220,6 +220,9 @@ Integer `switch` is supported with explicit blocks and automatic break:
 "}"
 ```
 
+Dense integer cases compile to dex `packed-switch`; sparse cases compile to
+dex `sparse-switch`.
+
 ### Returns
 
 High-frequency orig path:
