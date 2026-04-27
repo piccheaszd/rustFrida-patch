@@ -92,10 +92,10 @@ pub(super) struct GeneratedStringLiteral {
 
 mod descriptor;
 use descriptor::{
-    array_component_descriptor, build_method_sig, build_params_sig, common_value_descriptor,
-    descriptor_list_word_count, descriptor_to_java_class_name, descriptor_word_count, java_class_to_descriptor,
-    java_class_to_descriptor_or_primitive, parse_call_params, parse_method_params_signature, parse_method_signature,
-    return_is_object,
+    array_component_descriptor, build_method_sig, build_params_sig, common_value_descriptor_with_env,
+    descriptor_is_interface, descriptor_list_word_count, descriptor_to_java_class_name, descriptor_word_count,
+    java_class_to_descriptor, java_class_to_descriptor_or_primitive, object_assignability_score, parse_call_params,
+    parse_method_params_signature, parse_method_signature, resolve_field_with_env, return_is_object,
 };
 
 fn emit_return_from_orig(ir: &mut DexIrBuilder, return_type: &str) -> Result<(), String> {
@@ -121,19 +121,30 @@ fn emit_return_from_orig(ir: &mut DexIrBuilder, return_type: &str) -> Result<(),
 mod semantic;
 use semantic::validate_semantics;
 
-fn resolve_call_proto(
+fn resolve_call_proto_with_arg_types(
     env: JniEnv,
     stmt: &DslCallStmt,
     class_type: &str,
+    arg_types: Option<&[Option<String>]>,
 ) -> Result<(Vec<String>, String, String), String> {
     if let Ok((params, return_type)) = parse_method_signature(&stmt.sig) {
         return Ok((params, return_type, stmt.sig.clone()));
     }
 
-    let params = parse_method_params_signature(&stmt.sig)?;
-    let params_sig = build_params_sig(&params);
     let class_name = descriptor_to_java_class_name(class_type)?;
     let is_static = matches!(stmt.kind, DslCallKind::Static);
+    if stmt.sig.is_empty() {
+        let arg_types = arg_types.ok_or_else(|| {
+            format!(
+                "direct call {}.{}(...) requires argument type inference; use overload(\"...\") to disambiguate",
+                class_name, stmt.method_name
+            )
+        })?;
+        return resolve_direct_call_proto(env, stmt, &class_name, is_static, arg_types);
+    }
+
+    let params = parse_method_params_signature(&stmt.sig)?;
+    let params_sig = build_params_sig(&params);
     let collect_matches = |declared_only: bool, include_synthetic: bool| -> Result<BTreeSet<String>, String> {
         let methods = unsafe {
             if declared_only {
@@ -187,6 +198,117 @@ fn resolve_call_proto(
             class_name, stmt.method_name, params_sig
         )),
     }
+}
+
+fn resolve_direct_call_proto(
+    env: JniEnv,
+    stmt: &DslCallStmt,
+    class_name: &str,
+    is_static: bool,
+    arg_types: &[Option<String>],
+) -> Result<(Vec<String>, String, String), String> {
+    let collect_matches = |declared_only: bool, include_synthetic: bool| -> Result<BTreeSet<(u16, String)>, String> {
+        let methods = unsafe {
+            if declared_only {
+                enumerate_methods_declared_only(env, class_name)
+            } else {
+                enumerate_methods(env, class_name)
+            }
+        }?;
+        let mut matches = BTreeSet::new();
+        for method in methods {
+            if method.name != stmt.method_name || method.is_static != is_static {
+                continue;
+            }
+            if !include_synthetic && (method.modifiers & (ACC_BRIDGE as i32 | ACC_SYNTHETIC as i32)) != 0 {
+                continue;
+            }
+            let Ok((method_params, _)) = parse_method_signature(&method.sig) else {
+                continue;
+            };
+            let Some(score) = direct_call_match_score(env, arg_types, &method_params) else {
+                continue;
+            };
+            matches.insert((score, method.sig));
+        }
+        Ok(matches)
+    };
+
+    let declared_matches = collect_matches(true, false)?;
+    let matches = if declared_matches.is_empty() {
+        let inherited_matches = collect_matches(false, false)?;
+        if inherited_matches.is_empty() {
+            collect_matches(false, true)?
+        } else {
+            inherited_matches
+        }
+    } else {
+        declared_matches
+    };
+
+    pick_unique_direct_call_sig(class_name, &stmt.method_name, arg_types, matches).and_then(|full_sig| {
+        let (params, return_type) = parse_method_signature(&full_sig)?;
+        Ok((params, return_type, full_sig))
+    })
+}
+
+fn pick_unique_direct_call_sig(
+    class_name: &str,
+    method_name: &str,
+    arg_types: &[Option<String>],
+    matches: BTreeSet<(u16, String)>,
+) -> Result<String, String> {
+    let Some(best_score) = matches.iter().map(|(score, _)| *score).min() else {
+        return Err(format!(
+            "method not found for {}.{}({} inferred arg(s)); use overload(\"...\") to specify parameter types",
+            class_name,
+            method_name,
+            arg_types.len()
+        ));
+    };
+    let best = matches
+        .into_iter()
+        .filter(|(score, _)| *score == best_score)
+        .map(|(_, sig)| sig)
+        .collect::<BTreeSet<_>>();
+    match best.len() {
+        1 => {
+            let full_sig = best.into_iter().next().unwrap();
+            Ok(full_sig)
+        }
+        _ => Err(format!(
+            "ambiguous overload for {}.{} with inferred argument types {}; use overload(\"...\")",
+            class_name,
+            method_name,
+            format_inferred_arg_types(arg_types)
+        )),
+    }
+}
+
+fn direct_call_match_score(env: JniEnv, arg_types: &[Option<String>], params: &[String]) -> Option<u16> {
+    if arg_types.len() != params.len() {
+        return None;
+    }
+    let mut score = 0u16;
+    for (arg_type, param) in arg_types.iter().zip(params) {
+        match arg_type {
+            Some(arg) if arg == param => {}
+            Some(arg) if return_is_object(arg) && return_is_object(param) => {
+                score = score.saturating_add(object_assignability_score(env, arg, param)?);
+            }
+            None if return_is_object(param) => score = score.saturating_add(4096),
+            _ => return None,
+        }
+    }
+    Some(score)
+}
+
+fn format_inferred_arg_types(arg_types: &[Option<String>]) -> String {
+    let parts = arg_types
+        .iter()
+        .map(|arg| arg.as_deref().unwrap_or("null"))
+        .collect::<Vec<_>>();
+    format!("({})", parts.join(", "))
 }
 
 mod emitter;

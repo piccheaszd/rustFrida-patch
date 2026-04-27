@@ -6,10 +6,11 @@ use super::dsl::{
     DslUnaryOp, DslValue,
 };
 use super::{
-    array_component_descriptor, common_value_descriptor, descriptor_list_word_count, descriptor_word_count,
-    emit_return_from_orig, java_class_to_descriptor, java_class_to_descriptor_or_primitive, parse_call_params,
-    parse_method_signature, resolve_call_proto, return_is_object, value_kind_from_descriptor, DexIntBinOp,
-    DexIntLit16Op, DexIntLit8Op, DexIrBuilder, FieldRef, GeneratedStringLiteral, IfCmpOp, MethodRef, ValueKind,
+    array_component_descriptor, common_value_descriptor_with_env, descriptor_is_interface, descriptor_list_word_count,
+    descriptor_word_count, emit_return_from_orig, java_class_to_descriptor, java_class_to_descriptor_or_primitive,
+    parse_call_params, parse_method_signature, resolve_call_proto_with_arg_types, resolve_field_with_env,
+    return_is_object, value_kind_from_descriptor, DexIntBinOp, DexIntLit16Op, DexIntLit8Op, DexIrBuilder, FieldRef,
+    GeneratedStringLiteral, IfCmpOp, MethodRef, ValueKind,
 };
 use crate::jsapi::java::jni_core::JniEnv;
 
@@ -295,7 +296,9 @@ fn emit_call_value(
         layout,
         dsl_ctx.env,
     )?;
-    let (params, return_type, full_sig) = resolve_call_proto(dsl_ctx.env, stmt, &class_type)?;
+    let arg_types = infer_call_arg_descriptors(stmt, layout, dsl_ctx.env)?;
+    let (params, return_type, full_sig) =
+        resolve_call_proto_with_arg_types(dsl_ctx.env, stmt, &class_type, Some(&arg_types))?;
     if return_type == "V" {
         return Err(format!(
             "{}.{}{} returns void and cannot be used as a value",
@@ -327,11 +330,7 @@ fn emit_call_value(
         params.clone(),
     );
     let receiver = emit_call_receiver(ir, stmt, &class_type, layout, dsl_ctx)?;
-    let invoke_kind = match stmt.kind {
-        DslCallKind::Virtual => ManagedInvokeKind::Virtual,
-        DslCallKind::Interface => ManagedInvokeKind::Interface,
-        DslCallKind::Static => ManagedInvokeKind::Static,
-    };
+    let invoke_kind = resolve_managed_invoke_kind(dsl_ctx.env, stmt.kind, &class_type);
     if stmt.null_safe {
         return emit_null_safe_call_value(
             ir,
@@ -421,14 +420,14 @@ fn emit_field_get_value(
         layout,
         dsl_ctx.env,
     )?;
-    let field_type = java_class_to_descriptor_or_primitive(&stmt.type_name)?;
+    let (declaring_type, field_type) = resolve_field_ref_parts(dsl_ctx.env, stmt, is_static, &class_type)?;
     if !value_descriptor_assignable_to(&field_type, expected_type) {
         return Err(format!(
             "field expression type {} cannot be passed as {}",
             field_type, expected_type
         ));
     }
-    let field = FieldRef::new(class_type, field_type.clone(), stmt.field_name.clone());
+    let field = FieldRef::new(declaring_type, field_type.clone(), stmt.field_name.clone());
     let kind = value_kind_from_descriptor(&field_type)?;
     if is_static {
         ir.sget(dst, field, kind);
@@ -935,7 +934,7 @@ fn infer_value_descriptor(value: &DslValue, layout: &HelperParamLayout, env: Jni
         } => {
             let then_desc = infer_value_descriptor(then_value, layout, env)?;
             let else_desc = infer_value_descriptor(else_value, layout, env)?;
-            common_value_descriptor(then_desc, else_desc)
+            common_value_descriptor_with_env(then_desc, else_desc, env)
         }
         DslValue::Null => Ok(None),
         DslValue::Call(stmt) => {
@@ -953,7 +952,8 @@ fn infer_value_descriptor(value: &DslValue, layout: &HelperParamLayout, env: Jni
                     layout,
                     env,
                 )?;
-                let (_, return_type, _) = resolve_call_proto(env, stmt, &class_type)?;
+                let arg_types = infer_call_arg_descriptors(stmt, layout, env)?;
+                let (_, return_type, _) = resolve_call_proto_with_arg_types(env, stmt, &class_type, Some(&arg_types))?;
                 if return_type == "V" {
                     Ok(None)
                 } else {
@@ -962,7 +962,16 @@ fn infer_value_descriptor(value: &DslValue, layout: &HelperParamLayout, env: Jni
             }
         }
         DslValue::NewObject { class_name, .. } => java_class_to_descriptor(class_name).map(Some),
-        DslValue::FieldGet { stmt, .. } => java_class_to_descriptor_or_primitive(&stmt.type_name).map(Some),
+        DslValue::FieldGet { stmt, is_static } => {
+            let class_type = resolve_member_class_type(
+                stmt.class_name.as_deref(),
+                stmt.target.as_ref(),
+                stmt.receiver.as_deref(),
+                layout,
+                env,
+            )?;
+            resolve_field_type(env, stmt, *is_static, &class_type).map(Some)
+        }
         DslValue::Cast { class_name, .. } => java_class_to_descriptor(class_name).map(Some),
         DslValue::ArrayGet { type_name, .. } => match type_name {
             Some(type_name) => java_class_to_descriptor_or_primitive(type_name).map(Some),
@@ -1155,8 +1164,8 @@ fn emit_field_read(
         layout,
         dsl_ctx.env,
     )?;
-    let field_type = java_class_to_descriptor_or_primitive(&stmt.type_name)?;
-    let field = FieldRef::new(class_type, field_type.clone(), stmt.field_name.clone());
+    let (declaring_type, field_type) = resolve_field_ref_parts(dsl_ctx.env, stmt, is_static, &class_type)?;
+    let field = FieldRef::new(declaring_type, field_type.clone(), stmt.field_name.clone());
     let kind = value_kind_from_descriptor(&field_type)?;
     let dst = if matches!(kind, ValueKind::Object) {
         REG_LAST_OBJECT
@@ -1186,8 +1195,8 @@ fn emit_field_write(
         layout,
         dsl_ctx.env,
     )?;
-    let field_type = java_class_to_descriptor_or_primitive(&stmt.type_name)?;
-    let field = FieldRef::new(class_type, field_type.clone(), stmt.field_name.clone());
+    let (declaring_type, field_type) = resolve_field_ref_parts(dsl_ctx.env, stmt, is_static, &class_type)?;
+    let field = FieldRef::new(declaring_type, field_type.clone(), stmt.field_name.clone());
     let kind = value_kind_from_descriptor(&field_type)?;
     let Some(value) = &stmt.value else {
         return Err("field write requires a value".to_string());
@@ -1201,6 +1210,29 @@ fn emit_field_write(
         ir.iput(src, obj, field, kind);
     }
     Ok(())
+}
+
+fn resolve_field_type(env: JniEnv, stmt: &DslFieldStmt, is_static: bool, class_type: &str) -> Result<String, String> {
+    if !stmt.type_name.is_empty() {
+        return java_class_to_descriptor_or_primitive(&stmt.type_name);
+    }
+    resolve_field_with_env(env, class_type, &stmt.field_name, Some(is_static)).map(|field| field.field_type)
+}
+
+fn resolve_field_ref_parts(
+    env: JniEnv,
+    stmt: &DslFieldStmt,
+    is_static: bool,
+    class_type: &str,
+) -> Result<(String, String), String> {
+    if !stmt.type_name.is_empty() {
+        return Ok((
+            class_type.to_string(),
+            java_class_to_descriptor_or_primitive(&stmt.type_name)?,
+        ));
+    }
+    let field = resolve_field_with_env(env, class_type, &stmt.field_name, Some(is_static))?;
+    Ok((field.declaring_type, field.field_type))
 }
 
 fn emit_let(
@@ -1633,6 +1665,26 @@ enum ManagedInvokeKind {
     Static,
 }
 
+fn resolve_managed_invoke_kind(env: JniEnv, requested: DslCallKind, class_type: &str) -> ManagedInvokeKind {
+    match requested {
+        DslCallKind::Virtual if descriptor_is_interface(env, class_type) => ManagedInvokeKind::Interface,
+        DslCallKind::Virtual => ManagedInvokeKind::Virtual,
+        DslCallKind::Interface => ManagedInvokeKind::Interface,
+        DslCallKind::Static => ManagedInvokeKind::Static,
+    }
+}
+
+fn infer_call_arg_descriptors(
+    stmt: &DslCallStmt,
+    layout: &HelperParamLayout,
+    env: JniEnv,
+) -> Result<Vec<Option<String>>, String> {
+    stmt.args
+        .iter()
+        .map(|arg| infer_value_descriptor(arg, layout, env))
+        .collect::<Result<Vec<_>, _>>()
+}
+
 fn value_contains_invoke(value: &DslValue) -> bool {
     match value {
         DslValue::Call(_) | DslValue::NewObject { .. } => true,
@@ -1748,7 +1800,9 @@ fn emit_call(
         layout,
         dsl_ctx.env,
     )?;
-    let (params, return_type, full_sig) = resolve_call_proto(dsl_ctx.env, stmt, &class_type)?;
+    let arg_types = infer_call_arg_descriptors(stmt, layout, dsl_ctx.env)?;
+    let (params, return_type, full_sig) =
+        resolve_call_proto_with_arg_types(dsl_ctx.env, stmt, &class_type, Some(&arg_types))?;
     if params.len() != stmt.args.len() {
         return Err(format!(
             "{}.{}{} expects {} explicit args, got {}",
@@ -1771,11 +1825,7 @@ fn emit_call(
         .as_ref()
         .map(|target| resolve_target_reg(target, layout).map(|reg| (reg, class_type.as_str())))
         .transpose()?;
-    let invoke_kind = match stmt.kind {
-        DslCallKind::Virtual => ManagedInvokeKind::Virtual,
-        DslCallKind::Interface => ManagedInvokeKind::Interface,
-        DslCallKind::Static => ManagedInvokeKind::Static,
-    };
+    let invoke_kind = resolve_managed_invoke_kind(dsl_ctx.env, stmt.kind, &class_type);
     if stmt.null_safe {
         let Some((receiver_reg, receiver_desc)) = receiver else {
             return Err("null-safe call requires a receiver".to_string());
@@ -2001,8 +2051,7 @@ fn statements_max_invoke_words(stmts: &[DslStmt], target_params: &[String], is_s
             }
             DslStmt::NewArray { size, .. } => value_max_invoke_words(size)?,
             DslStmt::Call(stmt) => {
-                let params = parse_call_params(&stmt.sig)?;
-                let mut words = invoke_arg_words(stmt.target.is_some() || stmt.receiver.is_some(), &params)?;
+                let mut words = call_stmt_max_direct_words(stmt)?;
                 for arg in &stmt.args {
                     words = words.max(value_max_invoke_words(arg)?);
                 }
@@ -2102,8 +2151,7 @@ fn value_max_invoke_words(value: &DslValue) -> Result<u16, String> {
             Ok(words)
         }
         DslValue::Call(stmt) => {
-            let params = parse_call_params(&stmt.sig)?;
-            let mut words = invoke_arg_words(stmt.target.is_some() || stmt.receiver.is_some(), &params)?;
+            let mut words = call_stmt_max_direct_words(stmt)?;
             for arg in &stmt.args {
                 words = words.max(value_max_invoke_words(arg)?);
             }
@@ -2133,6 +2181,23 @@ fn value_max_invoke_words(value: &DslValue) -> Result<u16, String> {
         | DslValue::Bool(_)
         | DslValue::Null => Ok(0),
     }
+}
+
+fn call_stmt_max_direct_words(stmt: &DslCallStmt) -> Result<u16, String> {
+    let has_receiver = stmt.target.is_some() || stmt.receiver.is_some();
+    if stmt.sig.is_empty() {
+        let receiver_words = if has_receiver { 1 } else { 0 };
+        let arg_words = stmt
+            .args
+            .len()
+            .checked_mul(2)
+            .ok_or_else(|| "too many direct-call arguments".to_string())?;
+        return (receiver_words + arg_words)
+            .try_into()
+            .map_err(|_| "too many direct-call argument words".to_string());
+    }
+    let params = parse_call_params(&stmt.sig)?;
+    invoke_arg_words(has_receiver, &params)
 }
 
 fn condition_max_invoke_words(condition: &DslCondition) -> Result<u16, String> {

@@ -651,10 +651,13 @@ fn handle_zymbiote_connection(mut stream: std::os::unix::net::UnixStream) -> Res
         if let Some(n) = map.remove(&package_name) {
             Some(n)
         } else {
-            // 前缀匹配: "com.foo.bar:service" 匹配注册的 "com.foo.bar"
+            // Prefix matching is only for explicit process-name requests, not for
+            // consuming a base package request with a secondary process like
+            // "com.foo.bar:service". The base package must keep waiting for the
+            // main process exact hello.
             let prefix_key = map
                 .keys()
-                .find(|k| package_name.starts_with(k.as_str()) && package_name[k.len()..].starts_with(':'))
+                .find(|k| k.contains(':') && package_name.starts_with(k.as_str()))
                 .cloned();
             prefix_key.and_then(|k| map.remove(&k))
         }

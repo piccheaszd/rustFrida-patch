@@ -125,6 +125,19 @@ pub(super) enum DslCallKind {
     Static,
 }
 
+enum ParsedCallArgs {
+    Direct(Vec<DslValue>),
+    LegacyCall {
+        class_name: Option<String>,
+        sig: String,
+        args: Vec<DslValue>,
+    },
+    Field {
+        class_name: Option<String>,
+        type_name: String,
+    },
+}
+
 #[derive(Clone)]
 pub(super) struct DslFieldStmt {
     pub(super) target: Option<DslTarget>,
@@ -565,7 +578,7 @@ impl<'a> DslParser<'a> {
         let mut tokens = Vec::new();
         loop {
             self.skip_ws();
-            let token = if self.peek() == Some('"') {
+            let token = if self.peek_string() {
                 NewArgToken::String(self.parse_string_arg()?)
             } else {
                 NewArgToken::Value(self.parse_value_arg()?)
@@ -1181,39 +1194,61 @@ impl<'a> DslParser<'a> {
             return self.parse_postfix_overload_call(receiver, member_name, call_kind, null_safe);
         }
 
+        if self.peek() != Some('(') {
+            if call_kind == DslCallKind::Interface {
+                return Err(self.err("interface field access is not supported"));
+            }
+            return Ok(DslValue::FieldGet {
+                stmt: Box::new(DslFieldStmt {
+                    target: None,
+                    receiver: Some(Box::new(receiver)),
+                    class_name: None,
+                    field_name: member_name,
+                    type_name: String::new(),
+                    value: None,
+                }),
+                is_static: false,
+            });
+        }
+
         self.expect_char('(')?;
-        let sig_or_type = self.parse_string_arg()?;
-        let args = self.parse_optional_value_args()?;
-        self.expect_char(')')?;
-        if sig_or_type.starts_with('(') {
-            Ok(DslValue::Call(DslCallStmt {
+        match self.parse_member_call_args(true, false)? {
+            ParsedCallArgs::Direct(args) => Ok(DslValue::Call(DslCallStmt {
                 kind: call_kind,
                 target: None,
                 receiver: Some(Box::new(receiver)),
                 null_safe,
                 class_name: None,
                 method_name: member_name,
-                sig: sig_or_type,
+                sig: String::new(),
                 args,
-            }))
-        } else {
-            if call_kind == DslCallKind::Interface {
-                return Err(self.err("interface field access is not supported"));
+            })),
+            ParsedCallArgs::LegacyCall { class_name, sig, args } => Ok(DslValue::Call(DslCallStmt {
+                kind: call_kind,
+                target: None,
+                receiver: Some(Box::new(receiver)),
+                null_safe,
+                class_name,
+                method_name: member_name,
+                sig,
+                args,
+            })),
+            ParsedCallArgs::Field { type_name, .. } => {
+                if call_kind == DslCallKind::Interface {
+                    return Err(self.err("interface field access is not supported"));
+                }
+                Ok(DslValue::FieldGet {
+                    stmt: Box::new(DslFieldStmt {
+                        target: None,
+                        receiver: Some(Box::new(receiver)),
+                        class_name: None,
+                        field_name: member_name,
+                        type_name,
+                        value: None,
+                    }),
+                    is_static: false,
+                })
             }
-            if !args.is_empty() {
-                return Err(self.err("field access does not accept value arguments"));
-            }
-            Ok(DslValue::FieldGet {
-                stmt: Box::new(DslFieldStmt {
-                    target: None,
-                    receiver: Some(Box::new(receiver)),
-                    class_name: None,
-                    field_name: member_name,
-                    type_name: sig_or_type,
-                    value: None,
-                }),
-                is_static: false,
-            })
         }
     }
 
@@ -1287,6 +1322,70 @@ impl<'a> DslParser<'a> {
         }))
     }
 
+    fn parse_member_call_args(
+        &mut self,
+        allow_field: bool,
+        allow_explicit_class: bool,
+    ) -> Result<ParsedCallArgs, String> {
+        self.skip_ws();
+        if self.peek() == Some(')') {
+            self.expect_char(')')?;
+            return Ok(ParsedCallArgs::Direct(Vec::new()));
+        }
+
+        if self.peek_string() {
+            let first = self.parse_string_arg()?;
+            self.skip_ws();
+            if first.starts_with('(') {
+                let args = self.parse_optional_value_args()?;
+                self.expect_char(')')?;
+                return Ok(ParsedCallArgs::LegacyCall {
+                    class_name: None,
+                    sig: first,
+                    args,
+                });
+            }
+            if allow_explicit_class && self.peek() == Some(',') && looks_like_type_name(&first) {
+                let checkpoint = self.pos;
+                self.expect_char(',')?;
+                self.skip_ws();
+                if self.peek_string() {
+                    let second = self.parse_string_arg()?;
+                    if second.starts_with('(') {
+                        let args = self.parse_optional_value_args()?;
+                        self.expect_char(')')?;
+                        return Ok(ParsedCallArgs::LegacyCall {
+                            class_name: Some(first),
+                            sig: second,
+                            args,
+                        });
+                    }
+                }
+                self.pos = checkpoint;
+            }
+            if allow_field && self.peek() == Some(')') && looks_like_type_name(&first) {
+                self.expect_char(')')?;
+                return Ok(ParsedCallArgs::Field {
+                    class_name: None,
+                    type_name: first,
+                });
+            }
+
+            let mut args = vec![DslValue::String(first)];
+            while self.peek() == Some(',') {
+                self.expect_char(',')?;
+                args.push(self.parse_value_arg()?);
+                self.skip_ws();
+            }
+            self.expect_char(')')?;
+            return Ok(ParsedCallArgs::Direct(args));
+        }
+
+        let args = self.parse_value_arg_list_until_close()?;
+        self.expect_char(')')?;
+        Ok(ParsedCallArgs::Direct(args))
+    }
+
     fn parse_js_member_value(&mut self, first: String) -> Result<DslValue, String> {
         let mut parts = vec![first];
         while self.peek() == Some('.') {
@@ -1307,79 +1406,97 @@ impl<'a> DslParser<'a> {
             let target = parse_target_name(&parts[0]).unwrap_or_else(|| DslTarget::Local(parts[0].clone()));
             return Ok(DslValue::ArrayLength(Box::new(DslValue::Target(target))));
         }
+        if self.peek() != Some('(') {
+            if parts.len() == 2 && !looks_like_static_class_name(&parts[0]) {
+                let target = parse_target_name(&parts[0]).unwrap_or_else(|| DslTarget::Local(parts[0].clone()));
+                return Ok(DslValue::FieldGet {
+                    stmt: Box::new(DslFieldStmt {
+                        target: Some(target),
+                        receiver: None,
+                        class_name: None,
+                        field_name: parts[1].clone(),
+                        type_name: String::new(),
+                        value: None,
+                    }),
+                    is_static: false,
+                });
+            }
+            return Err(
+                self.err("direct field access currently supports only instance fields on this/arg/local values")
+            );
+        }
         self.expect_char('(')?;
-        self.skip_ws();
 
         if parts.len() == 2 && parse_target_name(&parts[0]).is_some() {
             let target = parse_target_name(&parts[0]).unwrap();
-            let first_arg = self.parse_string_arg()?;
-            let (class_name, sig_or_type) = if first_arg.starts_with('(') || self.peek() != Some(',') {
-                (None, first_arg)
-            } else {
-                self.expect_char(',')?;
-                (Some(first_arg), self.parse_string_arg()?)
-            };
-            let args = self.parse_optional_value_args()?;
-            self.expect_char(')')?;
-            if sig_or_type.starts_with('(') {
-                Ok(DslValue::Call(DslCallStmt {
+            match self.parse_member_call_args(true, matches!(target, DslTarget::Last | DslTarget::Result))? {
+                ParsedCallArgs::Direct(args) => Ok(DslValue::Call(DslCallStmt {
+                    kind: DslCallKind::Virtual,
+                    target: Some(target),
+                    receiver: None,
+                    null_safe: false,
+                    class_name: None,
+                    method_name: parts[1].clone(),
+                    sig: String::new(),
+                    args,
+                })),
+                ParsedCallArgs::LegacyCall { class_name, sig, args } => Ok(DslValue::Call(DslCallStmt {
                     kind: DslCallKind::Virtual,
                     target: Some(target),
                     receiver: None,
                     null_safe: false,
                     class_name,
                     method_name: parts[1].clone(),
-                    sig: sig_or_type,
+                    sig,
                     args,
-                }))
-            } else {
-                if !args.is_empty() {
-                    return Err(self.err("field access does not accept value arguments"));
-                }
-                Ok(DslValue::FieldGet {
+                })),
+                ParsedCallArgs::Field { class_name, type_name } => Ok(DslValue::FieldGet {
                     stmt: Box::new(DslFieldStmt {
                         target: Some(target),
                         receiver: None,
                         class_name,
                         field_name: parts[1].clone(),
-                        type_name: sig_or_type,
+                        type_name,
                         value: None,
                     }),
                     is_static: false,
-                })
+                }),
             }
         } else {
             let member_name = parts.pop().unwrap();
             let class_name = parts.join(".");
-            let sig_or_type = self.parse_string_arg()?;
-            let args = self.parse_optional_value_args()?;
-            self.expect_char(')')?;
-            if sig_or_type.starts_with('(') {
-                Ok(DslValue::Call(DslCallStmt {
+            match self.parse_member_call_args(true, false)? {
+                ParsedCallArgs::Direct(args) => Ok(DslValue::Call(DslCallStmt {
                     kind: DslCallKind::Static,
                     target: None,
                     receiver: None,
                     null_safe: false,
                     class_name: Some(class_name),
                     method_name: member_name,
-                    sig: sig_or_type,
+                    sig: String::new(),
                     args,
-                }))
-            } else {
-                if !args.is_empty() {
-                    return Err(self.err("field access does not accept value arguments"));
-                }
-                Ok(DslValue::FieldGet {
+                })),
+                ParsedCallArgs::LegacyCall { sig, args, .. } => Ok(DslValue::Call(DslCallStmt {
+                    kind: DslCallKind::Static,
+                    target: None,
+                    receiver: None,
+                    null_safe: false,
+                    class_name: Some(class_name),
+                    method_name: member_name,
+                    sig,
+                    args,
+                })),
+                ParsedCallArgs::Field { type_name, .. } => Ok(DslValue::FieldGet {
                     stmt: Box::new(DslFieldStmt {
                         target: None,
                         receiver: None,
                         class_name: Some(class_name),
                         field_name: member_name,
-                        type_name: sig_or_type,
+                        type_name,
                         value: None,
                     }),
                     is_static: true,
-                })
+                }),
             }
         }
     }
@@ -1770,6 +1887,22 @@ fn parse_target_name(name: &str) -> Option<DslTarget> {
         value if is_local_ident(value) => Some(DslTarget::Local(value.to_string())),
         _ => None,
     }
+}
+
+fn looks_like_type_name(value: &str) -> bool {
+    matches!(
+        value,
+        "boolean" | "byte" | "char" | "short" | "int" | "long" | "float" | "double" | "void"
+    ) || matches!(value, "Z" | "B" | "C" | "S" | "I" | "J" | "F" | "D" | "V")
+        || value.starts_with('[')
+        || (value.starts_with('L') && value.ends_with(';'))
+        || value.ends_with("[]")
+        || value.contains('.')
+        || value.contains('/')
+}
+
+fn looks_like_static_class_name(value: &str) -> bool {
+    value.chars().next().map(|ch| ch.is_ascii_uppercase()).unwrap_or(false)
 }
 
 fn fold_unary_op(op: DslUnaryOp, value: DslValue) -> DslValue {

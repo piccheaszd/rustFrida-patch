@@ -5,8 +5,9 @@ use super::dsl::{
     DslValue,
 };
 use super::{
-    array_component_descriptor, common_value_descriptor, java_class_to_descriptor,
-    java_class_to_descriptor_or_primitive, parse_method_signature, resolve_call_proto, return_is_object,
+    array_component_descriptor, common_value_descriptor_with_env, java_class_to_descriptor,
+    java_class_to_descriptor_or_primitive, parse_method_signature, resolve_call_proto_with_arg_types,
+    resolve_field_with_env, return_is_object,
 };
 use crate::jsapi::java::jni_core::JniEnv;
 
@@ -129,7 +130,7 @@ impl DslSemanticContext {
             } => {
                 let then_desc = self.infer_value_descriptor(then_value)?;
                 let else_desc = self.infer_value_descriptor(else_value)?;
-                common_value_descriptor(then_desc, else_desc)
+                common_value_descriptor_with_env(then_desc, else_desc, self.env)
             }
             DslValue::Bool(_) => Ok(Some("Z".to_string())),
             DslValue::Null => Ok(None),
@@ -139,7 +140,9 @@ impl DslSemanticContext {
                     stmt.target.as_ref(),
                     stmt.receiver.as_deref(),
                 )?;
-                let (_, return_type, _) = resolve_call_proto(self.env, stmt, &class_type)?;
+                let arg_types = self.infer_call_arg_descriptors(stmt)?;
+                let (_, return_type, _) =
+                    resolve_call_proto_with_arg_types(self.env, stmt, &class_type, Some(&arg_types))?;
                 if return_type == "V" {
                     Ok(None)
                 } else {
@@ -147,7 +150,7 @@ impl DslSemanticContext {
                 }
             }
             DslValue::NewObject { class_name, .. } => java_class_to_descriptor(class_name).map(Some),
-            DslValue::FieldGet { stmt, .. } => java_class_to_descriptor_or_primitive(&stmt.type_name).map(Some),
+            DslValue::FieldGet { stmt, is_static } => self.resolve_field_descriptor(stmt, *is_static).map(Some),
             DslValue::Cast { class_name, .. } => java_class_to_descriptor(class_name).map(Some),
             DslValue::ArrayGet { type_name, array, .. } => match type_name {
                 Some(type_name) => java_class_to_descriptor_or_primitive(type_name).map(Some),
@@ -286,11 +289,11 @@ impl DslSemanticContext {
                 }
                 self.validate_call_inner(stmt, require_nonnull_receiver)?;
             }
-            DslValue::FieldGet { stmt, .. } => {
+            DslValue::FieldGet { stmt, is_static } => {
                 if let Some(receiver) = &stmt.receiver {
                     self.validate_value_inner(receiver, require_nonnull_receiver)?;
                 }
-                self.validate_field(stmt)?;
+                self.validate_field(stmt, *is_static)?;
             }
         }
         Ok(())
@@ -344,7 +347,8 @@ impl DslSemanticContext {
             stmt.target.as_ref(),
             stmt.receiver.as_deref(),
         )?;
-        let (params, _, full_sig) = resolve_call_proto(self.env, stmt, &class_type)?;
+        let arg_types = self.infer_call_arg_descriptors(stmt)?;
+        let (params, _, full_sig) = resolve_call_proto_with_arg_types(self.env, stmt, &class_type, Some(&arg_types))?;
         if require_nonnull_receiver {
             self.validate_receiver_nonnull(stmt, &class_type)?;
         }
@@ -367,7 +371,26 @@ impl DslSemanticContext {
         Ok(())
     }
 
-    fn validate_field(&mut self, stmt: &DslFieldStmt) -> Result<(), String> {
+    fn infer_call_arg_descriptors(&self, stmt: &DslCallStmt) -> Result<Vec<Option<String>>, String> {
+        stmt.args
+            .iter()
+            .map(|arg| self.infer_value_descriptor(arg))
+            .collect::<Result<Vec<_>, _>>()
+    }
+
+    fn resolve_field_descriptor(&self, stmt: &DslFieldStmt, is_static: bool) -> Result<String, String> {
+        if !stmt.type_name.is_empty() {
+            return java_class_to_descriptor_or_primitive(&stmt.type_name);
+        }
+        let class_type = self.resolve_member_class_type(
+            stmt.class_name.as_deref(),
+            stmt.target.as_ref(),
+            stmt.receiver.as_deref(),
+        )?;
+        resolve_field_with_env(self.env, &class_type, &stmt.field_name, Some(is_static)).map(|field| field.field_type)
+    }
+
+    fn validate_field(&mut self, stmt: &DslFieldStmt, is_static: bool) -> Result<(), String> {
         if stmt.target.is_some() && stmt.receiver.is_some() {
             return Err("field access cannot use both target and receiver expression".to_string());
         }
@@ -379,9 +402,22 @@ impl DslSemanticContext {
         if let Some(receiver) = &stmt.receiver {
             self.validate_value(receiver)?;
         }
-        java_class_to_descriptor_or_primitive(&stmt.type_name)?;
+        let descriptor = self.resolve_field_descriptor(stmt, is_static)?;
         if let Some(value) = &stmt.value {
             self.validate_value(value)?;
+            if let Some(value_desc) = self.infer_value_descriptor(value)? {
+                if !value_descriptor_assignable_to(&value_desc, &descriptor) {
+                    return Err(format!(
+                        "field '{}' type mismatch: cannot assign {} to {}",
+                        stmt.field_name, value_desc, descriptor
+                    ));
+                }
+            } else if !return_is_object(&descriptor) {
+                return Err(format!(
+                    "field '{}' type mismatch: cannot assign null/void to {}",
+                    stmt.field_name, descriptor
+                ));
+            }
         }
         Ok(())
     }
@@ -524,7 +560,9 @@ impl DslSemanticContext {
                     java_class_to_descriptor_or_primitive(type_name)?;
                 }
             }
-            DslStmt::FieldRead { stmt, .. } | DslStmt::FieldWrite { stmt, .. } => self.validate_field(stmt)?,
+            DslStmt::FieldRead { stmt, is_static } | DslStmt::FieldWrite { stmt, is_static } => {
+                self.validate_field(stmt, *is_static)?
+            }
             DslStmt::IfNull {
                 value,
                 invert,
