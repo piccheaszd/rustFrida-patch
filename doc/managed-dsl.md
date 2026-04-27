@@ -31,9 +31,9 @@ Java.ready(function () {
       "let a: int[] = last;" +
       "a[0] = plus;" +
       "if (plus > 0) {" +
-      "  return orig();" +
+      "  return orig(arg0, arg1);" +
       "} else {" +
-      "  return orig();" +
+      "  return orig(arg0, arg1);" +
       "}"
   });
 });
@@ -41,7 +41,8 @@ Java.ready(function () {
 
 ## High-Frequency Rules
 
-If a DSL program uses `orig()`, every return path must end with `return orig();`.
+If a DSL program uses `orig()`, every return path must end with `return orig();`
+or `return orig(...)`.
 The compiler rejects mixed return paths such as:
 
 ```js
@@ -55,6 +56,11 @@ The compiler rejects mixed return paths such as:
 This restriction is deliberate. The managed direct thunk arms the per-thread
 orig bypass before entering the generated helper. Requiring every return path to
 consume that bypass prevents leaked bypass slots on high-frequency traffic.
+
+`orig()` calls the original method with the original receiver and arguments.
+`orig(arg0, arg1)` calls the original method with explicit replacement
+arguments. The replacement argument count must exactly match the hooked method's
+parameter count; instance receivers are still supplied automatically.
 
 The expected stable stats are:
 
@@ -146,6 +152,30 @@ Full JNI signatures are still accepted when reflection cannot resolve a method:
 "last.append.overload(\"java.lang.StringBuilder\", \"(Ljava/lang/Object;)Ljava/lang/StringBuilder;\")(arg0);"
 ```
 
+### Original Calls
+
+Call the original method with unchanged arguments:
+
+```js
+"return orig();"
+```
+
+Call the original method with explicit arguments:
+
+```js
+"return orig(arg0, arg1);"
+```
+
+Store the original result before running more DSL logic:
+
+```js
+"let old: java.lang.Object = orig(arg0, arg1);" +
+"return old;"
+```
+
+For instance hooks, do not pass `this` to `orig(...)`; only pass Java method
+parameters. For static hooks, pass all static method parameters.
+
 ### Arrays
 
 ```js
@@ -234,16 +264,17 @@ High-frequency orig path:
 Orig result path:
 
 ```js
-"let old: java.lang.Object = orig();" +
+"let old: java.lang.Object = orig(arg0, arg1);" +
 "return old;"
 ```
 
-`let x = orig()` is intentionally restricted: it must appear once as the first
-top-level statement, and it cannot be mixed with `return orig()`. This keeps the
-per-thread orig bypass consumed exactly once before any user DSL logic runs.
+`let x = orig(...)` is intentionally restricted: it must appear once as the
+first top-level statement, and it cannot be mixed with `return orig(...)`. This
+keeps the per-thread orig bypass consumed exactly once before any user DSL logic
+runs.
 
 Direct value returns are supported only for DSL programs that do not use
-`orig()`:
+`orig()` or `orig(...)`:
 
 ```js
 "return null;"
@@ -252,9 +283,9 @@ Direct value returns are supported only for DSL programs that do not use
 
 ## Current Limits
 
-- `return orig()` cannot be mixed with `return null`, `return value`, or
+- `return orig(...)` cannot be mixed with `return null`, `return value`, or
   fall-through return paths.
-- `let x = orig()` must be the first top-level statement and cannot be nested.
+- `let x = orig(...)` must be the first top-level statement and cannot be nested.
 - Local variable type inference is not supported; use `let name: Type = value`.
 - `switch` supports integer case constants only. Case bodies must use `{ ... }`,
   and fallthrough/break are not part of the DSL.

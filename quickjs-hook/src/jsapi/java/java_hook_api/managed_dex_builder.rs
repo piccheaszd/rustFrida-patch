@@ -1615,10 +1615,7 @@ fn parse_method_params_signature(sig: &str) -> Result<Vec<String>, String> {
     }
     pos += 1;
     if pos != bytes.len() {
-        return Err(format!(
-            "invalid method parameter signature '{}': trailing input",
-            sig
-        ));
+        return Err(format!("invalid method parameter signature '{}': trailing input", sig));
     }
     Ok(params)
 }
@@ -1800,11 +1797,7 @@ fn helper_param_layout(
         next += descriptor_word_count(target_type);
         Some(reg)
     };
-    let this_descriptor = if is_static {
-        None
-    } else {
-        Some(target_type.to_string())
-    };
+    let this_descriptor = if is_static { None } else { Some(target_type.to_string()) };
     let mut arg_regs = Vec::with_capacity(target_params.len());
     for param in target_params {
         let reg = checked_reg(next, "argument register")?;
@@ -1989,7 +1982,9 @@ fn emit_call_value(
     if return_type == "V" {
         return Err(format!(
             "{}.{}{} returns void and cannot be used as a value",
-            stmt.class_label(), stmt.method_name, full_sig
+            stmt.class_label(),
+            stmt.method_name,
+            full_sig
         ));
     }
     if !value_descriptor_assignable_to(&return_type, expected_type) {
@@ -2297,9 +2292,9 @@ fn resolve_target_descriptor(target: &DslTarget, layout: &HelperParamLayout) -> 
             .get(name)
             .map(|slot| slot.descriptor.clone())
             .ok_or_else(|| format!("local '{}' is not declared", name)),
-        DslTarget::Last | DslTarget::Result => Err(
-            "target class cannot be inferred for last/result; pass the class name explicitly".to_string(),
-        ),
+        DslTarget::Last | DslTarget::Result => {
+            Err("target class cannot be inferred for last/result; pass the class name explicitly".to_string())
+        }
     }
 }
 
@@ -2326,7 +2321,10 @@ fn resolve_member_class_type(
 
 fn descriptor_to_java_class_name(desc: &str) -> Result<String, String> {
     let Some(class_desc) = desc.strip_prefix('L').and_then(|value| value.strip_suffix(';')) else {
-        return Err(format!("method overload resolution requires object class, got {}", desc));
+        return Err(format!(
+            "method overload resolution requires object class, got {}",
+            desc
+        ));
     };
     Ok(class_desc.replace('/', "."))
 }
@@ -2357,9 +2355,7 @@ fn resolve_call_proto(
             if method.name != stmt.method_name || method.is_static != is_static {
                 continue;
             }
-            if !include_synthetic
-                && (method.modifiers & (ACC_BRIDGE as i32 | ACC_SYNTHETIC as i32)) != 0
-            {
+            if !include_synthetic && (method.modifiers & (ACC_BRIDGE as i32 | ACC_SYNTHETIC as i32)) != 0 {
                 continue;
             }
             let Ok((method_params, _)) = parse_method_signature(&method.sig) else {
@@ -2479,7 +2475,13 @@ fn emit_let(
     Ok(())
 }
 
-fn emit_let_orig(ir: &mut DexIrBuilder, name: &str, type_name: &str, emit_ctx: &EmitContext<'_>) -> Result<(), String> {
+fn emit_let_orig(
+    ir: &mut DexIrBuilder,
+    name: &str,
+    type_name: &str,
+    args: &DslOrigArgs,
+    emit_ctx: &mut EmitContext<'_>,
+) -> Result<(), String> {
     if emit_ctx.return_type == "V" {
         return Err("void orig() cannot be assigned to a local".to_string());
     }
@@ -2495,11 +2497,7 @@ fn emit_let_orig(ir: &mut DexIrBuilder, name: &str, type_name: &str, emit_ctx: &
         .local_regs
         .get(name)
         .ok_or_else(|| format!("local '{}' is not allocated", name))?;
-    if emit_ctx.is_static {
-        ir.invoke_static_range(emit_ctx.local_count, emit_ctx.ins_size as u8, emit_ctx.target.clone());
-    } else {
-        ir.invoke_virtual_range(emit_ctx.local_count, emit_ctx.ins_size as u8, emit_ctx.target.clone());
-    }
+    emit_orig_invoke(ir, args, emit_ctx)?;
     emit_move_result_value(ir, emit_ctx.return_type, slot.reg)?;
     Ok(())
 }
@@ -2640,8 +2638,14 @@ fn emit_switch(
     for ((literal, _), label) in cases.iter().zip(case_labels.iter()) {
         label_by_key.insert(*literal, *label);
     }
-    let min_key = *seen.iter().next().ok_or_else(|| "switch requires at least one case".to_string())?;
-    let max_key = *seen.iter().next_back().ok_or_else(|| "switch requires at least one case".to_string())?;
+    let min_key = *seen
+        .iter()
+        .next()
+        .ok_or_else(|| "switch requires at least one case".to_string())?;
+    let max_key = *seen
+        .iter()
+        .next_back()
+        .ok_or_else(|| "switch requires at least one case".to_string())?;
     let range_len = (max_key as i32 - min_key as i32 + 1) as usize;
     if range_len <= cases.len() * 2 {
         let targets = (min_key..=max_key)
@@ -2962,16 +2966,16 @@ fn invoke_arg_words(has_receiver: bool, params: &[String]) -> Result<u16, String
     Ok(words)
 }
 
-fn program_max_invoke_words(program: &DslProgram) -> Result<u16, String> {
-    statements_max_invoke_words(&program.stmts)
+fn program_max_invoke_words(program: &DslProgram, target_params: &[String], is_static: bool) -> Result<u16, String> {
+    statements_max_invoke_words(&program.stmts, target_params, is_static)
 }
 
-fn statements_max_invoke_words(stmts: &[DslStmt]) -> Result<u16, String> {
+fn statements_max_invoke_words(stmts: &[DslStmt], target_params: &[String], is_static: bool) -> Result<u16, String> {
     let mut max_words = 0u16;
     for stmt in stmts {
         let words = match stmt {
             DslStmt::Let { value, .. } => value_max_invoke_words(value)?,
-            DslStmt::LetOrig { .. } => 0,
+            DslStmt::LetOrig { args, .. } => orig_args_max_invoke_words(args, target_params, is_static)?,
             DslStmt::New { ctor_sig, args, .. } => {
                 let params = if let Some(sig) = ctor_sig {
                     let (params, return_type) = parse_method_signature(sig)?;
@@ -3003,8 +3007,8 @@ fn statements_max_invoke_words(stmts: &[DslStmt]) -> Result<u16, String> {
                 else_stmts,
                 ..
             } => value_max_invoke_words(value)?
-                .max(statements_max_invoke_words(then_stmts)?)
-                .max(statements_max_invoke_words(else_stmts)?),
+                .max(statements_max_invoke_words(then_stmts, target_params, is_static)?)
+                .max(statements_max_invoke_words(else_stmts, target_params, is_static)?),
             DslStmt::IfCmp {
                 left,
                 right,
@@ -3013,16 +3017,16 @@ fn statements_max_invoke_words(stmts: &[DslStmt]) -> Result<u16, String> {
                 ..
             } => value_max_invoke_words(left)?
                 .max(value_max_invoke_words(right)?)
-                .max(statements_max_invoke_words(then_stmts)?)
-                .max(statements_max_invoke_words(else_stmts)?),
+                .max(statements_max_invoke_words(then_stmts, target_params, is_static)?)
+                .max(statements_max_invoke_words(else_stmts, target_params, is_static)?),
             DslStmt::IfInstanceOf {
                 value,
                 then_stmts,
                 else_stmts,
                 ..
             } => value_max_invoke_words(value)?
-                .max(statements_max_invoke_words(then_stmts)?)
-                .max(statements_max_invoke_words(else_stmts)?),
+                .max(statements_max_invoke_words(then_stmts, target_params, is_static)?)
+                .max(statements_max_invoke_words(else_stmts, target_params, is_static)?),
             DslStmt::Switch {
                 value,
                 cases,
@@ -3030,10 +3034,10 @@ fn statements_max_invoke_words(stmts: &[DslStmt]) -> Result<u16, String> {
             } => {
                 let mut words = value_max_invoke_words(value)?;
                 for (_, stmts) in cases {
-                    words = words.max(statements_max_invoke_words(stmts)?);
+                    words = words.max(statements_max_invoke_words(stmts, target_params, is_static)?);
                 }
                 if let Some(stmts) = default_stmts {
-                    words = words.max(statements_max_invoke_words(stmts)?);
+                    words = words.max(statements_max_invoke_words(stmts, target_params, is_static)?);
                 }
                 words
             }
@@ -3054,7 +3058,7 @@ fn statements_max_invoke_words(stmts: &[DslStmt]) -> Result<u16, String> {
                 .map(value_max_invoke_words)
                 .transpose()?
                 .unwrap_or(0),
-            DslStmt::ReturnOrig => 0,
+            DslStmt::ReturnOrig { args } => orig_args_max_invoke_words(args, target_params, is_static)?,
             DslStmt::ReturnValue { value } => value.as_ref().map(value_max_invoke_words).transpose()?.unwrap_or(0),
         };
         max_words = max_words.max(words);
@@ -3101,6 +3105,24 @@ fn value_max_invoke_words(value: &DslValue) -> Result<u16, String> {
     }
 }
 
+fn orig_args_max_invoke_words(args: &DslOrigArgs, target_params: &[String], is_static: bool) -> Result<u16, String> {
+    let DslOrigArgs::Values(values) = args else {
+        return Ok(0);
+    };
+    if values.len() != target_params.len() {
+        return Err(format!(
+            "orig(...) expects {} argument(s), got {}",
+            target_params.len(),
+            values.len()
+        ));
+    }
+    let mut words = invoke_arg_words(!is_static, target_params)?;
+    for value in values {
+        words = words.max(value_max_invoke_words(value)?);
+    }
+    Ok(words)
+}
+
 fn program_uses_orig(program: &DslProgram) -> bool {
     statements_use_orig(&program.stmts)
 }
@@ -3111,7 +3133,7 @@ fn statements_use_orig(stmts: &[DslStmt]) -> bool {
 
 fn stmt_uses_orig(stmt: &DslStmt) -> bool {
     match stmt {
-        DslStmt::ReturnOrig | DslStmt::LetOrig { .. } => true,
+        DslStmt::ReturnOrig { .. } | DslStmt::LetOrig { .. } => true,
         DslStmt::IfNull {
             then_stmts, else_stmts, ..
         }
@@ -3122,9 +3144,7 @@ fn stmt_uses_orig(stmt: &DslStmt) -> bool {
             then_stmts, else_stmts, ..
         } => statements_use_orig(then_stmts) || statements_use_orig(else_stmts),
         DslStmt::Switch {
-            cases,
-            default_stmts,
-            ..
+            cases, default_stmts, ..
         } => {
             cases.iter().any(|(_, stmts)| statements_use_orig(stmts))
                 || default_stmts
@@ -3145,7 +3165,7 @@ struct ReturnFlow {
 fn analyze_return_flow(stmts: &[DslStmt]) -> ReturnFlow {
     for stmt in stmts {
         match stmt {
-            DslStmt::ReturnOrig => {
+            DslStmt::ReturnOrig { .. } => {
                 return ReturnFlow {
                     falls_through: false,
                     has_non_orig_return: false,
@@ -3182,9 +3202,7 @@ fn analyze_return_flow(stmts: &[DslStmt]) -> ReturnFlow {
                 }
             }
             DslStmt::Switch {
-                cases,
-                default_stmts,
-                ..
+                cases, default_stmts, ..
             } => {
                 let mut falls_through = default_stmts.is_none();
                 let mut has_non_orig_return = false;
@@ -3227,7 +3245,7 @@ fn validate_orig_bypass_flow(program: &DslProgram) -> Result<(), String> {
     let flow = analyze_return_flow(&program.stmts);
     if flow.has_non_orig_return || flow.falls_through {
         return Err(
-            "managed DSL uses orig(); every return path must end with return orig() for high-frequency direct bypass"
+            "managed DSL uses orig(); every return path must end with return orig() or return orig(...) for high-frequency direct bypass"
                 .to_string(),
         );
     }
@@ -3240,7 +3258,7 @@ fn program_uses_orig_value(program: &DslProgram) -> Result<bool, String> {
             match stmt {
                 DslStmt::LetOrig { .. } => {
                     if nested {
-                        return Err("let x = orig() is only supported at top level".to_string());
+                        return Err("let x = orig(...) is only supported at top level".to_string());
                     }
                     *count += 1;
                 }
@@ -3257,9 +3275,7 @@ fn program_uses_orig_value(program: &DslProgram) -> Result<bool, String> {
                     visit(else_stmts, true, count)?;
                 }
                 DslStmt::Switch {
-                    cases,
-                    default_stmts,
-                    ..
+                    cases, default_stmts, ..
                 } => {
                     for (_, stmts) in cases {
                         visit(stmts, true, count)?;
@@ -3277,14 +3293,14 @@ fn program_uses_orig_value(program: &DslProgram) -> Result<bool, String> {
     let mut count = 0usize;
     visit(&program.stmts, false, &mut count)?;
     if count > 1 {
-        return Err("managed DSL supports at most one let x = orig()".to_string());
+        return Err("managed DSL supports at most one let x = orig(...)".to_string());
     }
     Ok(count == 1)
 }
 
 fn statements_contain_return_orig(stmts: &[DslStmt]) -> bool {
     stmts.iter().any(|stmt| match stmt {
-        DslStmt::ReturnOrig => true,
+        DslStmt::ReturnOrig { .. } => true,
         DslStmt::IfNull {
             then_stmts, else_stmts, ..
         }
@@ -3295,9 +3311,7 @@ fn statements_contain_return_orig(stmts: &[DslStmt]) -> bool {
             then_stmts, else_stmts, ..
         } => statements_contain_return_orig(then_stmts) || statements_contain_return_orig(else_stmts),
         DslStmt::Switch {
-            cases,
-            default_stmts,
-            ..
+            cases, default_stmts, ..
         } => {
             cases.iter().any(|(_, stmts)| statements_contain_return_orig(stmts))
                 || default_stmts
@@ -3314,16 +3328,16 @@ fn validate_orig_value_flow(program: &DslProgram) -> Result<(), String> {
         .stmts
         .iter()
         .position(|stmt| matches!(stmt, DslStmt::LetOrig { .. }))
-        .ok_or_else(|| "internal error: missing let x = orig()".to_string())?;
+        .ok_or_else(|| "internal error: missing let x = orig(...)".to_string())?;
     if statements_contain_return_orig(&program.stmts) {
-        return Err("let x = orig() cannot be mixed with return orig()".to_string());
+        return Err("let x = orig(...) cannot be mixed with return orig(...)".to_string());
     }
     if orig_pos != 0 {
-        return Err("let x = orig() must be the first top-level statement".to_string());
+        return Err("let x = orig(...) must be the first top-level statement".to_string());
     }
     let flow = analyze_return_flow(&program.stmts[orig_pos + 1..]);
     if flow.falls_through {
-        return Err("managed DSL using let x = orig() must return on every path after orig()".to_string());
+        return Err("managed DSL using let x = orig(...) must return on every path after orig(...)".to_string());
     }
     Ok(())
 }
@@ -3342,7 +3356,7 @@ fn collect_local_slots_from_stmts(
 ) -> Result<(), String> {
     for stmt in stmts {
         match stmt {
-            DslStmt::Let { name, type_name, .. } | DslStmt::LetOrig { name, type_name } => {
+            DslStmt::Let { name, type_name, .. } | DslStmt::LetOrig { name, type_name, .. } => {
                 if slots.contains_key(name) {
                     continue;
                 }
@@ -3372,9 +3386,7 @@ fn collect_local_slots_from_stmts(
                 collect_local_slots_from_stmts(else_stmts, slots, next)?;
             }
             DslStmt::Switch {
-                cases,
-                default_stmts,
-                ..
+                cases, default_stmts, ..
             } => {
                 for (_, stmts) in cases {
                     collect_local_slots_from_stmts(stmts, slots, next)?;
@@ -3400,12 +3412,61 @@ struct EmitContext<'a> {
     sink: &'a FieldRef,
 }
 
-fn emit_return_orig(ir: &mut DexIrBuilder, emit_ctx: &EmitContext<'_>) -> Result<(), String> {
-    if emit_ctx.is_static {
-        ir.invoke_static_range(emit_ctx.local_count, emit_ctx.ins_size as u8, emit_ctx.target.clone());
-    } else {
-        ir.invoke_virtual_range(emit_ctx.local_count, emit_ctx.ins_size as u8, emit_ctx.target.clone());
+fn emit_orig_invoke(ir: &mut DexIrBuilder, args: &DslOrigArgs, emit_ctx: &mut EmitContext<'_>) -> Result<(), String> {
+    match args {
+        DslOrigArgs::Original => {
+            if emit_ctx.is_static {
+                ir.invoke_static_range(emit_ctx.local_count, emit_ctx.ins_size as u8, emit_ctx.target.clone());
+            } else {
+                ir.invoke_virtual_range(emit_ctx.local_count, emit_ctx.ins_size as u8, emit_ctx.target.clone());
+            }
+        }
+        DslOrigArgs::Values(values) => {
+            if values.len() != emit_ctx.layout.arg_descriptors.len() {
+                return Err(format!(
+                    "orig(...) expects {} argument(s), got {}",
+                    emit_ctx.layout.arg_descriptors.len(),
+                    values.len()
+                ));
+            }
+            let receiver = if emit_ctx.is_static {
+                None
+            } else {
+                Some((
+                    emit_ctx
+                        .layout
+                        .this_reg
+                        .ok_or_else(|| "missing this register for orig(...)".to_string())?,
+                    emit_ctx
+                        .layout
+                        .this_descriptor
+                        .as_deref()
+                        .ok_or_else(|| "missing this descriptor for orig(...)".to_string())?,
+                ))
+            };
+            let kind = if emit_ctx.is_static {
+                ManagedInvokeKind::Static
+            } else {
+                ManagedInvokeKind::Virtual
+            };
+            let params = emit_ctx.layout.arg_descriptors.clone();
+            emit_invoke_with_values(
+                ir,
+                kind,
+                emit_ctx.target.clone(),
+                receiver,
+                &params,
+                values,
+                emit_ctx.layout,
+                emit_ctx.dsl_ctx,
+            )?;
+        }
     }
+    Ok(())
+}
+
+fn emit_return_orig(ir: &mut DexIrBuilder, args: &DslOrigArgs, emit_ctx: &mut EmitContext<'_>) -> Result<(), String> {
+    emit_orig_invoke(ir, args, emit_ctx)?;
     emit_return_from_orig(ir, emit_ctx.return_type)
 }
 
@@ -3417,7 +3478,7 @@ fn emit_return_value(
     match emit_ctx.return_type {
         "V" => {
             if value.is_some() {
-                return Err("void method can only use return; or return orig();".to_string());
+                return Err("void method can only use return; or return orig(...);".to_string());
             }
             ir.return_void();
         }
@@ -3483,8 +3544,8 @@ fn emit_statement(ir: &mut DexIrBuilder, stmt: &DslStmt, emit_ctx: &mut EmitCont
             emit_let(ir, name, type_name, value, emit_ctx.layout, emit_ctx.dsl_ctx)?;
             Ok(false)
         }
-        DslStmt::LetOrig { name, type_name } => {
-            emit_let_orig(ir, name, type_name, emit_ctx)?;
+        DslStmt::LetOrig { name, type_name, args } => {
+            emit_let_orig(ir, name, type_name, args, emit_ctx)?;
             Ok(false)
         }
         DslStmt::New {
@@ -3531,7 +3592,14 @@ fn emit_statement(ir: &mut DexIrBuilder, stmt: &DslStmt, emit_ctx: &mut EmitCont
             index,
             type_name,
         } => {
-            emit_array_get_stmt(ir, array, index, type_name.as_deref(), emit_ctx.layout, emit_ctx.dsl_ctx)?;
+            emit_array_get_stmt(
+                ir,
+                array,
+                index,
+                type_name.as_deref(),
+                emit_ctx.layout,
+                emit_ctx.dsl_ctx,
+            )?;
             Ok(false)
         }
         DslStmt::ArrayPut {
@@ -3540,7 +3608,15 @@ fn emit_statement(ir: &mut DexIrBuilder, stmt: &DslStmt, emit_ctx: &mut EmitCont
             type_name,
             value,
         } => {
-            emit_array_put(ir, array, index, type_name.as_deref(), value, emit_ctx.layout, emit_ctx.dsl_ctx)?;
+            emit_array_put(
+                ir,
+                array,
+                index,
+                type_name.as_deref(),
+                value,
+                emit_ctx.layout,
+                emit_ctx.dsl_ctx,
+            )?;
             Ok(false)
         }
         DslStmt::FieldRead { stmt, is_static } => {
@@ -3575,8 +3651,8 @@ fn emit_statement(ir: &mut DexIrBuilder, stmt: &DslStmt, emit_ctx: &mut EmitCont
             cases,
             default_stmts,
         } => emit_switch(ir, value, cases, default_stmts.as_deref(), emit_ctx),
-        DslStmt::ReturnOrig => {
-            emit_return_orig(ir, emit_ctx)?;
+        DslStmt::ReturnOrig { args } => {
+            emit_return_orig(ir, args, emit_ctx)?;
             Ok(true)
         }
         DslStmt::ReturnValue { value } => {
@@ -3622,7 +3698,7 @@ pub(super) unsafe fn build_managed_dsl_dex(
     if ins_size > u8::MAX as u16 {
         return Err(format!("too many invoke argument words: {}", ins_size));
     }
-    let max_invoke_words = program_max_invoke_words(&program)?;
+    let max_invoke_words = program_max_invoke_words(&program, &target_params, is_static)?;
     if max_invoke_words > u8::MAX as u16 {
         return Err(format!("too many DSL invoke argument words: {}", max_invoke_words));
     }
@@ -3718,6 +3794,7 @@ enum DslStmt {
     LetOrig {
         name: String,
         type_name: String,
+        args: DslOrigArgs,
     },
     New {
         class_name: String,
@@ -3779,10 +3856,18 @@ enum DslStmt {
         cases: Vec<(i16, Vec<DslStmt>)>,
         default_stmts: Option<Vec<DslStmt>>,
     },
-    ReturnOrig,
+    ReturnOrig {
+        args: DslOrigArgs,
+    },
     ReturnValue {
         value: Option<DslValue>,
     },
+}
+
+#[derive(Clone)]
+enum DslOrigArgs {
+    Original,
+    Values(Vec<DslValue>),
 }
 
 #[derive(Clone)]
@@ -3985,13 +4070,10 @@ impl<'a> DslParser<'a> {
             self.skip_ws();
             if self.peek_ident("orig") {
                 self.expect_ident("orig")?;
-                self.skip_ws();
-                self.expect_char('(')?;
-                self.skip_ws();
-                self.expect_char(')')?;
+                let args = self.parse_orig_args()?;
                 self.skip_ws();
                 self.expect_char(';')?;
-                return Ok(DslStmt::ReturnOrig);
+                return Ok(DslStmt::ReturnOrig { args });
             }
             let value = if self.peek() == Some(';') {
                 None
@@ -4066,15 +4148,13 @@ impl<'a> DslParser<'a> {
         self.skip_ws();
         if self.peek_ident("orig") {
             self.expect_ident("orig")?;
-            self.skip_ws();
-            self.expect_char('(')?;
-            self.skip_ws();
-            self.expect_char(')')?;
+            let args = self.parse_orig_args()?;
             self.skip_ws();
             self.expect_char(';')?;
             return Ok(DslStmt::LetOrig {
                 name: local_name,
                 type_name,
+                args,
             });
         }
         let value = self.parse_value_arg()?;
@@ -4085,6 +4165,20 @@ impl<'a> DslParser<'a> {
             type_name,
             value,
         })
+    }
+
+    fn parse_orig_args(&mut self) -> Result<DslOrigArgs, String> {
+        self.skip_ws();
+        self.expect_char('(')?;
+        self.skip_ws();
+        if self.peek() == Some(')') {
+            self.expect_char(')')?;
+            return Ok(DslOrigArgs::Original);
+        }
+        let args = self.parse_value_arg_list_until_close()?;
+        self.skip_ws();
+        self.expect_char(')')?;
+        Ok(DslOrigArgs::Values(args))
     }
 
     fn parse_js_new_statement(&mut self) -> Result<DslStmt, String> {
@@ -4150,11 +4244,7 @@ impl<'a> DslParser<'a> {
         };
         if first.starts_with('(') {
             let sig = first.clone();
-            let args = tokens
-                .into_iter()
-                .skip(1)
-                .map(token_to_value)
-                .collect::<Vec<_>>();
+            let args = tokens.into_iter().skip(1).map(token_to_value).collect::<Vec<_>>();
             return Ok((Some(sig), args));
         }
 
@@ -4651,9 +4741,7 @@ impl<'a> DslParser<'a> {
             let target = parse_target_name(&parts[0]).unwrap();
             let (class_name, params) = if overload_args.first().map(|arg| arg.starts_with('(')).unwrap_or(false) {
                 (None, overload_args[0].clone())
-            } else if overload_args.len() >= 2
-                && overload_args[1].starts_with('(')
-            {
+            } else if overload_args.len() >= 2 && overload_args[1].starts_with('(') {
                 (Some(overload_args[0].clone()), overload_args[1].clone())
             } else {
                 let first_is_explicit_class = matches!(target, DslTarget::Last | DslTarget::Result)
