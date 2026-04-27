@@ -208,12 +208,8 @@ pub(super) type GetStaticObjectFieldFn =
     unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
 pub(super) type NewDirectByteBufferFn =
     unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i64) -> *mut std::ffi::c_void;
-pub(super) type RegisterNativesFn = unsafe extern "C" fn(
-    JniEnv,
-    *mut std::ffi::c_void,
-    *const JniNativeMethod,
-    i32,
-) -> i32;
+pub(super) type RegisterNativesFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *const JniNativeMethod, i32) -> i32;
 
 #[repr(C)]
 pub(super) struct JniNativeMethod {
@@ -376,9 +372,8 @@ pub(super) fn is_code_pointer(val: u64) -> bool {
     crate::jsapi::util::read_proc_self_maps()
         .as_deref()
         .map(|maps| {
-            crate::jsapi::util::proc_maps_entries(maps).any(|entry| {
-                entry.contains(stripped) && (entry.prot_flags() & libc::PROT_EXEC) != 0
-            })
+            crate::jsapi::util::proc_maps_entries(maps)
+                .any(|entry| entry.contains(stripped) && (entry.prot_flags() & libc::PROT_EXEC) != 0)
         })
         .unwrap_or(false)
 }

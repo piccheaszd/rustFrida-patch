@@ -1179,8 +1179,7 @@ fn stack_replacement_source(method: u64) -> Option<u64> {
                 });
             }
             super::callback::HookType::Managed {
-                replacement_art_method,
-                ..
+                replacement_art_method, ..
             } if *replacement_art_method == method => {
                 return Some(data.art_method);
             }

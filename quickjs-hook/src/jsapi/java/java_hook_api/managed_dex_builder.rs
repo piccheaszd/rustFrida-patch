@@ -70,7 +70,7 @@ impl MethodRef {
 }
 
 mod dex_ir;
-use dex_ir::{value_kind_from_descriptor, DexIrBuilder, IfCmpOp, ValueKind};
+use dex_ir::{value_kind_from_descriptor, DexIntBinOp, DexIntLit16Op, DexIntLit8Op, DexIrBuilder, IfCmpOp, ValueKind};
 
 mod dex_writer;
 use dex_writer::{DexBuilder, DexClass};
@@ -191,8 +191,9 @@ fn resolve_call_proto(
 
 mod emitter;
 use emitter::{
-    collect_local_slots, emit_statements, helper_param_layout, program_max_invoke_words, program_uses_orig,
-    validate_orig_bypass_flow, DslBuildContext, EmitContext, BASE_LOCAL_REG_COUNT,
+    collect_local_slots, emit_statements, helper_param_layout, program_int_expr_scratch_count,
+    program_max_invoke_words, program_uses_orig, validate_orig_bypass_flow, DslBuildContext, EmitContext,
+    BASE_LOCAL_REG_COUNT,
 };
 
 pub(super) unsafe fn build_managed_dsl_dex(
@@ -212,7 +213,7 @@ pub(super) unsafe fn build_managed_dsl_dex(
     let target_type = java_class_to_descriptor(target_class_name)?;
     let object_type = "Ljava/lang/Object;".to_string();
     let (target_params, return_type) = parse_method_signature(target_sig)?;
-    validate_semantics(env, &program, is_static, target_type.clone(), target_params.clone())?;
+    let local_descriptors = validate_semantics(env, &program, is_static, target_type.clone(), target_params.clone())?;
     let mut helper_params = Vec::new();
     if !is_static {
         helper_params.push(target_type.clone());
@@ -227,10 +228,14 @@ pub(super) unsafe fn build_managed_dsl_dex(
     if max_invoke_words > u8::MAX as u16 {
         return Err(format!("too many DSL invoke argument words: {}", max_invoke_words));
     }
-    let locals_start = BASE_LOCAL_REG_COUNT
+    let int_expr_scratch_count = program_int_expr_scratch_count(&program);
+    let range_scratch_base = BASE_LOCAL_REG_COUNT
+        .checked_add(int_expr_scratch_count)
+        .ok_or_else(|| "too many dex registers".to_string())?;
+    let locals_start = range_scratch_base
         .checked_add(max_invoke_words)
         .ok_or_else(|| "too many dex registers".to_string())?;
-    let (local_slots, local_words) = collect_local_slots(&program, locals_start)?;
+    let (local_slots, local_words) = collect_local_slots(&local_descriptors, locals_start)?;
     let local_count = locals_start
         .checked_add(local_words)
         .ok_or_else(|| "too many dex registers".to_string())?;
@@ -248,7 +253,13 @@ pub(super) unsafe fn build_managed_dsl_dex(
     let generated_type = format!("Lrustfrida/DynManagedHook{};", class_id);
     let generated_class_name = format!("rustfrida.DynManagedHook{}", class_id);
     let sink = FieldRef::new(generated_type.clone(), object_type.clone(), "sink");
-    let mut dsl_ctx = DslBuildContext::new(env, generated_type.clone(), BASE_LOCAL_REG_COUNT);
+    let mut dsl_ctx = DslBuildContext::new(
+        env,
+        generated_type.clone(),
+        BASE_LOCAL_REG_COUNT,
+        int_expr_scratch_count,
+        range_scratch_base,
+    );
     let target = MethodRef::new(
         target_type.clone(),
         target_method_name.to_string(),

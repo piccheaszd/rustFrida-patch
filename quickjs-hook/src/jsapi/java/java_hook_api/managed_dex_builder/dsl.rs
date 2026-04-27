@@ -6,9 +6,14 @@ pub(super) struct DslProgram {
 
 #[derive(Clone)]
 pub(super) enum DslStmt {
+    Block(Vec<DslStmt>),
     Let {
         name: String,
-        type_name: String,
+        type_name: Option<String>,
+        value: DslValue,
+    },
+    Assign {
+        name: String,
         value: DslValue,
     },
     LetOrig {
@@ -99,6 +104,7 @@ pub(super) enum DslOrigArgs {
 pub(super) struct DslCallStmt {
     pub(super) kind: DslCallKind,
     pub(super) target: Option<DslTarget>,
+    pub(super) receiver: Option<Box<DslValue>>,
     pub(super) class_name: Option<String>,
     pub(super) method_name: String,
     pub(super) sig: String,
@@ -121,6 +127,7 @@ pub(super) enum DslCallKind {
 #[derive(Clone)]
 pub(super) struct DslFieldStmt {
     pub(super) target: Option<DslTarget>,
+    pub(super) receiver: Option<Box<DslValue>>,
     pub(super) class_name: Option<String>,
     pub(super) field_name: String,
     pub(super) type_name: String,
@@ -132,9 +139,17 @@ pub(super) enum DslValue {
     Target(DslTarget),
     String(String),
     Int(i16),
+    Bool(bool),
     Null,
-    AddLit(Box<DslValue>, i8),
-    SubLit(Box<DslValue>, i8),
+    UnaryOp {
+        op: DslUnaryOp,
+        value: Box<DslValue>,
+    },
+    IntBinOp {
+        op: DslIntBinOp,
+        left: Box<DslValue>,
+        right: Box<DslValue>,
+    },
     Call(DslCallStmt),
     NewObject {
         class_name: String,
@@ -157,6 +172,28 @@ pub(super) enum DslValue {
     },
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum DslUnaryOp {
+    Neg,
+    BitNot,
+    BoolNot,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum DslIntBinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    And,
+    Or,
+    Xor,
+    Shl,
+    Shr,
+    Ushr,
+}
+
 enum DslCondition {
     Null {
         value: DslValue,
@@ -174,6 +211,7 @@ enum DslCondition {
     Bool {
         value: DslValue,
     },
+    Const(bool),
     And(Box<DslCondition>, Box<DslCondition>),
     Or(Box<DslCondition>, Box<DslCondition>),
     Not(Box<DslCondition>),
@@ -182,6 +220,8 @@ enum DslCondition {
 impl DslCondition {
     fn into_if_stmt(self, then_stmts: Vec<DslStmt>, else_stmts: Vec<DslStmt>) -> DslStmt {
         match self {
+            DslCondition::Const(true) => DslStmt::Block(then_stmts),
+            DslCondition::Const(false) => DslStmt::Block(else_stmts),
             DslCondition::Null { value, invert } => DslStmt::IfNull {
                 value,
                 invert,
@@ -216,6 +256,32 @@ impl DslCondition {
             }
             DslCondition::Not(condition) => condition.into_if_stmt(else_stmts, then_stmts),
         }
+    }
+}
+
+fn condition_and(left: DslCondition, right: DslCondition) -> DslCondition {
+    match (left, right) {
+        (DslCondition::Const(false), _) | (_, DslCondition::Const(false)) => DslCondition::Const(false),
+        (DslCondition::Const(true), right) => right,
+        (left, DslCondition::Const(true)) => left,
+        (left, right) => DslCondition::And(Box::new(left), Box::new(right)),
+    }
+}
+
+fn condition_or(left: DslCondition, right: DslCondition) -> DslCondition {
+    match (left, right) {
+        (DslCondition::Const(true), _) | (_, DslCondition::Const(true)) => DslCondition::Const(true),
+        (DslCondition::Const(false), right) => right,
+        (left, DslCondition::Const(false)) => left,
+        (left, right) => DslCondition::Or(Box::new(left), Box::new(right)),
+    }
+}
+
+fn condition_not(condition: DslCondition) -> DslCondition {
+    match condition {
+        DslCondition::Const(value) => DslCondition::Const(!value),
+        DslCondition::Not(inner) => *inner,
+        other => DslCondition::Not(Box::new(other)),
     }
 }
 
@@ -335,6 +401,13 @@ impl<'a> DslParser<'a> {
             self.expect_char(';')?;
             return Ok(stmt);
         }
+        if self.peek() == Some('=') {
+            self.expect_char('=')?;
+            let value = self.parse_value_arg()?;
+            self.skip_ws();
+            self.expect_char(';')?;
+            return Ok(DslStmt::Assign { name, value });
+        }
         if self.peek() == Some('.') || self.peek() == Some('[') || self.peek_ident("as") {
             let value = self.parse_value_from_ident(name)?;
             self.skip_ws();
@@ -374,12 +447,19 @@ impl<'a> DslParser<'a> {
         self.skip_ws();
         let local_name = self.parse_ident()?;
         self.skip_ws();
-        self.expect_char(':')?;
-        let type_name = self.parse_type_name()?;
+        let type_name = if self.peek() == Some(':') {
+            self.expect_char(':')?;
+            Some(self.parse_type_name()?)
+        } else {
+            None
+        };
         self.skip_ws();
         self.expect_char('=')?;
         self.skip_ws();
         if self.peek_ident("orig") {
+            let Some(type_name) = type_name else {
+                return Err(self.err("let x = orig(...) requires an explicit type"));
+            };
             self.expect_ident("orig")?;
             let args = self.parse_orig_args()?;
             self.skip_ws();
@@ -693,7 +773,13 @@ fn dsl_lex(input: &str) -> Result<Vec<DslToken>, String> {
             continue;
         }
         let rest = &input[pos..];
-        let op = if rest.starts_with("==") {
+        let op = if rest.starts_with(">>>") {
+            Some(">>>")
+        } else if rest.starts_with("<<") {
+            Some("<<")
+        } else if rest.starts_with(">>") {
+            Some(">>")
+        } else if rest.starts_with("==") {
             Some("==")
         } else if rest.starts_with("!=") {
             Some("!=")
@@ -716,7 +802,7 @@ fn dsl_lex(input: &str) -> Result<Vec<DslToken>, String> {
             });
             continue;
         }
-        if "{}()[];:,.+-=<>!".contains(ch) {
+        if "{}()[];:,.+-=<>!*/%&|^~".contains(ch) {
             pos += ch.len_utf8();
             tokens.push(DslToken {
                 kind: DslTokenKind::Symbol(ch),
@@ -851,30 +937,116 @@ impl<'a> DslParser<'a> {
         Ok(signed as i16)
     }
 
-    fn parse_i8(&mut self) -> Result<i8, String> {
-        let value = self.parse_i16()?;
-        if value < i8::MIN as i16 || value > i8::MAX as i16 {
-            return Err(self.err("integer must fit int8"));
-        }
-        Ok(value as i8)
+    fn parse_value_arg(&mut self) -> Result<DslValue, String> {
+        self.parse_int_binary_expr(0)
     }
 
-    fn parse_value_arg(&mut self) -> Result<DslValue, String> {
+    fn parse_int_binary_expr(&mut self, min_prec: u8) -> Result<DslValue, String> {
+        let mut left = self.parse_value_unary()?;
+        loop {
+            self.skip_ws();
+            let Some((op, prec)) = self.peek_int_binary_op() else {
+                break;
+            };
+            if prec < min_prec {
+                break;
+            }
+            self.consume_int_binary_op(op)?;
+            let right = self.parse_int_binary_expr(prec + 1)?;
+            left = fold_int_binop(op, left, right);
+        }
+        Ok(left)
+    }
+
+    fn parse_value_unary(&mut self) -> Result<DslValue, String> {
+        self.skip_ws();
+        if self.peek() == Some('-') {
+            self.expect_char('-')?;
+            if self.peek_number() {
+                self.pos = self.pos.saturating_sub(1);
+                return Ok(DslValue::Int(self.parse_i16()?));
+            }
+            let value = self.parse_value_unary()?;
+            return Ok(fold_unary_op(DslUnaryOp::Neg, value));
+        }
+        if self.peek() == Some('~') {
+            self.expect_char('~')?;
+            let value = self.parse_value_unary()?;
+            return Ok(fold_unary_op(DslUnaryOp::BitNot, value));
+        }
+        if self.peek() == Some('!') {
+            self.expect_char('!')?;
+            let value = self.parse_value_unary()?;
+            return Ok(fold_unary_op(DslUnaryOp::BoolNot, value));
+        }
+        self.parse_value_primary()
+    }
+
+    fn parse_value_primary(&mut self) -> Result<DslValue, String> {
         self.skip_ws();
         let value = if self.peek_string() {
             DslValue::String(self.parse_string()?)
-        } else if self.peek() == Some('-') || self.peek_number() {
+        } else if self.peek_number() {
             DslValue::Int(self.parse_i16()?)
+        } else if self.peek() == Some('(') {
+            self.expect_char('(')?;
+            let value = self.parse_value_arg()?;
+            self.expect_char(')')?;
+            value
         } else {
             let ident = self.parse_ident()?;
             if ident == "null" {
                 DslValue::Null
+            } else if ident == "true" {
+                DslValue::Bool(true)
+            } else if ident == "false" {
+                DslValue::Bool(false)
             } else {
                 self.parse_value_from_ident(ident)?
             }
         };
         self.skip_ws();
         self.parse_value_postfix(value)
+    }
+
+    fn peek_int_binary_op(&mut self) -> Option<(DslIntBinOp, u8)> {
+        self.skip_ws();
+        if self.peek_op(">>>") {
+            return Some((DslIntBinOp::Ushr, 5));
+        }
+        if self.peek_op("<<") {
+            return Some((DslIntBinOp::Shl, 5));
+        }
+        if self.peek_op(">>") {
+            return Some((DslIntBinOp::Shr, 5));
+        }
+        match self.peek()? {
+            '|' => Some((DslIntBinOp::Or, 1)),
+            '^' => Some((DslIntBinOp::Xor, 2)),
+            '&' => Some((DslIntBinOp::And, 3)),
+            '+' => Some((DslIntBinOp::Add, 6)),
+            '-' => Some((DslIntBinOp::Sub, 6)),
+            '*' => Some((DslIntBinOp::Mul, 7)),
+            '/' => Some((DslIntBinOp::Div, 7)),
+            '%' => Some((DslIntBinOp::Rem, 7)),
+            _ => None,
+        }
+    }
+
+    fn consume_int_binary_op(&mut self, op: DslIntBinOp) -> Result<(), String> {
+        match op {
+            DslIntBinOp::Ushr => self.expect_op(">>>"),
+            DslIntBinOp::Shl => self.expect_op("<<"),
+            DslIntBinOp::Shr => self.expect_op(">>"),
+            DslIntBinOp::Or => self.expect_char('|'),
+            DslIntBinOp::Xor => self.expect_char('^'),
+            DslIntBinOp::And => self.expect_char('&'),
+            DslIntBinOp::Add => self.expect_char('+'),
+            DslIntBinOp::Sub => self.expect_char('-'),
+            DslIntBinOp::Mul => self.expect_char('*'),
+            DslIntBinOp::Div => self.expect_char('/'),
+            DslIntBinOp::Rem => self.expect_char('%'),
+        }
     }
 
     fn parse_value_from_ident(&mut self, ident: String) -> Result<DslValue, String> {
@@ -914,18 +1086,148 @@ impl<'a> DslParser<'a> {
                     index: Box::new(index),
                     type_name,
                 };
-            } else if self.peek() == Some('+') {
-                self.expect_char('+')?;
-                let literal = self.parse_i8()?;
-                value = DslValue::AddLit(Box::new(value), literal);
-            } else if self.peek() == Some('-') {
-                self.expect_char('-')?;
-                let literal = self.parse_i8()?;
-                value = DslValue::SubLit(Box::new(value), literal);
+            } else if self.peek() == Some('.') {
+                value = self.parse_postfix_member_value(value)?;
             } else {
                 return Ok(value);
             }
         }
+    }
+
+    fn parse_postfix_member_value(&mut self, receiver: DslValue) -> Result<DslValue, String> {
+        self.expect_char('.')?;
+        let member_name = self.parse_ident()?;
+        self.skip_ws();
+
+        if member_name == "length" && self.peek() != Some('(') && self.peek() != Some('.') {
+            return Ok(DslValue::ArrayLength(Box::new(receiver)));
+        }
+        if member_name == "$new" {
+            return Err(self.err("$new is only supported on class names"));
+        }
+
+        let call_kind = if self.peek() == Some('.') {
+            let checkpoint = self.pos;
+            self.expect_char('.')?;
+            if self.peek_ident("interface") {
+                self.expect_ident("interface")?;
+                self.skip_ws();
+                DslCallKind::Interface
+            } else {
+                self.pos = checkpoint;
+                DslCallKind::Virtual
+            }
+        } else {
+            DslCallKind::Virtual
+        };
+
+        if self.peek() == Some('.') {
+            self.expect_char('.')?;
+            self.expect_ident("overload")?;
+            return self.parse_postfix_overload_call(receiver, member_name, call_kind);
+        }
+
+        self.expect_char('(')?;
+        let sig_or_type = self.parse_string_arg()?;
+        let args = self.parse_optional_value_args()?;
+        self.expect_char(')')?;
+        if sig_or_type.starts_with('(') {
+            Ok(DslValue::Call(DslCallStmt {
+                kind: call_kind,
+                target: None,
+                receiver: Some(Box::new(receiver)),
+                class_name: None,
+                method_name: member_name,
+                sig: sig_or_type,
+                args,
+            }))
+        } else {
+            if call_kind == DslCallKind::Interface {
+                return Err(self.err("interface field access is not supported"));
+            }
+            if !args.is_empty() {
+                return Err(self.err("field access does not accept value arguments"));
+            }
+            Ok(DslValue::FieldGet {
+                stmt: Box::new(DslFieldStmt {
+                    target: None,
+                    receiver: Some(Box::new(receiver)),
+                    class_name: None,
+                    field_name: member_name,
+                    type_name: sig_or_type,
+                    value: None,
+                }),
+                is_static: false,
+            })
+        }
+    }
+
+    fn parse_postfix_overload_call(
+        &mut self,
+        receiver: DslValue,
+        method_name: String,
+        call_kind: DslCallKind,
+    ) -> Result<DslValue, String> {
+        self.expect_char('(')?;
+        self.skip_ws();
+        let mut overload_args = Vec::new();
+        if self.peek() != Some(')') {
+            loop {
+                overload_args.push(self.parse_string_arg()?);
+                if self.peek() != Some(',') {
+                    break;
+                }
+                self.expect_char(',')?;
+                self.skip_ws();
+            }
+        }
+        self.expect_char(')')?;
+        self.skip_ws();
+        self.expect_char('(')?;
+        let args = self.parse_value_arg_list_until_close()?;
+        self.expect_char(')')?;
+
+        let (class_name, params) = if call_kind == DslCallKind::Interface {
+            let Some(class_name) = overload_args.first() else {
+                return Err(self.err("interface overload expects overload(\"InterfaceClass\", ...)"));
+            };
+            if class_name.starts_with('(') {
+                return Err(self.err("interface overload expects overload(\"InterfaceClass\", ...)"));
+            }
+            let params = if overload_args.len() >= 2 && overload_args[1].starts_with('(') {
+                overload_args[1].clone()
+            } else {
+                let param_types = overload_args[1..]
+                    .iter()
+                    .map(|arg| java_class_to_descriptor_or_primitive(arg))
+                    .collect::<Result<Vec<_>, _>>()?;
+                build_params_sig(&param_types)
+            };
+            (Some(class_name.clone()), params)
+        } else if overload_args.first().map(|arg| arg.starts_with('(')).unwrap_or(false) {
+            if overload_args.len() != 1 {
+                return Err(self.err("full-signature overload expects overload(\"sig\")"));
+            }
+            (None, overload_args[0].clone())
+        } else if overload_args.len() >= 2 && overload_args[1].starts_with('(') {
+            (Some(overload_args[0].clone()), overload_args[1].clone())
+        } else {
+            let param_types = overload_args
+                .iter()
+                .map(|arg| java_class_to_descriptor_or_primitive(arg))
+                .collect::<Result<Vec<_>, _>>()?;
+            (None, build_params_sig(&param_types))
+        };
+
+        Ok(DslValue::Call(DslCallStmt {
+            kind: call_kind,
+            target: None,
+            receiver: Some(Box::new(receiver)),
+            class_name,
+            method_name,
+            sig: params,
+            args,
+        }))
     }
 
     fn parse_js_member_value(&mut self, first: String) -> Result<DslValue, String> {
@@ -966,6 +1268,7 @@ impl<'a> DslParser<'a> {
                 Ok(DslValue::Call(DslCallStmt {
                     kind: DslCallKind::Virtual,
                     target: Some(target),
+                    receiver: None,
                     class_name,
                     method_name: parts[1].clone(),
                     sig: sig_or_type,
@@ -978,6 +1281,7 @@ impl<'a> DslParser<'a> {
                 Ok(DslValue::FieldGet {
                     stmt: Box::new(DslFieldStmt {
                         target: Some(target),
+                        receiver: None,
                         class_name,
                         field_name: parts[1].clone(),
                         type_name: sig_or_type,
@@ -996,6 +1300,7 @@ impl<'a> DslParser<'a> {
                 Ok(DslValue::Call(DslCallStmt {
                     kind: DslCallKind::Static,
                     target: None,
+                    receiver: None,
                     class_name: Some(class_name),
                     method_name: member_name,
                     sig: sig_or_type,
@@ -1008,6 +1313,7 @@ impl<'a> DslParser<'a> {
                 Ok(DslValue::FieldGet {
                     stmt: Box::new(DslFieldStmt {
                         target: None,
+                        receiver: None,
                         class_name: Some(class_name),
                         field_name: member_name,
                         type_name: sig_or_type,
@@ -1039,6 +1345,12 @@ impl<'a> DslParser<'a> {
             return Err(self.err("expected member.overload(...)"));
         }
         parts.pop();
+        let call_kind = if parts.last().map(|part| part.as_str()) == Some("interface") {
+            parts.pop();
+            DslCallKind::Interface
+        } else {
+            DslCallKind::Virtual
+        };
         let member_name = parts.pop().unwrap();
 
         self.expect_char('(')?;
@@ -1062,7 +1374,24 @@ impl<'a> DslParser<'a> {
 
         if parts.len() == 1 && parse_target_name(&parts[0]).is_some() {
             let target = parse_target_name(&parts[0]).unwrap();
-            let (class_name, params) = if overload_args.first().map(|arg| arg.starts_with('(')).unwrap_or(false) {
+            let (class_name, params) = if call_kind == DslCallKind::Interface {
+                let Some(class_name) = overload_args.first() else {
+                    return Err(self.err("interface overload expects overload(\"InterfaceClass\", ...)"));
+                };
+                if class_name.starts_with('(') {
+                    return Err(self.err("interface overload expects overload(\"InterfaceClass\", ...)"));
+                }
+                let params = if overload_args.len() >= 2 && overload_args[1].starts_with('(') {
+                    overload_args[1].clone()
+                } else {
+                    let param_types = overload_args[1..]
+                        .iter()
+                        .map(|arg| java_class_to_descriptor_or_primitive(arg))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    build_params_sig(&param_types)
+                };
+                (Some(class_name.clone()), params)
+            } else if overload_args.first().map(|arg| arg.starts_with('(')).unwrap_or(false) {
                 (None, overload_args[0].clone())
             } else if overload_args.len() >= 2 && overload_args[1].starts_with('(') {
                 (Some(overload_args[0].clone()), overload_args[1].clone())
@@ -1085,14 +1414,18 @@ impl<'a> DslParser<'a> {
                 }
             };
             Ok(DslValue::Call(DslCallStmt {
-                kind: DslCallKind::Virtual,
+                kind: call_kind,
                 target: Some(target),
+                receiver: None,
                 class_name,
                 method_name: member_name,
                 sig: params,
                 args,
             }))
         } else {
+            if call_kind == DslCallKind::Interface {
+                return Err(self.err("interface overload requires an instance target"));
+            }
             let params = if overload_args.first().map(|arg| arg.starts_with('(')).unwrap_or(false) {
                 if overload_args.len() != 1 {
                     return Err(self.err("static full-signature overload expects overload(\"sig\")"));
@@ -1108,6 +1441,7 @@ impl<'a> DslParser<'a> {
             Ok(DslValue::Call(DslCallStmt {
                 kind: DslCallKind::Static,
                 target: None,
+                receiver: None,
                 class_name: Some(parts.join(".")),
                 method_name: member_name,
                 sig: params,
@@ -1129,7 +1463,7 @@ impl<'a> DslParser<'a> {
             }
             self.expect_op("||")?;
             let right = self.parse_js_and_condition()?;
-            condition = DslCondition::Or(Box::new(condition), Box::new(right));
+            condition = condition_or(condition, right);
         }
         Ok(condition)
     }
@@ -1143,7 +1477,7 @@ impl<'a> DslParser<'a> {
             }
             self.expect_op("&&")?;
             let right = self.parse_js_unary_condition()?;
-            condition = DslCondition::And(Box::new(condition), Box::new(right));
+            condition = condition_and(condition, right);
         }
         Ok(condition)
     }
@@ -1152,7 +1486,7 @@ impl<'a> DslParser<'a> {
         self.skip_ws();
         if self.peek() == Some('!') {
             self.expect_char('!')?;
-            return Ok(DslCondition::Not(Box::new(self.parse_js_unary_condition()?)));
+            return Ok(condition_not(self.parse_js_unary_condition()?));
         }
         if self.peek() == Some('(') {
             self.expect_char('(')?;
@@ -1175,6 +1509,9 @@ impl<'a> DslParser<'a> {
             });
         }
         if !self.peek_js_cmp_op() {
+            if let DslValue::Bool(value) = left {
+                return Ok(DslCondition::Const(value));
+            }
             return Ok(DslCondition::Bool { value: left });
         }
         let op = self.parse_js_cmp_op()?;
@@ -1350,6 +1687,136 @@ fn parse_target_name(name: &str) -> Option<DslTarget> {
         value if is_local_ident(value) => Some(DslTarget::Local(value.to_string())),
         _ => None,
     }
+}
+
+fn fold_unary_op(op: DslUnaryOp, value: DslValue) -> DslValue {
+    match (op, value) {
+        (DslUnaryOp::Neg, DslValue::Int(value)) => {
+            value
+                .checked_neg()
+                .map(DslValue::Int)
+                .unwrap_or_else(|| DslValue::UnaryOp {
+                    op,
+                    value: Box::new(DslValue::Int(value)),
+                })
+        }
+        (DslUnaryOp::BitNot, DslValue::Int(value)) => DslValue::Int(!value),
+        (DslUnaryOp::BoolNot, DslValue::Bool(value)) => DslValue::Bool(!value),
+        (op, value) => DslValue::UnaryOp {
+            op,
+            value: Box::new(value),
+        },
+    }
+}
+
+fn fold_int_binop(op: DslIntBinOp, left: DslValue, right: DslValue) -> DslValue {
+    let (DslValue::Int(left_value), DslValue::Int(right_value)) = (&left, &right) else {
+        return simplify_int_binop(op, left, right);
+    };
+    let Some(folded) = eval_const_int_binop(op, *left_value as i32, *right_value as i32) else {
+        return simplify_int_binop(op, left, right);
+    };
+    if folded < i16::MIN as i32 || folded > i16::MAX as i32 {
+        return simplify_int_binop(op, left, right);
+    }
+    DslValue::Int(folded as i16)
+}
+
+fn simplify_int_binop(op: DslIntBinOp, left: DslValue, right: DslValue) -> DslValue {
+    let left_int = value_int_literal(&left);
+    let right_int = value_int_literal(&right);
+    match op {
+        DslIntBinOp::Add => {
+            if right_int == Some(0) {
+                return left;
+            }
+            if left_int == Some(0) {
+                return right;
+            }
+        }
+        DslIntBinOp::Sub => {
+            if right_int == Some(0) {
+                return left;
+            }
+            if left_int == Some(0) {
+                return fold_unary_op(DslUnaryOp::Neg, right);
+            }
+        }
+        DslIntBinOp::Mul => {
+            if right_int == Some(1) {
+                return left;
+            }
+            if left_int == Some(1) {
+                return right;
+            }
+        }
+        DslIntBinOp::Div => {
+            if right_int == Some(1) {
+                return left;
+            }
+        }
+        DslIntBinOp::And => {
+            if right_int == Some(-1) {
+                return left;
+            }
+            if left_int == Some(-1) {
+                return right;
+            }
+        }
+        DslIntBinOp::Or | DslIntBinOp::Xor => {
+            if right_int == Some(0) {
+                return left;
+            }
+            if left_int == Some(0) {
+                return right;
+            }
+        }
+        DslIntBinOp::Shl | DslIntBinOp::Shr | DslIntBinOp::Ushr => {
+            if right_int == Some(0) {
+                return left;
+            }
+        }
+        DslIntBinOp::Rem => {}
+    }
+    DslValue::IntBinOp {
+        op,
+        left: Box::new(left),
+        right: Box::new(right),
+    }
+}
+
+fn value_int_literal(value: &DslValue) -> Option<i16> {
+    let DslValue::Int(value) = value else {
+        return None;
+    };
+    Some(*value)
+}
+
+fn eval_const_int_binop(op: DslIntBinOp, left: i32, right: i32) -> Option<i32> {
+    let value = match op {
+        DslIntBinOp::Add => left.wrapping_add(right),
+        DslIntBinOp::Sub => left.wrapping_sub(right),
+        DslIntBinOp::Mul => left.wrapping_mul(right),
+        DslIntBinOp::Div => {
+            if right == 0 {
+                return None;
+            }
+            left.wrapping_div(right)
+        }
+        DslIntBinOp::Rem => {
+            if right == 0 {
+                return None;
+            }
+            left.wrapping_rem(right)
+        }
+        DslIntBinOp::And => left & right,
+        DslIntBinOp::Or => left | right,
+        DslIntBinOp::Xor => left ^ right,
+        DslIntBinOp::Shl => left.wrapping_shl((right & 0x1f) as u32),
+        DslIntBinOp::Shr => left.wrapping_shr((right & 0x1f) as u32),
+        DslIntBinOp::Ushr => ((left as u32).wrapping_shr((right & 0x1f) as u32)) as i32,
+    };
+    Some(value)
 }
 
 fn is_local_ident(value: &str) -> bool {

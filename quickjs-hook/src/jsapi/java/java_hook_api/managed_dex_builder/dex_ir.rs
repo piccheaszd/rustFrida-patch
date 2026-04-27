@@ -252,8 +252,16 @@ impl DexIrBuilder {
         self.instrs.push(IrInstr::Sput { src, field, kind });
     }
 
-    pub(super) fn add_int_lit8(&mut self, dst: u8, src: u8, literal: i8) {
-        self.instrs.push(IrInstr::AddIntLit8 { dst, src, literal });
+    pub(super) fn int_binop(&mut self, op: DexIntBinOp, dst: u8, left: u8, right: u8) {
+        self.instrs.push(IrInstr::IntBinOp { op, dst, left, right });
+    }
+
+    pub(super) fn int_binop_lit8(&mut self, op: DexIntLit8Op, dst: u8, src: u8, literal: i8) {
+        self.instrs.push(IrInstr::IntBinOpLit8 { op, dst, src, literal });
+    }
+
+    pub(super) fn int_binop_lit16(&mut self, op: DexIntLit16Op, dst: u8, src: u8, literal: i16) {
+        self.instrs.push(IrInstr::IntBinOpLit16 { op, dst, src, literal });
     }
 
     pub(super) fn move_result_object(&mut self, dst: u8) {
@@ -457,10 +465,23 @@ enum IrInstr {
         field: FieldRef,
         kind: ValueKind,
     },
-    AddIntLit8 {
+    IntBinOp {
+        op: DexIntBinOp,
+        dst: u8,
+        left: u8,
+        right: u8,
+    },
+    IntBinOpLit8 {
+        op: DexIntLit8Op,
         dst: u8,
         src: u8,
         literal: i8,
+    },
+    IntBinOpLit16 {
+        op: DexIntLit16Op,
+        dst: u8,
+        src: u8,
+        literal: i16,
     },
     MoveResult {
         dst: u8,
@@ -491,6 +512,99 @@ pub(super) enum IfCmpOp {
     Ge,
     Gt,
     Le,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum DexIntBinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    And,
+    Or,
+    Xor,
+    Shl,
+    Shr,
+    Ushr,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum DexIntLit8Op {
+    Add,
+    Rsub,
+    Mul,
+    Div,
+    Rem,
+    And,
+    Or,
+    Xor,
+    Shl,
+    Shr,
+    Ushr,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum DexIntLit16Op {
+    Add,
+    Rsub,
+    Mul,
+    Div,
+    Rem,
+    And,
+    Or,
+    Xor,
+}
+
+impl DexIntBinOp {
+    fn opcode(self) -> u16 {
+        match self {
+            DexIntBinOp::Add => 0x0090,
+            DexIntBinOp::Sub => 0x0091,
+            DexIntBinOp::Mul => 0x0092,
+            DexIntBinOp::Div => 0x0093,
+            DexIntBinOp::Rem => 0x0094,
+            DexIntBinOp::And => 0x0095,
+            DexIntBinOp::Or => 0x0096,
+            DexIntBinOp::Xor => 0x0097,
+            DexIntBinOp::Shl => 0x0098,
+            DexIntBinOp::Shr => 0x0099,
+            DexIntBinOp::Ushr => 0x009a,
+        }
+    }
+}
+
+impl DexIntLit16Op {
+    fn opcode(self) -> u16 {
+        match self {
+            DexIntLit16Op::Add => 0x00d0,
+            DexIntLit16Op::Rsub => 0x00d1,
+            DexIntLit16Op::Mul => 0x00d2,
+            DexIntLit16Op::Div => 0x00d3,
+            DexIntLit16Op::Rem => 0x00d4,
+            DexIntLit16Op::And => 0x00d5,
+            DexIntLit16Op::Or => 0x00d6,
+            DexIntLit16Op::Xor => 0x00d7,
+        }
+    }
+}
+
+impl DexIntLit8Op {
+    fn opcode(self) -> u16 {
+        match self {
+            DexIntLit8Op::Add => 0x00d8,
+            DexIntLit8Op::Rsub => 0x00d9,
+            DexIntLit8Op::Mul => 0x00da,
+            DexIntLit8Op::Div => 0x00db,
+            DexIntLit8Op::Rem => 0x00dc,
+            DexIntLit8Op::And => 0x00dd,
+            DexIntLit8Op::Or => 0x00de,
+            DexIntLit8Op::Xor => 0x00df,
+            DexIntLit8Op::Shl => 0x00e0,
+            DexIntLit8Op::Shr => 0x00e1,
+            DexIntLit8Op::Ushr => 0x00e2,
+        }
+    }
 }
 
 impl IfCmpOp {
@@ -556,7 +670,7 @@ impl IrInstr {
             | IrInstr::InvokeInterfaceRange { .. } => 3,
             IrInstr::SputObject { .. } => 2,
             IrInstr::Iget { .. } | IrInstr::Iput { .. } | IrInstr::Sget { .. } | IrInstr::Sput { .. } => 2,
-            IrInstr::AddIntLit8 { .. } => 2,
+            IrInstr::IntBinOp { .. } | IrInstr::IntBinOpLit8 { .. } | IrInstr::IntBinOpLit16 { .. } => 2,
             IrInstr::MoveResult { .. } | IrInstr::MoveResultWide { .. } => 1,
             IrInstr::MoveResultObject { .. } => 1,
             IrInstr::Return { .. } | IrInstr::ReturnWide { .. } => 1,
@@ -788,11 +902,24 @@ impl IrInstr {
                 code.raw(field_opcode(true, true, kind) | ((src as u16) << 8));
                 code.field_idx(field);
             }
-            IrInstr::AddIntLit8 { dst, src, literal } => {
-                require_byte(dst, "add-int/lit8 dst")?;
-                require_byte(src, "add-int/lit8 src")?;
-                code.raw(0x00d8 | ((dst as u16) << 8));
+            IrInstr::IntBinOp { op, dst, left, right } => {
+                require_byte(dst, "int binop dst")?;
+                require_byte(left, "int binop left")?;
+                require_byte(right, "int binop right")?;
+                code.raw(op.opcode() | ((dst as u16) << 8));
+                code.raw((left as u16) | ((right as u16) << 8));
+            }
+            IrInstr::IntBinOpLit8 { op, dst, src, literal } => {
+                require_byte(dst, "int binop/lit8 dst")?;
+                require_byte(src, "int binop/lit8 src")?;
+                code.raw(op.opcode() | ((dst as u16) << 8));
                 code.raw((src as u16) | (((literal as i16 as u16) & 0xff) << 8));
+            }
+            IrInstr::IntBinOpLit16 { op, dst, src, literal } => {
+                require_nibble(dst, "int binop/lit16 dst")?;
+                require_nibble(src, "int binop/lit16 src")?;
+                code.raw(op.opcode() | ((dst as u16) << 8) | ((src as u16) << 12));
+                code.raw(literal as u16);
             }
             IrInstr::MoveResult { dst } => {
                 require_byte(dst, "move-result dst")?;

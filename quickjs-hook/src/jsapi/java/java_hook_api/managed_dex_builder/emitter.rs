@@ -1,11 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::dsl::{DslCallKind, DslCallStmt, DslFieldStmt, DslOrigArgs, DslProgram, DslStmt, DslTarget, DslValue};
+use super::dsl::{
+    DslCallKind, DslCallStmt, DslFieldStmt, DslIntBinOp, DslOrigArgs, DslProgram, DslStmt, DslTarget, DslUnaryOp,
+    DslValue,
+};
 use super::{
     array_component_descriptor, descriptor_list_word_count, descriptor_word_count, emit_return_from_orig,
     java_class_to_descriptor, java_class_to_descriptor_or_primitive, parse_call_params, parse_method_signature,
-    resolve_call_proto, return_is_object, value_kind_from_descriptor, DexIrBuilder, FieldRef, GeneratedStringLiteral,
-    IfCmpOp, MethodRef, ValueKind,
+    resolve_call_proto, return_is_object, value_kind_from_descriptor, DexIntBinOp, DexIntLit16Op, DexIntLit8Op,
+    DexIrBuilder, FieldRef, GeneratedStringLiteral, IfCmpOp, MethodRef, ValueKind,
 };
 use crate::jsapi::java::jni_core::JniEnv;
 
@@ -34,17 +37,38 @@ pub(super) struct DslBuildContext {
     env: JniEnv,
     generated_type: String,
     pub(super) string_literals: Vec<GeneratedStringLiteral>,
+    int_expr_scratch_base: u16,
+    int_expr_scratch_count: u16,
     range_scratch_base: u16,
 }
 
 impl DslBuildContext {
-    pub(super) fn new(env: JniEnv, generated_type: String, range_scratch_base: u16) -> Self {
+    pub(super) fn new(
+        env: JniEnv,
+        generated_type: String,
+        int_expr_scratch_base: u16,
+        int_expr_scratch_count: u16,
+        range_scratch_base: u16,
+    ) -> Self {
         Self {
             env,
             generated_type,
             string_literals: Vec::new(),
+            int_expr_scratch_base,
+            int_expr_scratch_count,
             range_scratch_base,
         }
+    }
+
+    fn int_expr_scratch_reg(&self, index: u16) -> Result<u8, String> {
+        if index >= self.int_expr_scratch_count {
+            return Err(format!(
+                "int expression requires scratch register {}, only {} reserved",
+                index + 1,
+                self.int_expr_scratch_count
+            ));
+        }
+        checked_reg(self.int_expr_scratch_base + index, "int expression scratch register")
     }
 
     fn string_literal_field(&mut self, value: &str) -> FieldRef {
@@ -263,7 +287,13 @@ fn emit_call_value(
     layout: &HelperParamLayout,
     dsl_ctx: &mut DslBuildContext,
 ) -> Result<u8, String> {
-    let class_type = resolve_member_class_type(stmt.class_name.as_deref(), stmt.target.as_ref(), layout)?;
+    let class_type = resolve_member_class_type(
+        stmt.class_name.as_deref(),
+        stmt.target.as_ref(),
+        stmt.receiver.as_deref(),
+        layout,
+        dsl_ctx.env,
+    )?;
     let (params, return_type, full_sig) = resolve_call_proto(dsl_ctx.env, stmt, &class_type)?;
     if return_type == "V" {
         return Err(format!(
@@ -295,11 +325,7 @@ fn emit_call_value(
         return_type.clone(),
         params.clone(),
     );
-    let receiver = stmt
-        .target
-        .as_ref()
-        .map(|target| resolve_target_reg(target, layout).map(|reg| (reg, class_type.as_str())))
-        .transpose()?;
+    let receiver = emit_call_receiver(ir, stmt, &class_type, layout, dsl_ctx)?;
     let invoke_kind = match stmt.kind {
         DslCallKind::Virtual => ManagedInvokeKind::Virtual,
         DslCallKind::Interface => ManagedInvokeKind::Interface,
@@ -316,8 +342,15 @@ fn emit_field_get_value(
     expected_type: &str,
     dst: u8,
     layout: &HelperParamLayout,
+    dsl_ctx: &mut DslBuildContext,
 ) -> Result<u8, String> {
-    let class_type = resolve_member_class_type(stmt.class_name.as_deref(), stmt.target.as_ref(), layout)?;
+    let class_type = resolve_member_class_type(
+        stmt.class_name.as_deref(),
+        stmt.target.as_ref(),
+        stmt.receiver.as_deref(),
+        layout,
+        dsl_ctx.env,
+    )?;
     let field_type = java_class_to_descriptor_or_primitive(&stmt.type_name)?;
     if !value_descriptor_assignable_to(&field_type, expected_type) {
         return Err(format!(
@@ -330,10 +363,7 @@ fn emit_field_get_value(
     if is_static {
         ir.sget(dst, field, kind);
     } else {
-        let Some(target) = &stmt.target else {
-            return Err("instance field access requires a target".to_string());
-        };
-        let obj = emit_copy_object_if_needed(ir, resolve_target_reg(target, layout)?, REG_TMP1);
+        let obj = emit_field_receiver(ir, stmt, layout, dsl_ctx)?;
         ir.iget(dst, obj, field, kind);
     }
     Ok(dst)
@@ -386,6 +416,13 @@ fn emit_load_value(
             ir.const16(temp_reg, *value);
             Ok(temp_reg)
         }
+        DslValue::Bool(value) => {
+            if expected_type != "Z" {
+                return Err(format!("boolean literal cannot be passed as {}", expected_type));
+            }
+            ir.const4(temp_reg, if *value { 1 } else { 0 });
+            Ok(temp_reg)
+        }
         DslValue::Null => {
             if !return_is_object(expected_type) {
                 return Err(format!("null cannot be passed as {}", expected_type));
@@ -393,26 +430,12 @@ fn emit_load_value(
             ir.const4(temp_reg, 0);
             Ok(temp_reg)
         }
-        DslValue::AddLit(value, literal) => {
+        DslValue::UnaryOp { op, value } => emit_unary_value(ir, *op, value, expected_type, temp_reg, layout, dsl_ctx),
+        DslValue::IntBinOp { op, left, right } => {
             if expected_type != "I" {
                 return Err(format!("int expression cannot be passed as {}", expected_type));
             }
-            let src = emit_load_value(ir, value, expected_type, temp_reg, layout, dsl_ctx)?;
-            let src = emit_copy_field_value_if_needed(ir, src, temp_reg, ValueKind::Narrow);
-            ir.add_int_lit8(temp_reg, src, *literal);
-            Ok(temp_reg)
-        }
-        DslValue::SubLit(value, literal) => {
-            if expected_type != "I" {
-                return Err(format!("int expression cannot be passed as {}", expected_type));
-            }
-            let src = emit_load_value(ir, value, expected_type, temp_reg, layout, dsl_ctx)?;
-            let src = emit_copy_field_value_if_needed(ir, src, temp_reg, ValueKind::Narrow);
-            let Some(negated) = literal.checked_neg() else {
-                return Err("sub literal -128 cannot be encoded as add-int/lit8".to_string());
-            };
-            ir.add_int_lit8(temp_reg, src, negated);
-            Ok(temp_reg)
+            emit_int_binop_value(ir, *op, left, right, temp_reg, layout, dsl_ctx)
         }
         DslValue::Call(stmt) => emit_call_value(ir, stmt, expected_type, temp_reg, layout, dsl_ctx),
         DslValue::NewObject {
@@ -430,7 +453,7 @@ fn emit_load_value(
             dsl_ctx,
         ),
         DslValue::FieldGet { stmt, is_static } => {
-            emit_field_get_value(ir, stmt, *is_static, expected_type, temp_reg, layout)
+            emit_field_get_value(ir, stmt, *is_static, expected_type, temp_reg, layout, dsl_ctx)
         }
         DslValue::Cast { value, class_name } => {
             emit_cast_value(ir, value, class_name, expected_type, temp_reg, layout, dsl_ctx)
@@ -446,7 +469,7 @@ fn emit_load_value(
             index,
             type_name,
         } => {
-            let component_type = resolve_array_component_type(array, type_name.as_deref(), layout)?;
+            let component_type = resolve_array_component_type(array, type_name.as_deref(), layout, dsl_ctx.env)?;
             if !value_descriptor_assignable_to(&component_type, expected_type) {
                 return Err(format!(
                     "aget expression type {} cannot be passed as {}",
@@ -462,21 +485,287 @@ fn value_descriptor_assignable_to(src: &str, dst: &str) -> bool {
     src == dst || (return_is_object(src) && return_is_object(dst))
 }
 
-fn infer_value_descriptor(value: &DslValue, layout: &HelperParamLayout) -> Result<Option<String>, String> {
+fn dex_int_binop(op: DslIntBinOp) -> DexIntBinOp {
+    match op {
+        DslIntBinOp::Add => DexIntBinOp::Add,
+        DslIntBinOp::Sub => DexIntBinOp::Sub,
+        DslIntBinOp::Mul => DexIntBinOp::Mul,
+        DslIntBinOp::Div => DexIntBinOp::Div,
+        DslIntBinOp::Rem => DexIntBinOp::Rem,
+        DslIntBinOp::And => DexIntBinOp::And,
+        DslIntBinOp::Or => DexIntBinOp::Or,
+        DslIntBinOp::Xor => DexIntBinOp::Xor,
+        DslIntBinOp::Shl => DexIntBinOp::Shl,
+        DslIntBinOp::Shr => DexIntBinOp::Shr,
+        DslIntBinOp::Ushr => DexIntBinOp::Ushr,
+    }
+}
+
+fn emit_unary_value(
+    ir: &mut DexIrBuilder,
+    op: DslUnaryOp,
+    value: &DslValue,
+    expected_type: &str,
+    dst: u8,
+    layout: &HelperParamLayout,
+    dsl_ctx: &mut DslBuildContext,
+) -> Result<u8, String> {
+    emit_unary_value_with_scratch(ir, op, value, expected_type, dst, 0, layout, dsl_ctx)
+}
+
+fn emit_unary_value_with_scratch(
+    ir: &mut DexIrBuilder,
+    op: DslUnaryOp,
+    value: &DslValue,
+    expected_type: &str,
+    dst: u8,
+    scratch_index: u16,
+    layout: &HelperParamLayout,
+    dsl_ctx: &mut DslBuildContext,
+) -> Result<u8, String> {
+    match op {
+        DslUnaryOp::Neg => {
+            if expected_type != "I" {
+                return Err(format!("int unary expression cannot be passed as {}", expected_type));
+            }
+            let src = emit_int_expr_value(ir, value, dst, scratch_index, layout, dsl_ctx)?;
+            if src != dst {
+                ir.move_from16(dst, src as u16, ValueKind::Narrow);
+            }
+            ir.int_binop_lit8(DexIntLit8Op::Rsub, dst, dst, 0);
+            Ok(dst)
+        }
+        DslUnaryOp::BitNot => {
+            if expected_type != "I" {
+                return Err(format!("int unary expression cannot be passed as {}", expected_type));
+            }
+            let src = emit_int_expr_value(ir, value, dst, scratch_index, layout, dsl_ctx)?;
+            if src != dst {
+                ir.move_from16(dst, src as u16, ValueKind::Narrow);
+            }
+            ir.int_binop_lit8(DexIntLit8Op::Xor, dst, dst, -1);
+            Ok(dst)
+        }
+        DslUnaryOp::BoolNot => {
+            if expected_type != "Z" {
+                return Err(format!(
+                    "boolean unary expression cannot be passed as {}",
+                    expected_type
+                ));
+            }
+            let src = emit_load_value(ir, value, "Z", dst, layout, dsl_ctx)?;
+            if src != dst {
+                ir.move_from16(dst, src as u16, ValueKind::Narrow);
+            }
+            ir.int_binop_lit8(DexIntLit8Op::Xor, dst, dst, 1);
+            Ok(dst)
+        }
+    }
+}
+
+fn emit_int_binop_value(
+    ir: &mut DexIrBuilder,
+    op: DslIntBinOp,
+    left: &DslValue,
+    right: &DslValue,
+    dst: u8,
+    layout: &HelperParamLayout,
+    dsl_ctx: &mut DslBuildContext,
+) -> Result<u8, String> {
+    emit_int_binop_expr(ir, op, left, right, dst, 0, layout, dsl_ctx)
+}
+
+fn emit_int_expr_value(
+    ir: &mut DexIrBuilder,
+    value: &DslValue,
+    dst: u8,
+    scratch_index: u16,
+    layout: &HelperParamLayout,
+    dsl_ctx: &mut DslBuildContext,
+) -> Result<u8, String> {
+    match value {
+        DslValue::IntBinOp { op, left, right } => {
+            emit_int_binop_expr(ir, *op, left, right, dst, scratch_index, layout, dsl_ctx)
+        }
+        DslValue::UnaryOp {
+            op: op @ (DslUnaryOp::Neg | DslUnaryOp::BitNot),
+            value,
+        } => emit_unary_value_with_scratch(ir, *op, value, "I", dst, scratch_index, layout, dsl_ctx),
+        _ => emit_load_value(ir, value, "I", dst, layout, dsl_ctx),
+    }
+}
+
+fn emit_int_binop_expr(
+    ir: &mut DexIrBuilder,
+    op: DslIntBinOp,
+    left: &DslValue,
+    right: &DslValue,
+    dst: u8,
+    scratch_index: u16,
+    layout: &HelperParamLayout,
+    dsl_ctx: &mut DslBuildContext,
+) -> Result<u8, String> {
+    if let Some((lit_op, literal)) = right_lit8_op(op, right) {
+        let src = emit_int_expr_value(ir, left, dst, scratch_index, layout, dsl_ctx)?;
+        if src != dst {
+            ir.move_from16(dst, src as u16, ValueKind::Narrow);
+        }
+        ir.int_binop_lit8(lit_op, dst, dst, literal);
+        return Ok(dst);
+    }
+    if dst <= 0x0f {
+        if let Some((lit_op, literal)) = right_lit16_op(op, right) {
+            let src = emit_int_expr_value(ir, left, dst, scratch_index, layout, dsl_ctx)?;
+            if src != dst {
+                ir.move_from16(dst, src as u16, ValueKind::Narrow);
+            }
+            ir.int_binop_lit16(lit_op, dst, dst, literal);
+            return Ok(dst);
+        }
+    }
+    if let Some((lit_op, literal)) = left_lit8_op(op, left) {
+        let src = emit_int_expr_value(ir, right, dst, scratch_index, layout, dsl_ctx)?;
+        if src != dst {
+            ir.move_from16(dst, src as u16, ValueKind::Narrow);
+        }
+        ir.int_binop_lit8(lit_op, dst, dst, literal);
+        return Ok(dst);
+    }
+    if dst <= 0x0f {
+        if let Some((lit_op, literal)) = left_lit16_op(op, left) {
+            let src = emit_int_expr_value(ir, right, dst, scratch_index, layout, dsl_ctx)?;
+            if src != dst {
+                ir.move_from16(dst, src as u16, ValueKind::Narrow);
+            }
+            ir.int_binop_lit16(lit_op, dst, dst, literal);
+            return Ok(dst);
+        }
+    }
+    let left_dst = dsl_ctx.int_expr_scratch_reg(scratch_index)?;
+    let left_reg = emit_int_expr_value(ir, left, left_dst, scratch_index, layout, dsl_ctx)?;
+    if left_reg != left_dst {
+        ir.move_from16(left_dst, left_reg as u16, ValueKind::Narrow);
+    }
+    let right_index = scratch_index
+        .checked_add(1)
+        .ok_or_else(|| "too many int expression scratch registers".to_string())?;
+    let right_dst = dsl_ctx.int_expr_scratch_reg(right_index)?;
+    let right_reg = emit_int_expr_value(ir, right, right_dst, right_index, layout, dsl_ctx)?;
+    if right_reg != right_dst {
+        ir.move_from16(right_dst, right_reg as u16, ValueKind::Narrow);
+    }
+    ir.int_binop(dex_int_binop(op), dst, left_dst, right_dst);
+    Ok(dst)
+}
+
+fn right_lit8_op(op: DslIntBinOp, right: &DslValue) -> Option<(DexIntLit8Op, i8)> {
+    let literal = value_i8_literal(right)?;
+    let lit_op = match op {
+        DslIntBinOp::Add => DexIntLit8Op::Add,
+        DslIntBinOp::Sub => return literal.checked_neg().map(|negated| (DexIntLit8Op::Add, negated)),
+        DslIntBinOp::Mul => DexIntLit8Op::Mul,
+        DslIntBinOp::Div => DexIntLit8Op::Div,
+        DslIntBinOp::Rem => DexIntLit8Op::Rem,
+        DslIntBinOp::And => DexIntLit8Op::And,
+        DslIntBinOp::Or => DexIntLit8Op::Or,
+        DslIntBinOp::Xor => DexIntLit8Op::Xor,
+        DslIntBinOp::Shl => DexIntLit8Op::Shl,
+        DslIntBinOp::Shr => DexIntLit8Op::Shr,
+        DslIntBinOp::Ushr => DexIntLit8Op::Ushr,
+    };
+    Some((lit_op, literal))
+}
+
+fn right_lit16_op(op: DslIntBinOp, right: &DslValue) -> Option<(DexIntLit16Op, i16)> {
+    let literal = value_i16_literal(right)?;
+    let lit_op = match op {
+        DslIntBinOp::Add => DexIntLit16Op::Add,
+        DslIntBinOp::Sub => return literal.checked_neg().map(|negated| (DexIntLit16Op::Add, negated)),
+        DslIntBinOp::Mul => DexIntLit16Op::Mul,
+        DslIntBinOp::Div => DexIntLit16Op::Div,
+        DslIntBinOp::Rem => DexIntLit16Op::Rem,
+        DslIntBinOp::And => DexIntLit16Op::And,
+        DslIntBinOp::Or => DexIntLit16Op::Or,
+        DslIntBinOp::Xor => DexIntLit16Op::Xor,
+        DslIntBinOp::Shl | DslIntBinOp::Shr | DslIntBinOp::Ushr => return None,
+    };
+    Some((lit_op, literal))
+}
+
+fn left_lit8_op(op: DslIntBinOp, left: &DslValue) -> Option<(DexIntLit8Op, i8)> {
+    let literal = value_i8_literal(left)?;
+    let lit_op = match op {
+        DslIntBinOp::Add => DexIntLit8Op::Add,
+        DslIntBinOp::Sub => DexIntLit8Op::Rsub,
+        DslIntBinOp::Mul => DexIntLit8Op::Mul,
+        DslIntBinOp::And => DexIntLit8Op::And,
+        DslIntBinOp::Or => DexIntLit8Op::Or,
+        DslIntBinOp::Xor => DexIntLit8Op::Xor,
+        DslIntBinOp::Div | DslIntBinOp::Rem | DslIntBinOp::Shl | DslIntBinOp::Shr | DslIntBinOp::Ushr => return None,
+    };
+    Some((lit_op, literal))
+}
+
+fn left_lit16_op(op: DslIntBinOp, left: &DslValue) -> Option<(DexIntLit16Op, i16)> {
+    let literal = value_i16_literal(left)?;
+    let lit_op = match op {
+        DslIntBinOp::Add => DexIntLit16Op::Add,
+        DslIntBinOp::Sub => DexIntLit16Op::Rsub,
+        DslIntBinOp::Mul => DexIntLit16Op::Mul,
+        DslIntBinOp::And => DexIntLit16Op::And,
+        DslIntBinOp::Or => DexIntLit16Op::Or,
+        DslIntBinOp::Xor => DexIntLit16Op::Xor,
+        DslIntBinOp::Div | DslIntBinOp::Rem | DslIntBinOp::Shl | DslIntBinOp::Shr | DslIntBinOp::Ushr => return None,
+    };
+    Some((lit_op, literal))
+}
+
+fn value_i8_literal(value: &DslValue) -> Option<i8> {
+    let DslValue::Int(value) = value else {
+        return None;
+    };
+    (*value).try_into().ok()
+}
+
+fn value_i16_literal(value: &DslValue) -> Option<i16> {
+    let DslValue::Int(value) = value else {
+        return None;
+    };
+    Some(*value)
+}
+
+fn infer_value_descriptor(value: &DslValue, layout: &HelperParamLayout, env: JniEnv) -> Result<Option<String>, String> {
     match value {
         DslValue::Target(target) => resolve_target_descriptor(target, layout).map(Some),
         DslValue::String(_) => Ok(Some("Ljava/lang/String;".to_string())),
-        DslValue::Int(_) | DslValue::AddLit(_, _) | DslValue::SubLit(_, _) | DslValue::ArrayLength(_) => {
-            Ok(Some("I".to_string()))
-        }
+        DslValue::Int(_) | DslValue::IntBinOp { .. } | DslValue::ArrayLength(_) => Ok(Some("I".to_string())),
+        DslValue::UnaryOp { op, .. } => match op {
+            DslUnaryOp::Neg | DslUnaryOp::BitNot => Ok(Some("I".to_string())),
+            DslUnaryOp::BoolNot => Ok(Some("Z".to_string())),
+        },
+        DslValue::Bool(_) => Ok(Some("Z".to_string())),
         DslValue::Null => Ok(None),
         DslValue::Call(stmt) => {
-            let (_, return_type) = parse_method_signature(&stmt.sig)
-                .map_err(|_| "call return type cannot be inferred in this context".to_string())?;
-            if return_type == "V" {
-                Ok(None)
+            if let Ok((_, return_type)) = parse_method_signature(&stmt.sig) {
+                if return_type == "V" {
+                    Ok(None)
+                } else {
+                    Ok(Some(return_type))
+                }
             } else {
-                Ok(Some(return_type))
+                let class_type = resolve_member_class_type(
+                    stmt.class_name.as_deref(),
+                    stmt.target.as_ref(),
+                    stmt.receiver.as_deref(),
+                    layout,
+                    env,
+                )?;
+                let (_, return_type, _) = resolve_call_proto(env, stmt, &class_type)?;
+                if return_type == "V" {
+                    Ok(None)
+                } else {
+                    Ok(Some(return_type))
+                }
             }
         }
         DslValue::NewObject { class_name, .. } => java_class_to_descriptor(class_name).map(Some),
@@ -493,11 +782,12 @@ fn resolve_array_component_type(
     array: &DslValue,
     explicit_type_name: Option<&str>,
     layout: &HelperParamLayout,
+    env: JniEnv,
 ) -> Result<String, String> {
     if let Some(type_name) = explicit_type_name {
         return java_class_to_descriptor_or_primitive(type_name);
     }
-    let Some(array_desc) = infer_value_descriptor(array, layout)? else {
+    let Some(array_desc) = infer_value_descriptor(array, layout, env)? else {
         return Err("array element type cannot be inferred; use arr[index: Type]".to_string());
     };
     array_component_descriptor(&array_desc)
@@ -580,10 +870,24 @@ fn resolve_target_descriptor(target: &DslTarget, layout: &HelperParamLayout) -> 
 fn resolve_member_class_type(
     explicit_class_name: Option<&str>,
     target: Option<&DslTarget>,
+    receiver: Option<&DslValue>,
     layout: &HelperParamLayout,
+    env: JniEnv,
 ) -> Result<String, String> {
     if let Some(class_name) = explicit_class_name {
         return java_class_to_descriptor(class_name);
+    }
+    if let Some(receiver) = receiver {
+        let Some(desc) = infer_value_descriptor(receiver, layout, env)? else {
+            return Err("receiver class cannot be inferred from null/void expression".to_string());
+        };
+        if !desc.starts_with('L') || !desc.ends_with(';') {
+            return Err(format!(
+                "receiver class can only be inferred from object expressions, got {}",
+                desc
+            ));
+        }
+        return Ok(desc);
     }
     let Some(target) = target else {
         return Err("static member access requires an explicit class name".to_string());
@@ -598,13 +902,66 @@ fn resolve_member_class_type(
     Ok(desc)
 }
 
+fn emit_call_receiver<'a>(
+    ir: &mut DexIrBuilder,
+    stmt: &DslCallStmt,
+    class_type: &'a str,
+    layout: &HelperParamLayout,
+    dsl_ctx: &mut DslBuildContext,
+) -> Result<Option<(u8, &'a str)>, String> {
+    if stmt.kind == DslCallKind::Static {
+        return Ok(None);
+    }
+    if stmt.target.is_some() && stmt.receiver.is_some() {
+        return Err("method call cannot use both target and receiver expression".to_string());
+    }
+    if let Some(target) = stmt.target.as_ref() {
+        return resolve_target_reg(target, layout).map(|reg| Some((reg, class_type)));
+    }
+    if let Some(receiver) = stmt.receiver.as_ref() {
+        let reg = emit_load_value(ir, receiver, "Ljava/lang/Object;", REG_LAST_OBJECT, layout, dsl_ctx)?;
+        return Ok(Some((reg, class_type)));
+    }
+    Err("instance method call requires a target or receiver expression".to_string())
+}
+
+fn emit_field_receiver(
+    ir: &mut DexIrBuilder,
+    stmt: &DslFieldStmt,
+    layout: &HelperParamLayout,
+    dsl_ctx: &mut DslBuildContext,
+) -> Result<u8, String> {
+    if stmt.target.is_some() && stmt.receiver.is_some() {
+        return Err("field access cannot use both target and receiver expression".to_string());
+    }
+    if let Some(target) = stmt.target.as_ref() {
+        return Ok(emit_copy_object_if_needed(
+            ir,
+            resolve_target_reg(target, layout)?,
+            REG_TMP1,
+        ));
+    }
+    if let Some(receiver) = stmt.receiver.as_ref() {
+        let reg = emit_load_value(ir, receiver, "Ljava/lang/Object;", REG_TMP1, layout, dsl_ctx)?;
+        return Ok(emit_copy_object_if_needed(ir, reg, REG_TMP1));
+    }
+    Err("instance field access requires a target or receiver expression".to_string())
+}
+
 fn emit_field_read(
     ir: &mut DexIrBuilder,
     stmt: &DslFieldStmt,
     layout: &HelperParamLayout,
     is_static: bool,
+    dsl_ctx: &mut DslBuildContext,
 ) -> Result<(), String> {
-    let class_type = resolve_member_class_type(stmt.class_name.as_deref(), stmt.target.as_ref(), layout)?;
+    let class_type = resolve_member_class_type(
+        stmt.class_name.as_deref(),
+        stmt.target.as_ref(),
+        stmt.receiver.as_deref(),
+        layout,
+        dsl_ctx.env,
+    )?;
     let field_type = java_class_to_descriptor_or_primitive(&stmt.type_name)?;
     let field = FieldRef::new(class_type, field_type.clone(), stmt.field_name.clone());
     let kind = value_kind_from_descriptor(&field_type)?;
@@ -616,10 +973,7 @@ fn emit_field_read(
     if is_static {
         ir.sget(dst, field, kind);
     } else {
-        let Some(target) = &stmt.target else {
-            return Err("instance field access requires a target".to_string());
-        };
-        let obj = emit_copy_object_if_needed(ir, resolve_target_reg(target, layout)?, REG_TMP1);
+        let obj = emit_field_receiver(ir, stmt, layout, dsl_ctx)?;
         ir.iget(dst, obj, field, kind);
     }
     Ok(())
@@ -632,7 +986,13 @@ fn emit_field_write(
     is_static: bool,
     dsl_ctx: &mut DslBuildContext,
 ) -> Result<(), String> {
-    let class_type = resolve_member_class_type(stmt.class_name.as_deref(), stmt.target.as_ref(), layout)?;
+    let class_type = resolve_member_class_type(
+        stmt.class_name.as_deref(),
+        stmt.target.as_ref(),
+        stmt.receiver.as_deref(),
+        layout,
+        dsl_ctx.env,
+    )?;
     let field_type = java_class_to_descriptor_or_primitive(&stmt.type_name)?;
     let field = FieldRef::new(class_type, field_type.clone(), stmt.field_name.clone());
     let kind = value_kind_from_descriptor(&field_type)?;
@@ -644,10 +1004,7 @@ fn emit_field_write(
     if is_static {
         ir.sput(src, field, kind);
     } else {
-        let Some(target) = &stmt.target else {
-            return Err("instance field write requires a target".to_string());
-        };
-        let obj = emit_copy_object_if_needed(ir, resolve_target_reg(target, layout)?, REG_TMP1);
+        let obj = emit_field_receiver(ir, stmt, layout, dsl_ctx)?;
         ir.iput(src, obj, field, kind);
     }
     Ok(())
@@ -656,23 +1013,40 @@ fn emit_field_write(
 fn emit_let(
     ir: &mut DexIrBuilder,
     name: &str,
-    type_name: &str,
+    type_name: Option<&str>,
     value: &DslValue,
     layout: &HelperParamLayout,
     dsl_ctx: &mut DslBuildContext,
 ) -> Result<(), String> {
-    let descriptor = java_class_to_descriptor_or_primitive(type_name)?;
     let Some(slot) = layout.local_regs.get(name) else {
         return Err(format!("local '{}' is not allocated", name));
     };
-    if slot.descriptor != descriptor {
-        return Err(format!(
-            "local '{}' type mismatch: declared {}, emitted {}",
-            name, slot.descriptor, descriptor
-        ));
+    if let Some(type_name) = type_name {
+        let descriptor = java_class_to_descriptor_or_primitive(type_name)?;
+        if slot.descriptor != descriptor {
+            return Err(format!(
+                "local '{}' type mismatch: declared {}, emitted {}",
+                name, slot.descriptor, descriptor
+            ));
+        }
     }
-    let src = emit_load_value(ir, value, &descriptor, REG_TMP0, layout, dsl_ctx)?;
-    emit_copy_value(ir, slot.reg, src, &descriptor)?;
+    let src = emit_load_value(ir, value, &slot.descriptor, REG_TMP0, layout, dsl_ctx)?;
+    emit_copy_value(ir, slot.reg, src, &slot.descriptor)?;
+    Ok(())
+}
+
+fn emit_assign(
+    ir: &mut DexIrBuilder,
+    name: &str,
+    value: &DslValue,
+    layout: &HelperParamLayout,
+    dsl_ctx: &mut DslBuildContext,
+) -> Result<(), String> {
+    let Some(slot) = layout.local_regs.get(name) else {
+        return Err(format!("local '{}' is not allocated", name));
+    };
+    let src = emit_load_value(ir, value, &slot.descriptor, REG_TMP0, layout, dsl_ctx)?;
+    emit_copy_value(ir, slot.reg, src, &slot.descriptor)?;
     Ok(())
 }
 
@@ -761,27 +1135,48 @@ fn emit_if_bool(
 
 fn infer_cmp_descriptor(value: &DslValue, layout: &HelperParamLayout) -> Option<&'static str> {
     match value {
-        DslValue::Int(_) | DslValue::AddLit(_, _) | DslValue::SubLit(_, _) => Some("I"),
+        DslValue::Int(_) | DslValue::IntBinOp { .. } => Some("I"),
+        DslValue::UnaryOp { op, .. } => match op {
+            DslUnaryOp::Neg | DslUnaryOp::BitNot => Some("I"),
+            DslUnaryOp::BoolNot => Some("Z"),
+        },
+        DslValue::Bool(_) => Some("Z"),
         DslValue::Target(DslTarget::Result) => Some("I"),
         DslValue::Target(DslTarget::Local(name)) => {
             layout
                 .local_regs
                 .get(name)
-                .and_then(|slot| if slot.descriptor == "I" { Some("I") } else { None })
+                .and_then(|slot| match slot.descriptor.as_str() {
+                    "I" => Some("I"),
+                    "Z" => Some("Z"),
+                    _ => None,
+                })
         }
-        DslValue::Call(stmt) => {
-            parse_method_signature(&stmt.sig)
-                .ok()
-                .and_then(|(_, ret)| if ret == "I" { Some("I") } else { None })
-        }
-        DslValue::FieldGet { stmt, .. } => java_class_to_descriptor_or_primitive(&stmt.type_name)
+        DslValue::Call(stmt) => parse_method_signature(&stmt.sig)
             .ok()
-            .and_then(|desc| if desc == "I" { Some("I") } else { None }),
+            .and_then(|(_, ret)| match ret.as_str() {
+                "I" => Some("I"),
+                "Z" => Some("Z"),
+                _ => None,
+            }),
+        DslValue::FieldGet { stmt, .. } => {
+            java_class_to_descriptor_or_primitive(&stmt.type_name)
+                .ok()
+                .and_then(|desc| match desc.as_str() {
+                    "I" => Some("I"),
+                    "Z" => Some("Z"),
+                    _ => None,
+                })
+        }
         DslValue::ArrayLength(_) => Some("I"),
         DslValue::ArrayGet { type_name, .. } => type_name
             .as_ref()
             .and_then(|type_name| java_class_to_descriptor_or_primitive(type_name).ok())
-            .and_then(|desc| if desc == "I" { Some("I") } else { None }),
+            .and_then(|desc| match desc.as_str() {
+                "I" => Some("I"),
+                "Z" => Some("Z"),
+                _ => None,
+            }),
         _ => None,
     }
 }
@@ -812,7 +1207,11 @@ fn emit_if_cmp(
     else_stmts: &[DslStmt],
     emit_ctx: &mut EmitContext<'_>,
 ) -> Result<bool, String> {
-    let expected_type = if infer_cmp_descriptor(left, emit_ctx.layout) == Some("I")
+    let expected_type = if infer_cmp_descriptor(left, emit_ctx.layout) == Some("Z")
+        || infer_cmp_descriptor(right, emit_ctx.layout) == Some("Z")
+    {
+        "Z"
+    } else if infer_cmp_descriptor(left, emit_ctx.layout) == Some("I")
         || infer_cmp_descriptor(right, emit_ctx.layout) == Some("I")
     {
         "I"
@@ -962,7 +1361,7 @@ fn emit_array_get_stmt(
     layout: &HelperParamLayout,
     dsl_ctx: &mut DslBuildContext,
 ) -> Result<(), String> {
-    let component_type = resolve_array_component_type(array, type_name, layout)?;
+    let component_type = resolve_array_component_type(array, type_name, layout, dsl_ctx.env)?;
     let kind = value_kind_from_descriptor(&component_type)?;
     let dst = if matches!(kind, ValueKind::Object) {
         REG_LAST_OBJECT
@@ -982,7 +1381,7 @@ fn emit_array_put(
     layout: &HelperParamLayout,
     dsl_ctx: &mut DslBuildContext,
 ) -> Result<(), String> {
-    let component_type = resolve_array_component_type(array, type_name, layout)?;
+    let component_type = resolve_array_component_type(array, type_name, layout, dsl_ctx.env)?;
     let kind = value_kind_from_descriptor(&component_type)?;
     let array_reg = emit_load_value(ir, array, "Ljava/lang/Object;", REG_TMP1, layout, dsl_ctx)?;
     let array_reg = emit_copy_object_if_needed(ir, array_reg, REG_TMP1);
@@ -1044,14 +1443,17 @@ enum ManagedInvokeKind {
 fn value_contains_invoke(value: &DslValue) -> bool {
     match value {
         DslValue::Call(_) | DslValue::NewObject { .. } => true,
-        DslValue::AddLit(value, _) | DslValue::SubLit(value, _) | DslValue::ArrayLength(value) => {
-            value_contains_invoke(value)
-        }
+        DslValue::UnaryOp { value, .. } => value_contains_invoke(value),
+        DslValue::ArrayLength(value) => value_contains_invoke(value),
+        DslValue::IntBinOp { left, right, .. } => value_contains_invoke(left) || value_contains_invoke(right),
         DslValue::Cast { value, .. } => value_contains_invoke(value),
         DslValue::ArrayGet { array, index, .. } => value_contains_invoke(array) || value_contains_invoke(index),
-        DslValue::FieldGet { .. } | DslValue::Target(_) | DslValue::String(_) | DslValue::Int(_) | DslValue::Null => {
-            false
-        }
+        DslValue::FieldGet { .. }
+        | DslValue::Target(_)
+        | DslValue::String(_)
+        | DslValue::Int(_)
+        | DslValue::Bool(_)
+        | DslValue::Null => false,
     }
 }
 
@@ -1123,7 +1525,13 @@ fn emit_call(
     layout: &HelperParamLayout,
     dsl_ctx: &mut DslBuildContext,
 ) -> Result<MethodRef, String> {
-    let class_type = resolve_member_class_type(stmt.class_name.as_deref(), stmt.target.as_ref(), layout)?;
+    let class_type = resolve_member_class_type(
+        stmt.class_name.as_deref(),
+        stmt.target.as_ref(),
+        stmt.receiver.as_deref(),
+        layout,
+        dsl_ctx.env,
+    )?;
     let (params, return_type, full_sig) = resolve_call_proto(dsl_ctx.env, stmt, &class_type)?;
     if params.len() != stmt.args.len() {
         return Err(format!(
@@ -1182,11 +1590,126 @@ pub(super) fn program_max_invoke_words(
     statements_max_invoke_words(&program.stmts, target_params, is_static)
 }
 
+pub(super) fn program_int_expr_scratch_count(program: &DslProgram) -> u16 {
+    statements_int_expr_scratch_count(&program.stmts)
+}
+
+fn statements_int_expr_scratch_count(stmts: &[DslStmt]) -> u16 {
+    stmts.iter().map(stmt_int_expr_scratch_count).max().unwrap_or(0)
+}
+
+fn stmt_int_expr_scratch_count(stmt: &DslStmt) -> u16 {
+    match stmt {
+        DslStmt::Block(stmts) => statements_int_expr_scratch_count(stmts),
+        DslStmt::Let { value, .. } | DslStmt::Assign { value, .. } => value_int_expr_scratch_count(value),
+        DslStmt::LetOrig { args, .. } | DslStmt::ReturnOrig { args } => orig_args_int_expr_scratch_count(args),
+        DslStmt::New { args, .. } => values_int_expr_scratch_count(args),
+        DslStmt::NewArray { size, .. } => value_int_expr_scratch_count(size),
+        DslStmt::Call(stmt) => values_int_expr_scratch_count(&stmt.args),
+        DslStmt::Cast { value, .. } | DslStmt::ArrayLength { array: value } => value_int_expr_scratch_count(value),
+        DslStmt::ArrayGet { array, index, .. } => {
+            value_int_expr_scratch_count(array).max(value_int_expr_scratch_count(index))
+        }
+        DslStmt::ArrayPut {
+            array, index, value, ..
+        } => value_int_expr_scratch_count(array)
+            .max(value_int_expr_scratch_count(index))
+            .max(value_int_expr_scratch_count(value)),
+        DslStmt::FieldRead { .. } => 0,
+        DslStmt::FieldWrite { stmt, .. } => stmt.value.as_ref().map(value_int_expr_scratch_count).unwrap_or(0),
+        DslStmt::IfNull {
+            value,
+            then_stmts,
+            else_stmts,
+            ..
+        }
+        | DslStmt::IfBool {
+            value,
+            then_stmts,
+            else_stmts,
+        }
+        | DslStmt::IfInstanceOf {
+            value,
+            then_stmts,
+            else_stmts,
+            ..
+        } => value_int_expr_scratch_count(value)
+            .max(statements_int_expr_scratch_count(then_stmts))
+            .max(statements_int_expr_scratch_count(else_stmts)),
+        DslStmt::IfCmp {
+            left,
+            right,
+            then_stmts,
+            else_stmts,
+            ..
+        } => value_int_expr_scratch_count(left)
+            .max(value_int_expr_scratch_count(right))
+            .max(statements_int_expr_scratch_count(then_stmts))
+            .max(statements_int_expr_scratch_count(else_stmts)),
+        DslStmt::Switch {
+            value,
+            cases,
+            default_stmts,
+        } => {
+            let mut count = value_int_expr_scratch_count(value);
+            for (_, stmts) in cases {
+                count = count.max(statements_int_expr_scratch_count(stmts));
+            }
+            if let Some(stmts) = default_stmts {
+                count = count.max(statements_int_expr_scratch_count(stmts));
+            }
+            count
+        }
+        DslStmt::ReturnValue { value } => value.as_ref().map(value_int_expr_scratch_count).unwrap_or(0),
+    }
+}
+
+fn orig_args_int_expr_scratch_count(args: &DslOrigArgs) -> u16 {
+    match args {
+        DslOrigArgs::Original => 0,
+        DslOrigArgs::Values(values) => values_int_expr_scratch_count(values),
+    }
+}
+
+fn values_int_expr_scratch_count(values: &[DslValue]) -> u16 {
+    values.iter().map(value_int_expr_scratch_count).max().unwrap_or(0)
+}
+
+fn value_int_expr_scratch_count(value: &DslValue) -> u16 {
+    match value {
+        DslValue::IntBinOp { op, left, right } => {
+            if right_lit8_op(*op, right).is_some() {
+                return value_int_expr_scratch_count(left);
+            }
+            if left_lit8_op(*op, left).is_some() {
+                return value_int_expr_scratch_count(right);
+            }
+            let left_count = value_int_expr_scratch_count(left).max(1);
+            let right_count = 1 + value_int_expr_scratch_count(right).max(1);
+            left_count.max(right_count)
+        }
+        DslValue::UnaryOp { value, .. } => value_int_expr_scratch_count(value),
+        DslValue::NewObject { args, .. } => values_int_expr_scratch_count(args),
+        DslValue::Call(stmt) => values_int_expr_scratch_count(&stmt.args),
+        DslValue::Cast { value, .. } | DslValue::ArrayLength(value) => value_int_expr_scratch_count(value),
+        DslValue::ArrayGet { array, index, .. } => {
+            value_int_expr_scratch_count(array).max(value_int_expr_scratch_count(index))
+        }
+        DslValue::Target(_)
+        | DslValue::String(_)
+        | DslValue::Int(_)
+        | DslValue::Bool(_)
+        | DslValue::Null
+        | DslValue::FieldGet { .. } => 0,
+    }
+}
+
 fn statements_max_invoke_words(stmts: &[DslStmt], target_params: &[String], is_static: bool) -> Result<u16, String> {
     let mut max_words = 0u16;
     for stmt in stmts {
         let words = match stmt {
-            DslStmt::Let { value, .. } => value_max_invoke_words(value)?,
+            DslStmt::Block(stmts) => statements_max_invoke_words(stmts, target_params, is_static)?,
+            DslStmt::Let { value, .. } | DslStmt::Assign { value, .. } => value_max_invoke_words(value)?,
             DslStmt::LetOrig { args, .. } => orig_args_max_invoke_words(args, target_params, is_static)?,
             DslStmt::New { ctor_sig, args, .. } => {
                 let params = if let Some(sig) = ctor_sig {
@@ -1311,16 +1834,19 @@ fn value_max_invoke_words(value: &DslValue) -> Result<u16, String> {
             }
             Ok(words)
         }
-        DslValue::AddLit(value, _) | DslValue::SubLit(value, _) | DslValue::ArrayLength(value) => {
-            value_max_invoke_words(value)
-        }
+        DslValue::ArrayLength(value) => value_max_invoke_words(value),
+        DslValue::IntBinOp { left, right, .. } => Ok(value_max_invoke_words(left)?.max(value_max_invoke_words(right)?)),
+        DslValue::UnaryOp { value, .. } => value_max_invoke_words(value),
         DslValue::Cast { value, .. } => value_max_invoke_words(value),
         DslValue::ArrayGet { array, index, .. } => {
             Ok(value_max_invoke_words(array)?.max(value_max_invoke_words(index)?))
         }
-        DslValue::FieldGet { .. } | DslValue::Target(_) | DslValue::String(_) | DslValue::Int(_) | DslValue::Null => {
-            Ok(0)
-        }
+        DslValue::FieldGet { .. }
+        | DslValue::Target(_)
+        | DslValue::String(_)
+        | DslValue::Int(_)
+        | DslValue::Bool(_)
+        | DslValue::Null => Ok(0),
     }
 }
 
@@ -1352,6 +1878,7 @@ fn statements_use_orig(stmts: &[DslStmt]) -> bool {
 
 fn stmt_uses_orig(stmt: &DslStmt) -> bool {
     match stmt {
+        DslStmt::Block(stmts) => statements_use_orig(stmts),
         DslStmt::ReturnOrig { .. } | DslStmt::LetOrig { .. } => true,
         DslStmt::IfNull {
             then_stmts, else_stmts, ..
@@ -1387,6 +1914,12 @@ struct ReturnFlow {
 fn analyze_return_flow(stmts: &[DslStmt]) -> ReturnFlow {
     for stmt in stmts {
         match stmt {
+            DslStmt::Block(stmts) => {
+                let flow = analyze_return_flow(stmts);
+                if flow.has_non_orig_return || !flow.falls_through {
+                    return flow;
+                }
+            }
             DslStmt::ReturnOrig { .. } => {
                 return ReturnFlow {
                     falls_through: false,
@@ -1481,6 +2014,7 @@ fn program_uses_orig_value(program: &DslProgram) -> Result<bool, String> {
     fn visit(stmts: &[DslStmt], nested: bool, count: &mut usize) -> Result<(), String> {
         for stmt in stmts {
             match stmt {
+                DslStmt::Block(stmts) => visit(stmts, nested, count)?,
                 DslStmt::LetOrig { .. } => {
                     if nested {
                         return Err("let x = orig(...) is only supported at top level".to_string());
@@ -1528,6 +2062,7 @@ fn program_uses_orig_value(program: &DslProgram) -> Result<bool, String> {
 
 fn statements_contain_return_orig(stmts: &[DslStmt]) -> bool {
     stmts.iter().any(|stmt| match stmt {
+        DslStmt::Block(stmts) => statements_contain_return_orig(stmts),
         DslStmt::ReturnOrig { .. } => true,
         DslStmt::IfNull {
             then_stmts, else_stmts, ..
@@ -1574,71 +2109,25 @@ fn validate_orig_value_flow(program: &DslProgram) -> Result<(), String> {
 }
 
 pub(super) fn collect_local_slots(
-    program: &DslProgram,
+    local_descriptors: &BTreeMap<String, String>,
     first_reg: u16,
 ) -> Result<(BTreeMap<String, LocalSlot>, u16), String> {
     let mut slots = BTreeMap::new();
     let mut next = first_reg;
-    collect_local_slots_from_stmts(&program.stmts, &mut slots, &mut next)?;
-    Ok((slots, next - first_reg))
-}
-
-fn collect_local_slots_from_stmts(
-    stmts: &[DslStmt],
-    slots: &mut BTreeMap<String, LocalSlot>,
-    next: &mut u16,
-) -> Result<(), String> {
-    for stmt in stmts {
-        match stmt {
-            DslStmt::Let { name, type_name, .. } | DslStmt::LetOrig { name, type_name, .. } => {
-                if slots.contains_key(name) {
-                    continue;
-                }
-                let descriptor = java_class_to_descriptor_or_primitive(type_name)?;
-                let reg = checked_reg(*next, "local register")?;
-                *next = (*next)
-                    .checked_add(descriptor_word_count(&descriptor))
-                    .ok_or_else(|| "too many dex registers".to_string())?;
-                slots.insert(name.clone(), LocalSlot { reg, descriptor });
-            }
-            DslStmt::IfNull {
-                then_stmts, else_stmts, ..
-            } => {
-                collect_local_slots_from_stmts(then_stmts, slots, next)?;
-                collect_local_slots_from_stmts(else_stmts, slots, next)?;
-            }
-            DslStmt::IfBool {
-                then_stmts, else_stmts, ..
-            } => {
-                collect_local_slots_from_stmts(then_stmts, slots, next)?;
-                collect_local_slots_from_stmts(else_stmts, slots, next)?;
-            }
-            DslStmt::IfCmp {
-                then_stmts, else_stmts, ..
-            } => {
-                collect_local_slots_from_stmts(then_stmts, slots, next)?;
-                collect_local_slots_from_stmts(else_stmts, slots, next)?;
-            }
-            DslStmt::IfInstanceOf {
-                then_stmts, else_stmts, ..
-            } => {
-                collect_local_slots_from_stmts(then_stmts, slots, next)?;
-                collect_local_slots_from_stmts(else_stmts, slots, next)?;
-            }
-            DslStmt::Switch {
-                cases, default_stmts, ..
-            } => {
-                for (_, stmts) in cases {
-                    collect_local_slots_from_stmts(stmts, slots, next)?;
-                }
-                if let Some(stmts) = default_stmts {
-                    collect_local_slots_from_stmts(stmts, slots, next)?;
-                }
-            }
-            _ => {}
-        }
+    for (name, descriptor) in local_descriptors {
+        let reg = checked_reg(next, "local register")?;
+        next = next
+            .checked_add(descriptor_word_count(descriptor))
+            .ok_or_else(|| "too many dex registers".to_string())?;
+        slots.insert(
+            name.clone(),
+            LocalSlot {
+                reg,
+                descriptor: descriptor.clone(),
+            },
+        );
     }
-    Ok(())
+    Ok((slots, next - first_reg))
 }
 
 pub(super) struct EmitContext<'a> {
@@ -1780,8 +2269,13 @@ fn emit_return_value(
 
 fn emit_statement(ir: &mut DexIrBuilder, stmt: &DslStmt, emit_ctx: &mut EmitContext<'_>) -> Result<bool, String> {
     match stmt {
+        DslStmt::Block(stmts) => emit_statements(ir, stmts, emit_ctx),
         DslStmt::Let { name, type_name, value } => {
-            emit_let(ir, name, type_name, value, emit_ctx.layout, emit_ctx.dsl_ctx)?;
+            emit_let(ir, name, type_name.as_deref(), value, emit_ctx.layout, emit_ctx.dsl_ctx)?;
+            Ok(false)
+        }
+        DslStmt::Assign { name, value } => {
+            emit_assign(ir, name, value, emit_ctx.layout, emit_ctx.dsl_ctx)?;
             Ok(false)
         }
         DslStmt::LetOrig { name, type_name, args } => {
@@ -1860,7 +2354,7 @@ fn emit_statement(ir: &mut DexIrBuilder, stmt: &DslStmt, emit_ctx: &mut EmitCont
             Ok(false)
         }
         DslStmt::FieldRead { stmt, is_static } => {
-            emit_field_read(ir, stmt, emit_ctx.layout, *is_static)?;
+            emit_field_read(ir, stmt, emit_ctx.layout, *is_static, emit_ctx.dsl_ctx)?;
             Ok(false)
         }
         DslStmt::FieldWrite { stmt, is_static } => {

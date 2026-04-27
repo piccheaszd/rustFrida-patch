@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::dsl::{DslCallKind, DslCallStmt, DslFieldStmt, DslOrigArgs, DslProgram, DslStmt, DslTarget, DslValue};
+use super::dsl::{
+    DslCallKind, DslCallStmt, DslFieldStmt, DslOrigArgs, DslProgram, DslStmt, DslTarget, DslUnaryOp, DslValue,
+};
 use super::{
     array_component_descriptor, java_class_to_descriptor, java_class_to_descriptor_or_primitive,
     parse_method_signature, resolve_call_proto, return_is_object,
@@ -41,6 +43,10 @@ fn dsl_target_label(target: &DslTarget) -> String {
     }
 }
 
+fn value_descriptor_assignable_to(src: &str, dst: &str) -> bool {
+    src == dst || (return_is_object(src) && return_is_object(dst))
+}
+
 impl DslSemanticContext {
     fn new(env: JniEnv, is_static: bool, target_type: String, target_params: Vec<String>) -> Self {
         Self {
@@ -78,9 +84,22 @@ impl DslSemanticContext {
         &self,
         explicit_class_name: Option<&str>,
         target: Option<&DslTarget>,
+        receiver: Option<&DslValue>,
     ) -> Result<String, String> {
         if let Some(class_name) = explicit_class_name {
             return java_class_to_descriptor(class_name);
+        }
+        if let Some(receiver) = receiver {
+            let Some(desc) = self.infer_value_descriptor(receiver)? else {
+                return Err("receiver class cannot be inferred from null/void expression".to_string());
+            };
+            if !desc.starts_with('L') || !desc.ends_with(';') {
+                return Err(format!(
+                    "receiver class can only be inferred from object expressions, got {}",
+                    desc
+                ));
+            }
+            return Ok(desc);
         }
         let Some(target) = target else {
             return Err("static member access requires an explicit class name".to_string());
@@ -99,12 +118,19 @@ impl DslSemanticContext {
         match value {
             DslValue::Target(target) => self.resolve_target_descriptor(target).map(Some),
             DslValue::String(_) => Ok(Some("Ljava/lang/String;".to_string())),
-            DslValue::Int(_) | DslValue::AddLit(_, _) | DslValue::SubLit(_, _) | DslValue::ArrayLength(_) => {
-                Ok(Some("I".to_string()))
-            }
+            DslValue::Int(_) | DslValue::IntBinOp { .. } | DslValue::ArrayLength(_) => Ok(Some("I".to_string())),
+            DslValue::UnaryOp { op, .. } => match op {
+                DslUnaryOp::Neg | DslUnaryOp::BitNot => Ok(Some("I".to_string())),
+                DslUnaryOp::BoolNot => Ok(Some("Z".to_string())),
+            },
+            DslValue::Bool(_) => Ok(Some("Z".to_string())),
             DslValue::Null => Ok(None),
             DslValue::Call(stmt) => {
-                let class_type = self.resolve_member_class_type(stmt.class_name.as_deref(), stmt.target.as_ref())?;
+                let class_type = self.resolve_member_class_type(
+                    stmt.class_name.as_deref(),
+                    stmt.target.as_ref(),
+                    stmt.receiver.as_deref(),
+                )?;
                 let (_, return_type, _) = resolve_call_proto(self.env, stmt, &class_type)?;
                 if return_type == "V" {
                     Ok(None)
@@ -138,6 +164,9 @@ impl DslSemanticContext {
         if stmt.kind == DslCallKind::Static || !return_is_object(class_type) {
             return Ok(());
         }
+        if stmt.receiver.is_some() {
+            return Ok(());
+        }
         let Some(target) = stmt.target.as_ref() else {
             return Ok(());
         };
@@ -166,9 +195,28 @@ impl DslSemanticContext {
             DslValue::Target(target) => {
                 self.resolve_target_descriptor(target)?;
             }
-            DslValue::String(_) | DslValue::Int(_) | DslValue::Null => {}
-            DslValue::AddLit(value, _) | DslValue::SubLit(value, _) | DslValue::ArrayLength(value) => {
+            DslValue::String(_) | DslValue::Int(_) | DslValue::Bool(_) | DslValue::Null => {}
+            DslValue::UnaryOp { op, value } => {
                 self.validate_value_inner(value, require_nonnull_receiver)?;
+                let Some(desc) = self.infer_value_descriptor(value)? else {
+                    return Err("unary expression type cannot be inferred".to_string());
+                };
+                match op {
+                    DslUnaryOp::Neg | DslUnaryOp::BitNot if desc != "I" => {
+                        return Err(format!("int unary expression requires int, got {}", desc));
+                    }
+                    DslUnaryOp::BoolNot if desc != "Z" => {
+                        return Err(format!("boolean unary expression requires boolean, got {}", desc));
+                    }
+                    _ => {}
+                }
+            }
+            DslValue::ArrayLength(value) => {
+                self.validate_value_inner(value, require_nonnull_receiver)?;
+            }
+            DslValue::IntBinOp { left, right, .. } => {
+                self.validate_value_inner(left, require_nonnull_receiver)?;
+                self.validate_value_inner(right, require_nonnull_receiver)?;
             }
             DslValue::Cast { value, class_name } => {
                 self.validate_value_inner(value, require_nonnull_receiver)?;
@@ -215,9 +263,15 @@ impl DslSemanticContext {
                 }
             }
             DslValue::Call(stmt) => {
+                if let Some(receiver) = &stmt.receiver {
+                    self.validate_value_inner(receiver, require_nonnull_receiver)?;
+                }
                 self.validate_call_inner(stmt, require_nonnull_receiver)?;
             }
             DslValue::FieldGet { stmt, .. } => {
+                if let Some(receiver) = &stmt.receiver {
+                    self.validate_value_inner(receiver, require_nonnull_receiver)?;
+                }
                 self.validate_field(stmt)?;
             }
         }
@@ -229,10 +283,23 @@ impl DslSemanticContext {
     }
 
     fn validate_call_inner(&mut self, stmt: &DslCallStmt, require_nonnull_receiver: bool) -> Result<(), String> {
-        let class_type = self.resolve_member_class_type(stmt.class_name.as_deref(), stmt.target.as_ref())?;
+        if stmt.target.is_some() && stmt.receiver.is_some() {
+            return Err("method call cannot use both target and receiver expression".to_string());
+        }
+        if stmt.kind == DslCallKind::Static && stmt.receiver.is_some() {
+            return Err("static method call cannot use a receiver expression".to_string());
+        }
+        let class_type = self.resolve_member_class_type(
+            stmt.class_name.as_deref(),
+            stmt.target.as_ref(),
+            stmt.receiver.as_deref(),
+        )?;
         let (params, _, full_sig) = resolve_call_proto(self.env, stmt, &class_type)?;
         if require_nonnull_receiver {
             self.validate_receiver_nonnull(stmt, &class_type)?;
+        }
+        if let Some(receiver) = &stmt.receiver {
+            self.validate_value_inner(receiver, require_nonnull_receiver)?;
         }
         if params.len() != stmt.args.len() {
             return Err(format!(
@@ -251,7 +318,17 @@ impl DslSemanticContext {
     }
 
     fn validate_field(&mut self, stmt: &DslFieldStmt) -> Result<(), String> {
-        self.resolve_member_class_type(stmt.class_name.as_deref(), stmt.target.as_ref())?;
+        if stmt.target.is_some() && stmt.receiver.is_some() {
+            return Err("field access cannot use both target and receiver expression".to_string());
+        }
+        self.resolve_member_class_type(
+            stmt.class_name.as_deref(),
+            stmt.target.as_ref(),
+            stmt.receiver.as_deref(),
+        )?;
+        if let Some(receiver) = &stmt.receiver {
+            self.validate_value(receiver)?;
+        }
         java_class_to_descriptor_or_primitive(&stmt.type_name)?;
         if let Some(value) = &stmt.value {
             self.validate_value(value)?;
@@ -300,10 +377,49 @@ impl DslSemanticContext {
 
     fn validate_stmt(&mut self, stmt: &DslStmt) -> Result<(), String> {
         match stmt {
+            DslStmt::Block(stmts) => self.validate_stmts(stmts)?,
             DslStmt::Let { name, type_name, value } => {
-                let descriptor = java_class_to_descriptor_or_primitive(type_name)?;
                 self.validate_value(value)?;
+                let descriptor = if let Some(type_name) = type_name {
+                    let descriptor = java_class_to_descriptor_or_primitive(type_name)?;
+                    if let Some(value_desc) = self.infer_value_descriptor(value)? {
+                        if !value_descriptor_assignable_to(&value_desc, &descriptor) {
+                            return Err(format!(
+                                "local '{}' type mismatch: cannot assign {} to {}",
+                                name, value_desc, descriptor
+                            ));
+                        }
+                    } else if !return_is_object(&descriptor) {
+                        return Err(format!(
+                            "local '{}' type mismatch: cannot assign null/void to {}",
+                            name, descriptor
+                        ));
+                    }
+                    descriptor
+                } else {
+                    self.infer_value_descriptor(value)?
+                        .ok_or_else(|| format!("local '{}' type cannot be inferred", name))?
+                };
                 self.local_descriptors.entry(name.clone()).or_insert(descriptor);
+            }
+            DslStmt::Assign { name, value } => {
+                let Some(descriptor) = self.local_descriptors.get(name).cloned() else {
+                    return Err(format!("local '{}' is not declared", name));
+                };
+                self.validate_value(value)?;
+                if let Some(value_desc) = self.infer_value_descriptor(value)? {
+                    if !value_descriptor_assignable_to(&value_desc, &descriptor) {
+                        return Err(format!(
+                            "local '{}' type mismatch: cannot assign {} to {}",
+                            name, value_desc, descriptor
+                        ));
+                    }
+                } else if !return_is_object(&descriptor) {
+                    return Err(format!(
+                        "local '{}' type mismatch: cannot assign null/void to {}",
+                        name, descriptor
+                    ));
+                }
             }
             DslStmt::LetOrig { name, type_name, args } => {
                 let descriptor = java_class_to_descriptor_or_primitive(type_name)?;
@@ -435,7 +551,8 @@ pub(super) fn validate_semantics(
     is_static: bool,
     target_type: String,
     target_params: Vec<String>,
-) -> Result<(), String> {
+) -> Result<BTreeMap<String, String>, String> {
     let mut ctx = DslSemanticContext::new(env, is_static, target_type, target_params);
-    ctx.validate_stmts(&program.stmts)
+    ctx.validate_stmts(&program.stmts)?;
+    Ok(ctx.local_descriptors)
 }
