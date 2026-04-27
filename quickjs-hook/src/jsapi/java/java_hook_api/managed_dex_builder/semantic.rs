@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use super::dsl::{
     DslCallKind, DslCallStmt, DslCondition, DslFieldStmt, DslOrigArgs, DslProgram, DslStmt, DslTarget, DslUnaryOp,
@@ -16,7 +16,7 @@ struct DslSemanticContext {
     this_descriptor: Option<String>,
     arg_descriptors: Vec<String>,
     local_descriptors: BTreeMap<String, String>,
-    nonnull_targets: BTreeSet<DslTargetKey>,
+    target_narrow_types: BTreeMap<DslTargetKey, Option<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -49,6 +49,54 @@ fn value_descriptor_assignable_to(src: &str, dst: &str) -> bool {
     src == dst || (return_is_object(src) && return_is_object(dst))
 }
 
+fn nonnull_key_for_value(value: &DslValue) -> Option<DslTargetKey> {
+    let DslValue::Target(target) = value else {
+        return None;
+    };
+    dsl_target_key(target)
+}
+
+fn condition_facts_when_true(condition: &DslCondition) -> Vec<(DslTargetKey, Option<String>)> {
+    match condition {
+        DslCondition::Null { value, invert: true } => nonnull_key_for_value(value)
+            .into_iter()
+            .map(|key| (key, None))
+            .collect(),
+        DslCondition::InstanceOf { value, class_name } => nonnull_key_for_value(value)
+            .into_iter()
+            .map(|key| {
+                (
+                    key,
+                    Some(java_class_to_descriptor(class_name).unwrap_or_else(|_| class_name.clone())),
+                )
+            })
+            .collect(),
+        DslCondition::And(left, right) => {
+            let mut facts = condition_facts_when_true(left);
+            facts.extend(condition_facts_when_true(right));
+            facts
+        }
+        DslCondition::Not(condition) => condition_facts_when_false(condition),
+        _ => Vec::new(),
+    }
+}
+
+fn condition_facts_when_false(condition: &DslCondition) -> Vec<(DslTargetKey, Option<String>)> {
+    match condition {
+        DslCondition::Null { value, invert: false } => nonnull_key_for_value(value)
+            .into_iter()
+            .map(|key| (key, None))
+            .collect(),
+        DslCondition::Or(left, right) => {
+            let mut facts = condition_facts_when_false(left);
+            facts.extend(condition_facts_when_false(right));
+            facts
+        }
+        DslCondition::Not(condition) => condition_facts_when_true(condition),
+        _ => Vec::new(),
+    }
+}
+
 impl DslSemanticContext {
     fn new(env: JniEnv, is_static: bool, target_type: String, target_params: Vec<String>) -> Self {
         Self {
@@ -56,11 +104,16 @@ impl DslSemanticContext {
             this_descriptor: if is_static { None } else { Some(target_type) },
             arg_descriptors: target_params,
             local_descriptors: BTreeMap::new(),
-            nonnull_targets: BTreeSet::new(),
+            target_narrow_types: BTreeMap::new(),
         }
     }
 
     fn resolve_target_descriptor(&self, target: &DslTarget) -> Result<String, String> {
+        if let Some(key) = dsl_target_key(target) {
+            if let Some(Some(desc)) = self.target_narrow_types.get(&key) {
+                return Ok(desc.clone());
+            }
+        }
         match target {
             DslTarget::This => self
                 .this_descriptor
@@ -167,7 +220,7 @@ impl DslSemanticContext {
     fn is_known_nonnull_target(&self, target: &DslTarget) -> bool {
         matches!(target, DslTarget::This)
             || dsl_target_key(target)
-                .map(|key| self.nonnull_targets.contains(&key))
+                .map(|key| self.target_narrow_types.contains_key(&key))
                 .unwrap_or(false)
     }
 
@@ -198,7 +251,14 @@ impl DslSemanticContext {
     }
 
     fn validate_bool_condition_value(&mut self, value: &DslValue) -> Result<(), String> {
-        self.validate_value_inner(value, true)
+        self.validate_value_inner(value, true)?;
+        let Some(desc) = self.infer_value_descriptor(value)? else {
+            return Err("boolean condition requires boolean, got null/void".to_string());
+        };
+        if desc != "Z" {
+            return Err(format!("boolean condition requires boolean, got {}", desc));
+        }
+        Ok(())
     }
 
     fn validate_value_inner(&mut self, value: &DslValue, require_nonnull_receiver: bool) -> Result<(), String> {
@@ -235,8 +295,14 @@ impl DslSemanticContext {
                 else_value,
             } => {
                 self.validate_condition(condition)?;
-                self.validate_value_inner(then_value, require_nonnull_receiver)?;
-                self.validate_value_inner(else_value, require_nonnull_receiver)?;
+                let true_facts = condition_facts_when_true(condition);
+                self.validate_with_target_facts(&true_facts, |ctx| {
+                    ctx.validate_value_inner(then_value, require_nonnull_receiver)
+                })?;
+                let false_facts = condition_facts_when_false(condition);
+                self.validate_with_target_facts(&false_facts, |ctx| {
+                    ctx.validate_value_inner(else_value, require_nonnull_receiver)
+                })?;
                 let _ = self.infer_value_descriptor(value)?;
             }
             DslValue::Cast { value, class_name } => {
@@ -316,9 +382,15 @@ impl DslSemanticContext {
                 self.validate_value(value)?;
                 java_class_to_descriptor(class_name)?;
             }
-            DslCondition::And(left, right) | DslCondition::Or(left, right) => {
+            DslCondition::And(left, right) => {
                 self.validate_condition(left)?;
-                self.validate_condition(right)?;
+                let facts = condition_facts_when_true(left);
+                self.validate_with_target_facts(&facts, |ctx| ctx.validate_condition(right))?;
+            }
+            DslCondition::Or(left, right) => {
+                self.validate_condition(left)?;
+                let facts = condition_facts_when_false(left);
+                self.validate_with_target_facts(&facts, |ctx| ctx.validate_condition(right))?;
             }
             DslCondition::Not(condition) => self.validate_condition(condition)?,
         }
@@ -447,16 +519,30 @@ impl DslSemanticContext {
     }
 
     fn validate_stmts_with_nonnull_value(&mut self, value: &DslValue, stmts: &[DslStmt]) -> Result<(), String> {
-        let DslValue::Target(target) = value else {
+        let Some(key) = nonnull_key_for_value(value) else {
             return self.validate_stmts(stmts);
         };
-        let Some(key) = dsl_target_key(target) else {
-            return self.validate_stmts(stmts);
-        };
-        let inserted = self.nonnull_targets.insert(key.clone());
-        let result = self.validate_stmts(stmts);
-        if inserted {
-            self.nonnull_targets.remove(&key);
+        self.validate_with_target_facts(&[(key, None)], |ctx| ctx.validate_stmts(stmts))
+    }
+
+    fn validate_with_target_facts<F>(&mut self, facts: &[(DslTargetKey, Option<String>)], f: F) -> Result<(), String>
+    where
+        F: FnOnce(&mut Self) -> Result<(), String>,
+    {
+        let previous = facts
+            .iter()
+            .map(|(key, desc)| {
+                let old = self.target_narrow_types.insert(key.clone(), desc.clone());
+                (key.clone(), old)
+            })
+            .collect::<Vec<_>>();
+        let result = f(self);
+        for (key, old) in previous.into_iter().rev() {
+            if let Some(old) = old {
+                self.target_narrow_types.insert(key, old);
+            } else {
+                self.target_narrow_types.remove(&key);
+            }
         }
         result
     }
@@ -589,12 +675,17 @@ impl DslSemanticContext {
             }
             DslStmt::IfInstanceOf {
                 value,
+                class_name,
                 then_stmts,
                 else_stmts,
-                ..
             } => {
                 self.validate_value(value)?;
-                self.validate_stmts_with_nonnull_value(value, then_stmts)?;
+                let ty = java_class_to_descriptor(class_name)?;
+                let facts = nonnull_key_for_value(value)
+                    .into_iter()
+                    .map(|key| (key, Some(ty.clone())))
+                    .collect::<Vec<_>>();
+                self.validate_with_target_facts(&facts, |ctx| ctx.validate_stmts(then_stmts))?;
                 self.validate_stmts(else_stmts)?;
             }
             DslStmt::IfCmp {

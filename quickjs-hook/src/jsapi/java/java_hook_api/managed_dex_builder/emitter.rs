@@ -35,6 +35,7 @@ pub(super) struct LocalSlot {
     descriptor: String,
 }
 
+#[derive(Clone)]
 pub(super) struct DslBuildContext {
     env: JniEnv,
     generated_type: String,
@@ -42,6 +43,30 @@ pub(super) struct DslBuildContext {
     int_expr_scratch_base: u16,
     int_expr_scratch_count: u16,
     range_scratch_base: u16,
+    target_narrow_types: BTreeMap<DslTargetKey, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum DslTargetKey {
+    This,
+    Arg(usize),
+    Local(String),
+}
+
+fn dsl_target_key(target: &DslTarget) -> Option<DslTargetKey> {
+    match target {
+        DslTarget::This => Some(DslTargetKey::This),
+        DslTarget::Arg(index) => Some(DslTargetKey::Arg(*index)),
+        DslTarget::Local(name) => Some(DslTargetKey::Local(name.clone())),
+        DslTarget::Last | DslTarget::Result => None,
+    }
+}
+
+fn dsl_value_target_key(value: &DslValue) -> Option<DslTargetKey> {
+    let DslValue::Target(target) = value else {
+        return None;
+    };
+    dsl_target_key(target)
 }
 
 impl DslBuildContext {
@@ -59,6 +84,7 @@ impl DslBuildContext {
             int_expr_scratch_base,
             int_expr_scratch_count,
             range_scratch_base,
+            target_narrow_types: BTreeMap::new(),
         }
     }
 
@@ -91,6 +117,65 @@ impl DslBuildContext {
             "Ljava/lang/String;".to_string(),
             field_name,
         )
+    }
+
+    fn with_target_narrow_type<F>(&mut self, key: DslTargetKey, descriptor: String, f: F) -> Result<bool, String>
+    where
+        F: FnOnce(&mut Self) -> Result<bool, String>,
+    {
+        self.with_target_narrow_types(&[(key, descriptor)], f)
+    }
+
+    fn with_target_narrow_types<F, R>(&mut self, facts: &[(DslTargetKey, String)], f: F) -> Result<R, String>
+    where
+        F: FnOnce(&mut Self) -> Result<R, String>,
+    {
+        let previous = facts
+            .iter()
+            .map(|(key, descriptor)| {
+                let old = self.target_narrow_types.insert(key.clone(), descriptor.clone());
+                (key.clone(), old)
+            })
+            .collect::<Vec<_>>();
+        let result = f(self);
+        for (key, old) in previous.into_iter().rev() {
+            if let Some(old) = old {
+                self.target_narrow_types.insert(key, old);
+            } else {
+                self.target_narrow_types.remove(&key);
+            }
+        }
+        result
+    }
+}
+
+fn condition_narrow_facts_when_true(condition: &DslCondition) -> Result<Vec<(DslTargetKey, String)>, String> {
+    match condition {
+        DslCondition::InstanceOf { value, class_name } => {
+            let Some(key) = dsl_value_target_key(value) else {
+                return Ok(Vec::new());
+            };
+            Ok(vec![(key, java_class_to_descriptor(class_name)?)])
+        }
+        DslCondition::And(left, right) => {
+            let mut facts = condition_narrow_facts_when_true(left)?;
+            facts.extend(condition_narrow_facts_when_true(right)?);
+            Ok(facts)
+        }
+        DslCondition::Not(condition) => condition_narrow_facts_when_false(condition),
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn condition_narrow_facts_when_false(condition: &DslCondition) -> Result<Vec<(DslTargetKey, String)>, String> {
+    match condition {
+        DslCondition::Or(left, right) => {
+            let mut facts = condition_narrow_facts_when_false(left)?;
+            facts.extend(condition_narrow_facts_when_false(right)?);
+            Ok(facts)
+        }
+        DslCondition::Not(condition) => condition_narrow_facts_when_true(condition),
+        _ => Ok(Vec::new()),
     }
 }
 
@@ -294,9 +379,9 @@ fn emit_call_value(
         stmt.target.as_ref(),
         stmt.receiver.as_deref(),
         layout,
-        dsl_ctx.env,
+        dsl_ctx,
     )?;
-    let arg_types = infer_call_arg_descriptors(stmt, layout, dsl_ctx.env)?;
+    let arg_types = infer_call_arg_descriptors(stmt, layout, dsl_ctx)?;
     let (params, return_type, full_sig) =
         resolve_call_proto_with_arg_types(dsl_ctx.env, stmt, &class_type, Some(&arg_types))?;
     if return_type == "V" {
@@ -418,7 +503,7 @@ fn emit_field_get_value(
         stmt.target.as_ref(),
         stmt.receiver.as_deref(),
         layout,
-        dsl_ctx.env,
+        dsl_ctx,
     )?;
     let (declaring_type, field_type) = resolve_field_ref_parts(dsl_ctx.env, stmt, is_static, &class_type)?;
     if !value_descriptor_assignable_to(&field_type, expected_type) {
@@ -552,7 +637,7 @@ fn emit_load_value(
             index,
             type_name,
         } => {
-            let component_type = resolve_array_component_type(array, type_name.as_deref(), layout, dsl_ctx.env)?;
+            let component_type = resolve_array_component_type(array, type_name.as_deref(), layout, dsl_ctx)?;
             if !value_descriptor_assignable_to(&component_type, expected_type) {
                 return Err(format!(
                     "aget expression type {} cannot be passed as {}",
@@ -589,11 +674,17 @@ fn emit_ternary_value(
     let done_label = ir.new_label();
     emit_condition_branch(ir, condition, then_label, else_label, layout, dsl_ctx)?;
     ir.bind(then_label)?;
-    let then_reg = emit_load_value(ir, then_value, expected_type, dst, layout, dsl_ctx)?;
+    let then_facts = condition_narrow_facts_when_true(condition)?;
+    let then_reg = dsl_ctx.with_target_narrow_types(&then_facts, |dsl_ctx| {
+        emit_load_value(ir, then_value, expected_type, dst, layout, dsl_ctx)
+    })?;
     emit_copy_value(ir, dst, then_reg, expected_type)?;
     ir.goto16(done_label);
     ir.bind(else_label)?;
-    let else_reg = emit_load_value(ir, else_value, expected_type, dst, layout, dsl_ctx)?;
+    let else_facts = condition_narrow_facts_when_false(condition)?;
+    let else_reg = dsl_ctx.with_target_narrow_types(&else_facts, |dsl_ctx| {
+        emit_load_value(ir, else_value, expected_type, dst, layout, dsl_ctx)
+    })?;
     emit_copy_value(ir, dst, else_reg, expected_type)?;
     ir.bind(done_label)?;
     Ok(dst)
@@ -627,17 +718,7 @@ fn emit_condition_branch(
             }
         }
         DslCondition::Cmp { op, left, right } => {
-            let expected_type = if infer_cmp_descriptor(left, layout) == Some("Z")
-                || infer_cmp_descriptor(right, layout) == Some("Z")
-            {
-                "Z"
-            } else if infer_cmp_descriptor(left, layout) == Some("I")
-                || infer_cmp_descriptor(right, layout) == Some("I")
-            {
-                "I"
-            } else {
-                "Ljava/lang/Object;"
-            };
+            let expected_type = cmp_expected_type(left, right, layout, dsl_ctx)?;
             let left_reg = emit_load_cmp_value(ir, left, expected_type, REG_TMP0, layout, dsl_ctx)?;
             let right_reg = emit_load_cmp_value(ir, right, expected_type, REG_TMP1, layout, dsl_ctx)?;
             ir.if_cmp(*op, left_reg, right_reg, true_label);
@@ -655,13 +736,19 @@ fn emit_condition_branch(
             let right_label = ir.new_label();
             emit_condition_branch(ir, left, right_label, false_label, layout, dsl_ctx)?;
             ir.bind(right_label)?;
-            emit_condition_branch(ir, right, true_label, false_label, layout, dsl_ctx)?;
+            let facts = condition_narrow_facts_when_true(left)?;
+            dsl_ctx.with_target_narrow_types(&facts, |dsl_ctx| {
+                emit_condition_branch(ir, right, true_label, false_label, layout, dsl_ctx)
+            })?;
         }
         DslCondition::Or(left, right) => {
             let right_label = ir.new_label();
             emit_condition_branch(ir, left, true_label, right_label, layout, dsl_ctx)?;
             ir.bind(right_label)?;
-            emit_condition_branch(ir, right, true_label, false_label, layout, dsl_ctx)?;
+            let facts = condition_narrow_facts_when_false(left)?;
+            dsl_ctx.with_target_narrow_types(&facts, |dsl_ctx| {
+                emit_condition_branch(ir, right, true_label, false_label, layout, dsl_ctx)
+            })?;
         }
         DslCondition::Not(condition) => {
             emit_condition_branch(ir, condition, false_label, true_label, layout, dsl_ctx)?;
@@ -919,9 +1006,13 @@ fn value_i16_literal(value: &DslValue) -> Option<i16> {
     Some(*value)
 }
 
-fn infer_value_descriptor(value: &DslValue, layout: &HelperParamLayout, env: JniEnv) -> Result<Option<String>, String> {
+fn infer_value_descriptor(
+    value: &DslValue,
+    layout: &HelperParamLayout,
+    dsl_ctx: &DslBuildContext,
+) -> Result<Option<String>, String> {
     match value {
-        DslValue::Target(target) => resolve_target_descriptor(target, layout).map(Some),
+        DslValue::Target(target) => resolve_target_descriptor(target, layout, dsl_ctx).map(Some),
         DslValue::String(_) => Ok(Some("Ljava/lang/String;".to_string())),
         DslValue::Int(_) | DslValue::IntBinOp { .. } | DslValue::ArrayLength(_) => Ok(Some("I".to_string())),
         DslValue::UnaryOp { op, .. } => match op {
@@ -930,11 +1021,21 @@ fn infer_value_descriptor(value: &DslValue, layout: &HelperParamLayout, env: Jni
         },
         DslValue::Bool(_) => Ok(Some("Z".to_string())),
         DslValue::Ternary {
-            then_value, else_value, ..
+            condition,
+            then_value,
+            else_value,
         } => {
-            let then_desc = infer_value_descriptor(then_value, layout, env)?;
-            let else_desc = infer_value_descriptor(else_value, layout, env)?;
-            common_value_descriptor_with_env(then_desc, else_desc, env)
+            let then_facts = condition_narrow_facts_when_true(condition)?;
+            let mut then_ctx = dsl_ctx.clone();
+            let then_desc = then_ctx.with_target_narrow_types(&then_facts, |dsl_ctx| {
+                infer_value_descriptor(then_value, layout, dsl_ctx)
+            })?;
+            let else_facts = condition_narrow_facts_when_false(condition)?;
+            let mut else_ctx = dsl_ctx.clone();
+            let else_desc = else_ctx.with_target_narrow_types(&else_facts, |dsl_ctx| {
+                infer_value_descriptor(else_value, layout, dsl_ctx)
+            })?;
+            common_value_descriptor_with_env(then_desc, else_desc, dsl_ctx.env)
         }
         DslValue::Null => Ok(None),
         DslValue::Call(stmt) => {
@@ -950,10 +1051,11 @@ fn infer_value_descriptor(value: &DslValue, layout: &HelperParamLayout, env: Jni
                     stmt.target.as_ref(),
                     stmt.receiver.as_deref(),
                     layout,
-                    env,
+                    dsl_ctx,
                 )?;
-                let arg_types = infer_call_arg_descriptors(stmt, layout, env)?;
-                let (_, return_type, _) = resolve_call_proto_with_arg_types(env, stmt, &class_type, Some(&arg_types))?;
+                let arg_types = infer_call_arg_descriptors(stmt, layout, dsl_ctx)?;
+                let (_, return_type, _) =
+                    resolve_call_proto_with_arg_types(dsl_ctx.env, stmt, &class_type, Some(&arg_types))?;
                 if return_type == "V" {
                     Ok(None)
                 } else {
@@ -968,9 +1070,9 @@ fn infer_value_descriptor(value: &DslValue, layout: &HelperParamLayout, env: Jni
                 stmt.target.as_ref(),
                 stmt.receiver.as_deref(),
                 layout,
-                env,
+                dsl_ctx,
             )?;
-            resolve_field_type(env, stmt, *is_static, &class_type).map(Some)
+            resolve_field_type(dsl_ctx.env, stmt, *is_static, &class_type).map(Some)
         }
         DslValue::Cast { class_name, .. } => java_class_to_descriptor(class_name).map(Some),
         DslValue::ArrayGet { type_name, .. } => match type_name {
@@ -984,12 +1086,12 @@ fn resolve_array_component_type(
     array: &DslValue,
     explicit_type_name: Option<&str>,
     layout: &HelperParamLayout,
-    env: JniEnv,
+    dsl_ctx: &DslBuildContext,
 ) -> Result<String, String> {
     if let Some(type_name) = explicit_type_name {
         return java_class_to_descriptor_or_primitive(type_name);
     }
-    let Some(array_desc) = infer_value_descriptor(array, layout, env)? else {
+    let Some(array_desc) = infer_value_descriptor(array, layout, dsl_ctx)? else {
         return Err("array element type cannot be inferred; use arr[index: Type]".to_string());
     };
     array_component_descriptor(&array_desc)
@@ -1047,7 +1149,16 @@ fn resolve_target_reg(target: &DslTarget, layout: &HelperParamLayout) -> Result<
     }
 }
 
-fn resolve_target_descriptor(target: &DslTarget, layout: &HelperParamLayout) -> Result<String, String> {
+fn resolve_target_descriptor(
+    target: &DslTarget,
+    layout: &HelperParamLayout,
+    dsl_ctx: &DslBuildContext,
+) -> Result<String, String> {
+    if let Some(key) = dsl_target_key(target) {
+        if let Some(descriptor) = dsl_ctx.target_narrow_types.get(&key) {
+            return Ok(descriptor.clone());
+        }
+    }
     match target {
         DslTarget::This => layout
             .this_descriptor
@@ -1074,13 +1185,13 @@ fn resolve_member_class_type(
     target: Option<&DslTarget>,
     receiver: Option<&DslValue>,
     layout: &HelperParamLayout,
-    env: JniEnv,
+    dsl_ctx: &DslBuildContext,
 ) -> Result<String, String> {
     if let Some(class_name) = explicit_class_name {
         return java_class_to_descriptor(class_name);
     }
     if let Some(receiver) = receiver {
-        let Some(desc) = infer_value_descriptor(receiver, layout, env)? else {
+        let Some(desc) = infer_value_descriptor(receiver, layout, dsl_ctx)? else {
             return Err("receiver class cannot be inferred from null/void expression".to_string());
         };
         if !desc.starts_with('L') || !desc.ends_with(';') {
@@ -1094,7 +1205,7 @@ fn resolve_member_class_type(
     let Some(target) = target else {
         return Err("static member access requires an explicit class name".to_string());
     };
-    let desc = resolve_target_descriptor(target, layout)?;
+    let desc = resolve_target_descriptor(target, layout, dsl_ctx)?;
     if !desc.starts_with('L') || !desc.ends_with(';') {
         return Err(format!(
             "target class can only be inferred from object locals/args, got {}",
@@ -1162,7 +1273,7 @@ fn emit_field_read(
         stmt.target.as_ref(),
         stmt.receiver.as_deref(),
         layout,
-        dsl_ctx.env,
+        dsl_ctx,
     )?;
     let (declaring_type, field_type) = resolve_field_ref_parts(dsl_ctx.env, stmt, is_static, &class_type)?;
     let field = FieldRef::new(declaring_type, field_type.clone(), stmt.field_name.clone());
@@ -1193,7 +1304,7 @@ fn emit_field_write(
         stmt.target.as_ref(),
         stmt.receiver.as_deref(),
         layout,
-        dsl_ctx.env,
+        dsl_ctx,
     )?;
     let (declaring_type, field_type) = resolve_field_ref_parts(dsl_ctx.env, stmt, is_static, &class_type)?;
     let field = FieldRef::new(declaring_type, field_type.clone(), stmt.field_name.clone());
@@ -1358,52 +1469,36 @@ fn emit_if_bool(
     Ok(then_returns && else_returns)
 }
 
-fn infer_cmp_descriptor(value: &DslValue, layout: &HelperParamLayout) -> Option<&'static str> {
-    match value {
-        DslValue::Int(_) | DslValue::IntBinOp { .. } => Some("I"),
-        DslValue::UnaryOp { op, .. } => match op {
-            DslUnaryOp::Neg | DslUnaryOp::BitNot => Some("I"),
-            DslUnaryOp::BoolNot => Some("Z"),
-        },
-        DslValue::Bool(_) => Some("Z"),
-        DslValue::Target(DslTarget::Result) => Some("I"),
-        DslValue::Target(DslTarget::Local(name)) => {
-            layout
-                .local_regs
-                .get(name)
-                .and_then(|slot| match slot.descriptor.as_str() {
-                    "I" => Some("I"),
-                    "Z" => Some("Z"),
-                    _ => None,
-                })
-        }
-        DslValue::Call(stmt) => parse_method_signature(&stmt.sig)
-            .ok()
-            .and_then(|(_, ret)| match ret.as_str() {
-                "I" => Some("I"),
-                "Z" => Some("Z"),
-                _ => None,
-            }),
-        DslValue::FieldGet { stmt, .. } => {
-            java_class_to_descriptor_or_primitive(&stmt.type_name)
-                .ok()
-                .and_then(|desc| match desc.as_str() {
-                    "I" => Some("I"),
-                    "Z" => Some("Z"),
-                    _ => None,
-                })
-        }
-        DslValue::ArrayLength(_) => Some("I"),
-        DslValue::ArrayGet { type_name, .. } => type_name
-            .as_ref()
-            .and_then(|type_name| java_class_to_descriptor_or_primitive(type_name).ok())
-            .and_then(|desc| match desc.as_str() {
-                "I" => Some("I"),
-                "Z" => Some("Z"),
-                _ => None,
-            }),
-        _ => None,
+fn cmp_expected_type(
+    left: &DslValue,
+    right: &DslValue,
+    layout: &HelperParamLayout,
+    dsl_ctx: &DslBuildContext,
+) -> Result<&'static str, String> {
+    let left_desc = infer_cmp_descriptor(left, layout, dsl_ctx)?;
+    let right_desc = infer_cmp_descriptor(right, layout, dsl_ctx)?;
+    if left_desc == Some("Z") || right_desc == Some("Z") {
+        Ok("Z")
+    } else if left_desc == Some("I") || right_desc == Some("I") {
+        Ok("I")
+    } else {
+        Ok("Ljava/lang/Object;")
     }
+}
+
+fn infer_cmp_descriptor(
+    value: &DslValue,
+    layout: &HelperParamLayout,
+    dsl_ctx: &DslBuildContext,
+) -> Result<Option<&'static str>, String> {
+    let Some(desc) = infer_value_descriptor(value, layout, dsl_ctx)? else {
+        return Ok(None);
+    };
+    Ok(match desc.as_str() {
+        "I" => Some("I"),
+        "Z" => Some("Z"),
+        _ => None,
+    })
 }
 
 fn emit_load_cmp_value(
@@ -1432,17 +1527,7 @@ fn emit_if_cmp(
     else_stmts: &[DslStmt],
     emit_ctx: &mut EmitContext<'_>,
 ) -> Result<bool, String> {
-    let expected_type = if infer_cmp_descriptor(left, emit_ctx.layout) == Some("Z")
-        || infer_cmp_descriptor(right, emit_ctx.layout) == Some("Z")
-    {
-        "Z"
-    } else if infer_cmp_descriptor(left, emit_ctx.layout) == Some("I")
-        || infer_cmp_descriptor(right, emit_ctx.layout) == Some("I")
-    {
-        "I"
-    } else {
-        "Ljava/lang/Object;"
-    };
+    let expected_type = cmp_expected_type(left, right, emit_ctx.layout, emit_ctx.dsl_ctx)?;
     let left_reg = emit_load_cmp_value(ir, left, expected_type, REG_TMP0, emit_ctx.layout, emit_ctx.dsl_ctx)?;
     let right_reg = emit_load_cmp_value(ir, right, expected_type, REG_TMP1, emit_ctx.layout, emit_ctx.dsl_ctx)?;
     let else_label = ir.new_label();
@@ -1586,7 +1671,7 @@ fn emit_array_get_stmt(
     layout: &HelperParamLayout,
     dsl_ctx: &mut DslBuildContext,
 ) -> Result<(), String> {
-    let component_type = resolve_array_component_type(array, type_name, layout, dsl_ctx.env)?;
+    let component_type = resolve_array_component_type(array, type_name, layout, dsl_ctx)?;
     let kind = value_kind_from_descriptor(&component_type)?;
     let dst = if matches!(kind, ValueKind::Object) {
         REG_LAST_OBJECT
@@ -1606,7 +1691,7 @@ fn emit_array_put(
     layout: &HelperParamLayout,
     dsl_ctx: &mut DslBuildContext,
 ) -> Result<(), String> {
-    let component_type = resolve_array_component_type(array, type_name, layout, dsl_ctx.env)?;
+    let component_type = resolve_array_component_type(array, type_name, layout, dsl_ctx)?;
     let kind = value_kind_from_descriptor(&component_type)?;
     let array_reg = emit_load_value(ir, array, "Ljava/lang/Object;", REG_TMP1, layout, dsl_ctx)?;
     let array_reg = emit_copy_object_if_needed(ir, array_reg, REG_TMP1);
@@ -1641,13 +1726,29 @@ fn emit_if_instance_of(
         emit_ctx.dsl_ctx,
     )?;
     let obj = emit_copy_object_if_needed(ir, src, REG_TMP1);
-    ir.instance_of(REG_TMP0, obj, ty);
+    ir.instance_of(REG_TMP0, obj, ty.clone());
 
     let else_label = ir.new_label();
     let done_label = ir.new_label();
     ir.if_eqz(REG_TMP0, else_label);
 
-    let then_returns = emit_statements(ir, then_stmts, emit_ctx)?;
+    let then_returns = if let Some(key) = dsl_value_target_key(value) {
+        emit_ctx.dsl_ctx.with_target_narrow_type(key, ty.clone(), |dsl_ctx| {
+            let mut narrowed_ctx = EmitContext {
+                layout: emit_ctx.layout,
+                dsl_ctx,
+                is_static: emit_ctx.is_static,
+                local_count: emit_ctx.local_count,
+                ins_size: emit_ctx.ins_size,
+                target: emit_ctx.target,
+                return_type: emit_ctx.return_type,
+                sink: emit_ctx.sink,
+            };
+            emit_statements(ir, then_stmts, &mut narrowed_ctx)
+        })?
+    } else {
+        emit_statements(ir, then_stmts, emit_ctx)?
+    };
     if !then_returns {
         ir.goto16(done_label);
     }
@@ -1677,11 +1778,11 @@ fn resolve_managed_invoke_kind(env: JniEnv, requested: DslCallKind, class_type: 
 fn infer_call_arg_descriptors(
     stmt: &DslCallStmt,
     layout: &HelperParamLayout,
-    env: JniEnv,
+    dsl_ctx: &DslBuildContext,
 ) -> Result<Vec<Option<String>>, String> {
     stmt.args
         .iter()
-        .map(|arg| infer_value_descriptor(arg, layout, env))
+        .map(|arg| infer_value_descriptor(arg, layout, dsl_ctx))
         .collect::<Result<Vec<_>, _>>()
 }
 
@@ -1798,9 +1899,9 @@ fn emit_call(
         stmt.target.as_ref(),
         stmt.receiver.as_deref(),
         layout,
-        dsl_ctx.env,
+        dsl_ctx,
     )?;
-    let arg_types = infer_call_arg_descriptors(stmt, layout, dsl_ctx.env)?;
+    let arg_types = infer_call_arg_descriptors(stmt, layout, dsl_ctx)?;
     let (params, return_type, full_sig) =
         resolve_call_proto_with_arg_types(dsl_ctx.env, stmt, &class_type, Some(&arg_types))?;
     if params.len() != stmt.args.len() {
