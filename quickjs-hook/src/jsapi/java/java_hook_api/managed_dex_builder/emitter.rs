@@ -1474,11 +1474,7 @@ fn emit_array_literal_value(
     }
     let component_type = array_component_descriptor(&array_type)?;
     let kind = value_kind_from_descriptor(&component_type)?;
-    let array_reg = if dst <= 0x0f && dst != REG_TMP0 {
-        dst
-    } else {
-        REG_LAST_OBJECT
-    };
+    let array_reg = REG_LOOP_LIMIT;
     let len = i16::try_from(elements.len()).map_err(|_| "array literal is too large".to_string())?;
     if (0..=7).contains(&len) {
         ir.const4(REG_TMP0, len as i8);
@@ -1488,14 +1484,13 @@ fn emit_array_literal_value(
     ir.new_array(array_reg, REG_TMP0, array_type.clone());
 
     for (index, element) in elements.iter().enumerate() {
+        let value_reg = emit_array_literal_element(ir, element, &component_type, kind, array_reg, layout, dsl_ctx)?;
         let index = i16::try_from(index).map_err(|_| "array literal is too large".to_string())?;
         if (0..=7).contains(&index) {
             ir.const4(REG_TMP0, index as i8);
         } else {
             ir.const16(REG_TMP0, index);
         }
-        let value_reg =
-            emit_simple_array_literal_element(ir, element, &component_type, kind, array_reg, layout, dsl_ctx)?;
         ir.aput(value_reg, array_reg, REG_TMP0, kind);
     }
 
@@ -1505,21 +1500,25 @@ fn emit_array_literal_value(
     Ok(dst)
 }
 
-fn emit_simple_array_literal_element(
+fn emit_array_literal_element(
     ir: &mut DexIrBuilder,
     element: &DslValue,
     component_type: &str,
     kind: ValueKind,
     array_reg: u8,
     layout: &HelperParamLayout,
-    _dsl_ctx: &mut DslBuildContext,
+    dsl_ctx: &mut DslBuildContext,
 ) -> Result<u8, String> {
+    if matches!(element, DslValue::ArrayLiteral { .. }) {
+        return Err("nested array literals are not supported yet; create the inner array explicitly".to_string());
+    }
+
     match element {
         DslValue::String(value) => {
             if !return_is_object(component_type) {
                 return Err(format!("string literal cannot be stored in {}", component_type));
             }
-            let field = _dsl_ctx.string_literal_field(value);
+            let field = dsl_ctx.string_literal_field(value);
             ir.sget(REG_TMP1, field, ValueKind::Object);
             Ok(REG_TMP1)
         }
@@ -1544,15 +1543,18 @@ fn emit_simple_array_literal_element(
             ir.const4(REG_TMP1, 0);
             Ok(REG_TMP1)
         }
-        DslValue::Target(target) => {
-            let reg = resolve_target_reg(target, layout)?;
-            let reg = emit_copy_field_value_if_needed(ir, reg, REG_TMP1, kind);
+        _ => {
+            let reg = emit_load_value(ir, element, component_type, REG_TMP1, layout, dsl_ctx)?;
             if reg == array_reg {
                 return Err("array literal element cannot use the destination array register".to_string());
             }
-            Ok(reg)
+            if reg == REG_TMP0 {
+                ir.move_from16(REG_TMP1, REG_TMP0 as u16, kind);
+                Ok(REG_TMP1)
+            } else {
+                Ok(reg)
+            }
         }
-        _ => Err("array literal currently supports simple literal/target elements only".to_string()),
     }
 }
 
