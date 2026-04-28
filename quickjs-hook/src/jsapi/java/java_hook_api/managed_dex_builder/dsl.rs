@@ -1,5 +1,6 @@
 use super::{build_method_sig, build_params_sig, java_class_to_descriptor_or_primitive, IfCmpOp};
 
+mod assignment;
 mod ast;
 mod condition;
 pub(super) use ast::*;
