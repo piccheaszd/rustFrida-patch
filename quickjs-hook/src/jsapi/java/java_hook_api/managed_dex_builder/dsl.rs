@@ -14,6 +14,7 @@ use parser::DslParser;
 mod scope;
 mod syntax;
 
+mod expr_core;
 mod expression;
 mod helpers;
 pub(super) use helpers::*;
