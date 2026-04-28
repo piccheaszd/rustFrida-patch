@@ -1189,7 +1189,7 @@ impl DslSemanticContext {
     }
 }
 
-pub(super) fn validate_semantics(
+pub(in crate::jsapi::java::java_hook_api::managed_dex_builder) fn validate_semantics(
     env: JniEnv,
     program: &DslProgram,
     is_static: bool,
