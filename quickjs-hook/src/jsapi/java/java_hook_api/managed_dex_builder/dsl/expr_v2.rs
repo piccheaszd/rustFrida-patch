@@ -230,20 +230,8 @@ fn try_parse_v2_static_member_primary(
     let member_name = parts.pop().unwrap();
     let class_name = parts.join(".");
     if stream.consume_char('(') {
-        let args = parse_v2_direct_call_args(stream, local_scopes)?;
-        if !stream.consume_char(')') {
-            return Err(stream.err("expected ')'"));
-        }
-        return Ok(Some(DslValue::Call(DslCallStmt {
-            kind: DslCallKind::Static,
-            target: None,
-            receiver: None,
-            null_safe: false,
-            class_name: Some(class_name),
-            method_name: member_name,
-            sig: String::new(),
-            args,
-        })));
+        let parsed_args = parse_v2_member_call_args(stream, local_scopes, true, false)?;
+        return Ok(Some(build_v2_static_member_value(class_name, member_name, parsed_args)));
     }
     Ok(Some(DslValue::FieldGet {
         stmt: Box::new(DslFieldStmt {
@@ -447,39 +435,99 @@ fn parse_v2_member_postfix(
         );
     }
     if !stream.peek_char('(') {
-        return build_v2_receiver_field(stream, receiver, member_name, call_kind);
+        return build_v2_receiver_field(stream, receiver, member_name, call_kind, String::new());
     }
     stream.consume_char('(');
-    let args = parse_v2_direct_call_args(stream, local_scopes)?;
-    if !stream.consume_char(')') {
-        return Err(stream.err("expected ')'"));
-    }
-    Ok(build_v2_receiver_call(
-        receiver,
-        null_safe,
-        member_name,
-        call_kind,
-        args,
-    ))
+    let allow_explicit_class = matches!(receiver, DslValue::Target(DslTarget::Last | DslTarget::Result));
+    let parsed_args = parse_v2_member_call_args(stream, local_scopes, true, allow_explicit_class)?;
+    build_v2_receiver_call(stream, receiver, null_safe, member_name, call_kind, parsed_args)
 }
 
-fn parse_v2_direct_call_args(
+fn parse_v2_member_call_args(
+    stream: &mut DslTokenStream<'_>,
+    local_scopes: &[BTreeMap<String, String>],
+    allow_field: bool,
+    allow_explicit_class: bool,
+) -> Result<ParsedCallArgs, String> {
+    if stream.consume_char(')') {
+        return Ok(ParsedCallArgs::Direct(Vec::new()));
+    }
+
+    if matches!(stream.current_kind(), Some(DslTokenKind::String(_))) {
+        let first = stream.parse_string()?;
+        if first.starts_with('(') {
+            let args = parse_v2_optional_value_args(stream, local_scopes)?;
+            if !stream.consume_char(')') {
+                return Err(stream.err("expected ')'"));
+            }
+            return Ok(ParsedCallArgs::LegacyCall {
+                class_name: None,
+                sig: first,
+                args,
+            });
+        }
+        if allow_explicit_class && stream.peek_char(',') && looks_like_type_name(&first) {
+            let checkpoint = stream.mark();
+            stream.consume_char(',');
+            if matches!(stream.current_kind(), Some(DslTokenKind::String(_))) {
+                let second = stream.parse_string()?;
+                if second.starts_with('(') {
+                    let args = parse_v2_optional_value_args(stream, local_scopes)?;
+                    if !stream.consume_char(')') {
+                        return Err(stream.err("expected ')'"));
+                    }
+                    return Ok(ParsedCallArgs::LegacyCall {
+                        class_name: Some(first),
+                        sig: second,
+                        args,
+                    });
+                }
+            }
+            stream.restore(checkpoint);
+        }
+        if allow_field && stream.peek_char(')') && looks_like_type_name(&first) {
+            stream.consume_char(')');
+            return Ok(ParsedCallArgs::Field {
+                class_name: None,
+                type_name: first,
+            });
+        }
+
+        let mut args = vec![DslValue::String(first)];
+        while stream.consume_char(',') {
+            args.push(parse_v2_int_binary_expr(stream, local_scopes, 0)?);
+        }
+        if !stream.consume_char(')') {
+            return Err(stream.err("expected ')'"));
+        }
+        return Ok(ParsedCallArgs::Direct(args));
+    }
+
+    let mut args = Vec::new();
+    loop {
+        if stream.peek_char(')') {
+            stream.consume_char(')');
+            return Ok(ParsedCallArgs::Direct(args));
+        }
+        args.push(parse_v2_int_binary_expr(stream, local_scopes, 0)?);
+        if !stream.consume_char(',') {
+            if !stream.consume_char(')') {
+                return Err(stream.err("expected ')'"));
+            }
+            return Ok(ParsedCallArgs::Direct(args));
+        }
+    }
+}
+
+fn parse_v2_optional_value_args(
     stream: &mut DslTokenStream<'_>,
     local_scopes: &[BTreeMap<String, String>],
 ) -> Result<Vec<DslValue>, String> {
     let mut args = Vec::new();
-    loop {
-        if stream.peek_char(')') {
-            return Ok(args);
-        }
-        if matches!(stream.current_kind(), Some(DslTokenKind::String(_))) {
-            return Err(stream.err("string-leading call arguments are handled by the legacy parser"));
-        }
+    while stream.consume_char(',') {
         args.push(parse_v2_int_binary_expr(stream, local_scopes, 0)?);
-        if !stream.consume_char(',') {
-            return Ok(args);
-        }
     }
+    Ok(args)
 }
 
 fn parse_v2_overload_selector_args(stream: &mut DslTokenStream<'_>) -> Result<Vec<String>, String> {
@@ -543,23 +591,44 @@ fn build_v2_receiver_overload_call(
 }
 
 fn build_v2_receiver_call(
+    stream: &DslTokenStream<'_>,
     receiver: DslValue,
     null_safe: bool,
     method_name: String,
     kind: DslCallKind,
-    args: Vec<DslValue>,
-) -> DslValue {
-    let (target, receiver) = split_simple_target_receiver(receiver);
-    DslValue::Call(DslCallStmt {
-        kind,
-        target,
-        receiver: receiver.map(Box::new),
-        null_safe,
-        class_name: None,
-        method_name,
-        sig: String::new(),
-        args,
-    })
+    parsed_args: ParsedCallArgs,
+) -> Result<DslValue, String> {
+    match parsed_args {
+        ParsedCallArgs::Direct(args) => {
+            let (target, receiver) = split_simple_target_receiver(receiver);
+            Ok(DslValue::Call(DslCallStmt {
+                kind,
+                target,
+                receiver: receiver.map(Box::new),
+                null_safe,
+                class_name: None,
+                method_name,
+                sig: String::new(),
+                args,
+            }))
+        }
+        ParsedCallArgs::LegacyCall { class_name, sig, args } => {
+            let (target, receiver) = split_simple_target_receiver(receiver);
+            Ok(DslValue::Call(DslCallStmt {
+                kind,
+                target,
+                receiver: receiver.map(Box::new),
+                null_safe,
+                class_name,
+                method_name,
+                sig,
+                args,
+            }))
+        }
+        ParsedCallArgs::Field { type_name, .. } => {
+            build_v2_receiver_field(stream, receiver, method_name, kind, type_name)
+        }
+    }
 }
 
 fn build_v2_receiver_field(
@@ -567,6 +636,7 @@ fn build_v2_receiver_field(
     receiver: DslValue,
     field_name: String,
     kind: DslCallKind,
+    type_name: String,
 ) -> Result<DslValue, String> {
     if kind == DslCallKind::Interface {
         return Err(stream.err("interface field access is not supported"));
@@ -578,7 +648,7 @@ fn build_v2_receiver_field(
             receiver: receiver.map(Box::new),
             class_name: None,
             field_name,
-            type_name: String::new(),
+            type_name,
             value: None,
         }),
         is_static: false,
@@ -589,6 +659,42 @@ fn split_simple_target_receiver(value: DslValue) -> (Option<DslTarget>, Option<D
     match value {
         DslValue::Target(target) => (Some(target), None),
         value => (None, Some(value)),
+    }
+}
+
+fn build_v2_static_member_value(class_name: String, member_name: String, parsed_args: ParsedCallArgs) -> DslValue {
+    match parsed_args {
+        ParsedCallArgs::Direct(args) => DslValue::Call(DslCallStmt {
+            kind: DslCallKind::Static,
+            target: None,
+            receiver: None,
+            null_safe: false,
+            class_name: Some(class_name),
+            method_name: member_name,
+            sig: String::new(),
+            args,
+        }),
+        ParsedCallArgs::LegacyCall { sig, args, .. } => DslValue::Call(DslCallStmt {
+            kind: DslCallKind::Static,
+            target: None,
+            receiver: None,
+            null_safe: false,
+            class_name: Some(class_name),
+            method_name: member_name,
+            sig,
+            args,
+        }),
+        ParsedCallArgs::Field { type_name, .. } => DslValue::FieldGet {
+            stmt: Box::new(DslFieldStmt {
+                target: None,
+                receiver: None,
+                class_name: Some(class_name),
+                field_name: member_name,
+                type_name,
+                value: None,
+            }),
+            is_static: true,
+        },
     }
 }
 
