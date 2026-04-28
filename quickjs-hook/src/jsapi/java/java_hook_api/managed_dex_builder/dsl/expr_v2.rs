@@ -187,6 +187,25 @@ fn try_parse_v2_static_member_primary(
         stream.restore(mark);
         return Ok(None);
     }
+    if parts.last().map(|part| part.as_str()) == Some("$new") {
+        let class_parts = &parts[..parts.len() - 1];
+        if !class_parts.iter().any(|part| looks_like_static_class_name(part)) {
+            stream.restore(mark);
+            return Ok(None);
+        }
+        if !stream.consume_char('(') {
+            return Err(stream.err("expected '('"));
+        }
+        let (ctor_sig, args) = parse_v2_new_constructor_args(stream, local_scopes)?;
+        if !stream.consume_char(')') {
+            return Err(stream.err("expected ')'"));
+        }
+        return Ok(Some(DslValue::NewObject {
+            class_name: class_parts.join("."),
+            ctor_sig,
+            args,
+        }));
+    }
     if parts.last().map(|part| part.as_str()) == Some("overload") && parts.len() >= 3 {
         let method_name = parts[parts.len() - 2].clone();
         let class_parts = &parts[..parts.len() - 2];
@@ -254,6 +273,85 @@ fn parse_orig_args_v2(
         return Err(stream.err("expected ')'"));
     }
     Ok(DslOrigArgs::Values(args))
+}
+
+fn parse_v2_new_constructor_args(
+    stream: &mut DslTokenStream<'_>,
+    local_scopes: &[BTreeMap<String, String>],
+) -> Result<(Option<String>, Vec<DslValue>), String> {
+    enum NewArgToken {
+        String(String),
+        Value(DslValue),
+    }
+
+    fn token_to_value(token: NewArgToken) -> DslValue {
+        match token {
+            NewArgToken::String(value) => DslValue::String(value),
+            NewArgToken::Value(value) => value,
+        }
+    }
+
+    if stream.peek_char(')') {
+        return Ok((None, Vec::new()));
+    }
+
+    let mut tokens = Vec::new();
+    loop {
+        let token = if matches!(stream.current_kind(), Some(DslTokenKind::String(_))) {
+            NewArgToken::String(stream.parse_string()?)
+        } else {
+            NewArgToken::Value(parse_v2_int_binary_expr(stream, local_scopes, 0)?)
+        };
+        tokens.push(token);
+        if !stream.consume_char(',') {
+            break;
+        }
+    }
+
+    let Some(NewArgToken::String(first)) = tokens.first() else {
+        return Err(stream.err("constructor arguments must start with a signature or parameter type list"));
+    };
+    if first.starts_with('(') {
+        let sig = first.clone();
+        let args = tokens.into_iter().skip(1).map(token_to_value).collect::<Vec<_>>();
+        return Ok((Some(sig), args));
+    }
+
+    let mut resolved_type_count = None;
+    let mut resolved_sig = None;
+    if tokens.len() % 2 == 0 {
+        let type_count = tokens.len() / 2;
+        let mut params = Vec::with_capacity(type_count);
+        let mut all_types = true;
+        for token in &tokens[..type_count] {
+            let NewArgToken::String(type_name) = token else {
+                all_types = false;
+                break;
+            };
+            match java_class_to_descriptor_or_primitive(type_name) {
+                Ok(desc) => params.push(desc),
+                Err(_) => {
+                    all_types = false;
+                    break;
+                }
+            }
+        }
+        if all_types {
+            resolved_type_count = Some(type_count);
+            resolved_sig = Some(build_method_sig(&params, "V"));
+        }
+    }
+
+    let Some(type_count) = resolved_type_count else {
+        return Err(stream
+            .err("constructor expects either a full JNI signature or parameter type list followed by matching args"));
+    };
+    let args = tokens
+        .into_iter()
+        .skip(type_count)
+        .map(token_to_value)
+        .collect::<Vec<_>>();
+    Ok((resolved_sig, args))
 }
 
 fn parse_v2_array_literal(
