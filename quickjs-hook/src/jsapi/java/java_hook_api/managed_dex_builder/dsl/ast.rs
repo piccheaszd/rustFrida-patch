@@ -248,7 +248,7 @@ pub(in crate::jsapi::java::java_hook_api::managed_dex_builder) enum DslUnaryOp {
     BoolNot,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(in crate::jsapi::java::java_hook_api::managed_dex_builder) enum DslIntBinOp {
     Add,
     Sub,

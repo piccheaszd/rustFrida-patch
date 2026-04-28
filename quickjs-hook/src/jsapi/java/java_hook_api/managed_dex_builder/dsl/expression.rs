@@ -95,46 +95,6 @@ impl<'a> DslParser<'a> {
         self.parse_value_postfix(value)
     }
 
-    fn peek_int_binary_op(&mut self) -> Option<(DslIntBinOp, u8)> {
-        self.skip_ws();
-        if self.peek_op(">>>") {
-            return Some((DslIntBinOp::Ushr, 5));
-        }
-        if self.peek_op("<<") {
-            return Some((DslIntBinOp::Shl, 5));
-        }
-        if self.peek_op(">>") {
-            return Some((DslIntBinOp::Shr, 5));
-        }
-        match self.peek()? {
-            '|' => Some((DslIntBinOp::Or, 1)),
-            '^' => Some((DslIntBinOp::Xor, 2)),
-            '&' => Some((DslIntBinOp::And, 3)),
-            '+' => Some((DslIntBinOp::Add, 6)),
-            '-' => Some((DslIntBinOp::Sub, 6)),
-            '*' => Some((DslIntBinOp::Mul, 7)),
-            '/' => Some((DslIntBinOp::Div, 7)),
-            '%' => Some((DslIntBinOp::Rem, 7)),
-            _ => None,
-        }
-    }
-
-    fn consume_int_binary_op(&mut self, op: DslIntBinOp) -> Result<(), String> {
-        match op {
-            DslIntBinOp::Ushr => self.expect_op(">>>"),
-            DslIntBinOp::Shl => self.expect_op("<<"),
-            DslIntBinOp::Shr => self.expect_op(">>"),
-            DslIntBinOp::Or => self.expect_char('|'),
-            DslIntBinOp::Xor => self.expect_char('^'),
-            DslIntBinOp::And => self.expect_char('&'),
-            DslIntBinOp::Add => self.expect_char('+'),
-            DslIntBinOp::Sub => self.expect_char('-'),
-            DslIntBinOp::Mul => self.expect_char('*'),
-            DslIntBinOp::Div => self.expect_char('/'),
-            DslIntBinOp::Rem => self.expect_char('%'),
-        }
-    }
-
     pub(super) fn parse_value_from_ident(&mut self, ident: String) -> Result<DslValue, String> {
         self.skip_ws();
         if ident == "orig" && self.peek() == Some('(') {
