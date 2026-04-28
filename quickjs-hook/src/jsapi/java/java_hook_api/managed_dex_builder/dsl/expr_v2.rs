@@ -126,6 +126,14 @@ fn parse_v2_primary_expr(
             stream.advance();
             Ok(DslValue::Null)
         }
+        Some(DslTokenKind::Ident(value)) if value == "orig" => {
+            stream.advance();
+            if stream.peek_char('(') {
+                Ok(DslValue::OrigCall(parse_orig_args_v2(stream, local_scopes)?))
+            } else {
+                Ok(DslValue::Target(DslTarget::Local("orig".to_string())))
+            }
+        }
         Some(DslTokenKind::Ident(value)) => {
             let value = value.clone();
             stream.advance();
@@ -151,6 +159,23 @@ fn parse_v2_primary_expr(
     }
 }
 
+fn parse_orig_args_v2(
+    stream: &mut DslTokenStream<'_>,
+    local_scopes: &[BTreeMap<String, String>],
+) -> Result<DslOrigArgs, String> {
+    if !stream.consume_char('(') {
+        return Err(stream.err("expected '('"));
+    }
+    if stream.consume_char(')') {
+        return Ok(DslOrigArgs::Original);
+    }
+    let args = parse_v2_value_arg_list_until_close(stream, local_scopes)?;
+    if !stream.consume_char(')') {
+        return Err(stream.err("expected ')'"));
+    }
+    Ok(DslOrigArgs::Values(args))
+}
+
 fn parse_v2_array_literal(
     stream: &mut DslTokenStream<'_>,
     local_scopes: &[BTreeMap<String, String>],
@@ -174,6 +199,22 @@ fn parse_v2_array_literal(
             return Ok(DslValue::ArrayLiteral { elements });
         }
         return Err(stream.err("array literal expects ',' or ']'"));
+    }
+}
+
+fn parse_v2_value_arg_list_until_close(
+    stream: &mut DslTokenStream<'_>,
+    local_scopes: &[BTreeMap<String, String>],
+) -> Result<Vec<DslValue>, String> {
+    let mut args = Vec::new();
+    loop {
+        if stream.peek_char(')') {
+            return Ok(args);
+        }
+        args.push(parse_v2_int_binary_expr(stream, local_scopes, 0)?);
+        if !stream.consume_char(',') {
+            return Ok(args);
+        }
     }
 }
 
