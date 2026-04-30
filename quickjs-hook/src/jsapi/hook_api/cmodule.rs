@@ -35,9 +35,12 @@ extern "C" {
 }
 
 const TCC_OUTPUT_MEMORY: c_int = 1;
+const PR_SET_VMA: libc::c_int = 0x53564d41;
+const PR_SET_VMA_ANON_NAME: libc::c_int = 0;
 
 static CMODULE_CLASS_ID: AtomicU32 = AtomicU32::new(0);
 const CMODULE_CLASS_NAME: &[u8] = b"CModule\0";
+static CMODULE_CODE_VMA_NAME: &[u8] = b"wwb_cmodule_code\0";
 
 struct CModuleData {
     state: *mut TCCState,
@@ -48,6 +51,21 @@ struct CModuleData {
 struct CompileContext {
     errors: String,
     imports: HashMap<String, u64>,
+}
+
+unsafe fn mark_cmodule_code_vma(code: *mut c_void, code_size: usize) {
+    if code.is_null() || code_size == 0 {
+        return;
+    }
+
+    let _ = libc::syscall(
+        libc::SYS_prctl as libc::c_long,
+        PR_SET_VMA as libc::c_long,
+        PR_SET_VMA_ANON_NAME as libc::c_ulong,
+        code as libc::c_ulong,
+        code_size as libc::c_ulong,
+        CMODULE_CODE_VMA_NAME.as_ptr() as libc::c_ulong,
+    );
 }
 
 unsafe extern "C" fn cmodule_finalizer(_rt: *mut ffi::JSRuntime, val: ffi::JSValue) {
@@ -447,7 +465,10 @@ unsafe extern "C" fn js_cmodule(
         }
     }
 
-    let combined = match CString::new(format!("#line 1 \"rf_cmodule.c\"\n{}\n#line 1 \"module.c\"\n{}", PRELUDE, source)) {
+    let combined = match CString::new(format!(
+        "#line 1 \"rf_cmodule.c\"\n{}\n#line 1 \"module.c\"\n{}",
+        PRELUDE, source
+    )) {
         Ok(v) => v,
         Err(_) => {
             tcc_delete(state);
@@ -488,6 +509,7 @@ unsafe extern "C" fn js_cmodule(
         tcc_delete(state);
         return throw_internal_error(ctx, "CModule mmap(RWX) failed");
     }
+    mark_cmodule_code_vma(code, code_size);
 
     compile_ctx.errors.clear();
     tcc_set_error_func(state, &mut compile_ctx as *mut _ as *mut c_void, Some(append_error));
@@ -511,11 +533,7 @@ unsafe extern "C" fn js_cmodule(
         return obj;
     }
 
-    let data = Box::into_raw(Box::new(CModuleData {
-        state,
-        code,
-        code_size,
-    }));
+    let data = Box::into_raw(Box::new(CModuleData { state, code, code_size }));
     ffi::JS_SetOpaque(obj, data as *mut c_void);
 
     let mut symbols: Vec<(String, u64)> = Vec::new();
