@@ -199,10 +199,11 @@ void* generate_attach_thunk(HookEntry* entry, HookCallback on_enter,
     /* Restore x0-x15 from context (callback may have modified arguments) */
     emit_restore_caller_regs(&w);
 
-    /* x16 = trampoline (scratch). x17 = intercept_leave flag (scratch, 尚未恢复真值).
-     * 根据 flag 分两路 (仅当 on_leave==NULL 时允许 tail-jump, on_leave 注册时必须 wrap):
-     *   flag != 0 (默认) → wrap: BLR 原函数, 返回后走 on_leave + 出 thunk RET
-     *   flag == 0        → tail-jump: 恢复 x30/NZCV/x17/x18, ADD SP, BR trampoline, 不再回 thunk
+    /* x16 = trampoline (scratch).
+     *
+     * 规则:
+     *   on_leave == NULL → 必然 tail-jump, 不读 intercept_leave. 无 leave 时写 1 无效.
+     *   on_leave != NULL → wrap: BLR 原函数, 返回后走 on_leave + 出 thunk RET.
      *
      * tail-jump 路径省掉 thunk 栈帧在 BLR 期间的驻留, 原函数阻塞时 PC 已脱离 thunk,
      * full cleanup munmap pool 安全 (对标 "miss 不留栈帧" 的性能+安全优化). */
@@ -211,9 +212,8 @@ void* generate_attach_thunk(HookEntry* entry, HookCallback on_enter,
     uint64_t lbl_tail = 0;
     bool support_tail_jump = (on_leave == NULL);
     if (support_tail_jump) {
-        arm64_writer_put_ldr_reg_reg_offset(&w, ARM64_REG_X17, ARM64_REG_SP, 344); /* flag scratch */
         lbl_tail = arm64_writer_new_label_id(&w);
-        arm64_writer_put_cbz_reg_label(&w, ARM64_REG_X17, lbl_tail);
+        arm64_writer_put_b_label(&w, lbl_tail);
     }
 
     /* --- wrap path (intercept leave) --- */

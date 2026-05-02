@@ -40,8 +40,17 @@ const RULES: &[(&str, &str, &str, &[&str])] = &[
         "domain",
         "shell_data_file",
         "file",
-        &["read", "open", "getattr", "execute", "?map"],
+        &["read", "open", "getattr", "execute", "?map", "?execmod"],
     ),
+    // Normal inline patch temporarily mprotects file-backed text as RWX.
+    // SELinux checks this as file:execmod on the mapped file type.
+    ("domain", "?system_file", "file", &["?execmod"]),
+    ("domain", "?vendor_file", "file", &["?execmod"]),
+    ("domain", "?product_file", "file", &["?execmod"]),
+    ("domain", "?system_ext_file", "file", &["?execmod"]),
+    ("domain", "?apex_system_file", "file", &["?execmod"]),
+    ("domain", "?apk_data_file", "file", &["?execmod"]),
+    ("domain", "?app_data_file", "file", &["?execmod"]),
     (
         "domain",
         "?tmpfs",

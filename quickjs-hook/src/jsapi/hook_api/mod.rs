@@ -15,8 +15,7 @@ use crate::jsapi::util::add_cfunction_to_object;
 use callback::{in_flight_native_hook_callbacks, wait_for_in_flight_native_hook_callbacks};
 use functions::{
     js_attach_native, js_call_native, js_diag_alloc_near, js_hook, js_hook_native, js_interceptor_attach,
-    js_interceptor_detach_all, js_interceptor_flush, js_interceptor_replace, js_native_call, js_recomp_hook,
-    js_unhook,
+    js_interceptor_detach_all, js_interceptor_flush, js_interceptor_replace, js_native_call, js_recomp_hook, js_unhook,
 };
 #[cfg(feature = "qbdi")]
 pub use qbdi::preload_qbdi_helper;
@@ -99,6 +98,10 @@ pub(crate) unsafe fn remove_single_hook(addr: u64, data: &registry::HookData) {
 
 /// 释放单个 hook 的 JS callback 引用（on_enter/replace + attach 的 on_leave）。
 pub(crate) unsafe fn free_hook_callback(data: &registry::HookData) {
+    if data.native_attach_data != 0 {
+        callback::free_native_attach_callbacks(data.native_attach_data);
+        return;
+    }
     let ctx = data.ctx as *mut ffi::JSContext;
     if data.has_on_enter {
         let callback: ffi::JSValue = std::ptr::read(data.callback_bytes.as_ptr() as *const ffi::JSValue);

@@ -35,8 +35,9 @@ typedef struct {
     uint64_t nzcv;          /* Condition flags: 264 */
     void* trampoline;       /* Trampoline for callOriginal (NULL if N/A): 272 */
     uint64_t d[8];          /* d0-d7 FP registers: 280-343 */
-    uint64_t intercept_leave; /* 344: attach 模式下 on_enter 返回前可改写. 1=wrap (现有语义),
-                               * 0=tail-jump 原函数不回 thunk (miss 快路径, 无栈帧残留). */
+    uint64_t intercept_leave; /* 344: attach 模式下 on_enter 返回前可改写.
+                               * 仅当 hook 安装了 on_leave 时有效: 1=wrap, 0=tail-jump.
+                               * 无 on_leave 时 hook engine 必然 tail-jump, 写 1 无效. */
 } HookContext;              /* 352 bytes, 16-byte aligned */
 
 /* Callback function types */

@@ -11,6 +11,7 @@ use crate::jsapi::callback_util::{
     set_js_u64_property_atom,
 };
 use std::cell::RefCell;
+use std::ffi::c_void;
 use std::sync::{Condvar, Mutex};
 
 use super::registry::HOOK_REGISTRY;
@@ -117,6 +118,49 @@ pub(super) fn in_flight_native_hook_callbacks() -> usize {
         .unwrap_or_else(|e| e.into_inner())
 }
 
+pub(crate) type NativeAttachCallback = unsafe extern "C" fn(*mut hook_ffi::HookContext, *mut c_void);
+
+pub(crate) struct NativeAttachCallbacks {
+    pub(crate) on_enter: Option<NativeAttachCallback>,
+    pub(crate) on_leave: Option<NativeAttachCallback>,
+    pub(crate) user_data: *mut c_void,
+}
+
+pub(crate) unsafe extern "C" fn native_attach_on_enter_wrapper(
+    ctx_ptr: *mut hook_ffi::HookContext,
+    user_data: *mut c_void,
+) {
+    if user_data.is_null() {
+        return;
+    }
+    let callbacks = &*(user_data as *const NativeAttachCallbacks);
+    if let Some(on_enter) = callbacks.on_enter {
+        on_enter(ctx_ptr, callbacks.user_data);
+    }
+    if callbacks.on_leave.is_none() && !ctx_ptr.is_null() {
+        (*ctx_ptr).intercept_leave = 0;
+    }
+}
+
+pub(crate) unsafe extern "C" fn native_attach_on_leave_wrapper(
+    ctx_ptr: *mut hook_ffi::HookContext,
+    user_data: *mut c_void,
+) {
+    if user_data.is_null() {
+        return;
+    }
+    let callbacks = &*(user_data as *const NativeAttachCallbacks);
+    if let Some(on_leave) = callbacks.on_leave {
+        on_leave(ctx_ptr, callbacks.user_data);
+    }
+}
+
+pub(crate) unsafe fn free_native_attach_callbacks(ptr: usize) {
+    if ptr != 0 {
+        drop(Box::from_raw(ptr as *mut NativeAttachCallbacks));
+    }
+}
+
 /// Hook callback that calls the JS function (replace mode)
 pub(crate) unsafe extern "C" fn hook_callback_wrapper(
     ctx_ptr: *mut hook_ffi::HookContext,
@@ -210,10 +254,11 @@ pub(crate) unsafe extern "C" fn hook_callback_wrapper(
     }
 }
 
-/// JS CFunction: ctx.orig(...args?)
+/// JS CFunction: ctx.orig()
 ///
 /// 无参数: 先同步 JS ctx 对象上被修改的寄存器到 C HookContext，再调用 trampoline。
-/// 有参数: 用传入的参数覆盖 x0-xN（最多 6 个），其余寄存器同步自 JS ctx。
+/// 兼容旧脚本的有参数形式: 用传入的参数覆盖 x0-xN，其余寄存器同步自 JS ctx。
+/// 新脚本优先写 this.xN 后无参数调用 orig()；固定继续原函数应使用 attach。
 ///
 /// 返回原函数的返回值 (BigUint64 或 Number)，同时写入 ctx.x[0]。
 unsafe extern "C" fn js_native_call_original(

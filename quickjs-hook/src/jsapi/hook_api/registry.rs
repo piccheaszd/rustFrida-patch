@@ -80,6 +80,7 @@ pub(crate) struct HookData {
     pub(crate) kind: HookKind,           // Replace or Attach
     pub(crate) mode: StealthMode,        // hook 模式（unhook 时需要）
     pub(crate) recomp_addr: u64,         // Recomp 模式下的重编译地址
+    pub(crate) native_attach_data: usize, // attachNative callback storage (Box<NativeAttachCallbacks>)
 }
 
 // SAFETY: HookData only contains Copy types now (usize, [u8; 16])
