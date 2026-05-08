@@ -49,6 +49,7 @@ pub use jsapi::java::art_controller::{
     free_art_controller_state, set_art_controller_reload_paused,
 };
 pub use jsapi::java::cleanup_java_hooks;
+pub use jsapi::java::detach_current_jni_thread;
 pub use jsapi::java::{cut_java_hooks, drain_thunk_in_flight, free_java_hooks};
 pub use jsapi::memory::cleanup_wxshadow_patches;
 pub use runtime::JSRuntime;

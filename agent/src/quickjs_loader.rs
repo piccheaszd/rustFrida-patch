@@ -10,10 +10,10 @@ use libc::{munmap, sysconf, MAP_FAILED, _SC_PAGESIZE};
 
 use quickjs_hook::{
     cleanup_engine, cleanup_wxshadow_patches, complete_script, cut_art_controller_routing_hooks,
-    cut_art_controller_walkstack_guards, cut_java_hooks, cut_native_hooks, drain_thunk_in_flight,
-    free_art_controller_state, free_java_hooks, free_native_hooks, get_or_init_engine, init_hook_engine, load_script,
-    load_script_with_filename, set_art_controller_reload_paused, set_console_callback, set_qbdi_helper_blob,
-    set_qbdi_output_dir,
+    cut_art_controller_walkstack_guards, cut_java_hooks, cut_native_hooks, detach_current_jni_thread,
+    drain_thunk_in_flight, free_art_controller_state, free_java_hooks, free_native_hooks, get_or_init_engine,
+    init_hook_engine, load_script, load_script_with_filename, set_art_controller_reload_paused, set_console_callback,
+    set_qbdi_helper_blob, set_qbdi_output_dir,
 };
 #[cfg(feature = "qbdi")]
 use quickjs_hook::{preload_qbdi_helper, shutdown_qbdi_helper};
@@ -315,6 +315,8 @@ pub fn cleanup() {
             "[quickjs] safepoint timeout: keep walkstack guards and executable memory mapped; destructive cleanup skipped\n"
                 .to_string(),
         );
+        detach_current_jni_thread();
+        stage("cleanup detach_jni_thread", &mut t);
         return;
     }
 
@@ -333,6 +335,8 @@ pub fn cleanup() {
         log_msg(
             "[quickjs] post-guard safepoint timeout: keep executable memory mapped; final munmap skipped\n".to_string(),
         );
+        detach_current_jni_thread();
+        stage("cleanup detach_jni_thread", &mut t);
         return;
     }
     free_art_controller_state();
@@ -346,6 +350,8 @@ pub fn cleanup() {
         shutdown_qbdi_helper();
         stage("phase4 shutdown_qbdi_helper", &mut t);
     }
+    detach_current_jni_thread();
+    stage("phase4 detach_jni_thread", &mut t);
     cleanup_engine();
     stage("phase4 cleanup_engine", &mut t);
     cleanup_wxshadow_patches();
@@ -424,6 +430,8 @@ pub fn cleanup_soft() -> Result<(), String> {
              拒绝降级 (会让醒来的线程 UAF JS callback). total {}ms\n",
             t0.elapsed().as_millis()
         ));
+        detach_current_jni_thread();
+        stage("soft cleanup detach_jni_thread", &mut t);
         return Err("drain timeout，软清理已放弃".to_string());
     }
 
@@ -434,6 +442,8 @@ pub fn cleanup_soft() -> Result<(), String> {
     stage("phase3 free_native_hooks", &mut t);
     set_art_controller_reload_paused(false);
     stage("phase3 resume_art_controller_reload", &mut t);
+    detach_current_jni_thread();
+    stage("phase3 detach_jni_thread", &mut t);
     ENGINE_INITIALIZED.store(false, Ordering::SeqCst);
     cleanup_engine();
     stage("phase3 cleanup_engine", &mut t);

@@ -168,6 +168,31 @@ pub(crate) unsafe fn module_dlopen_load(
     std::ptr::null_mut()
 }
 
+/// Load a shared object as if the call came from libart's linker namespace.
+/// ART plugins such as libopenjdkjvmti.so live in the ART APEX namespace and
+/// may reject the generic linker trusted-caller used for ordinary app modules.
+pub(crate) unsafe fn module_dlopen_load_from_libart_namespace(
+    path: &str,
+    flags: i32,
+) -> *mut std::ffi::c_void {
+    let c_path = match CString::new(path) {
+        Ok(c) => c,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let api = UNRESTRICTED_LINKER_API.get_or_init(|| init_unrestricted_linker_api());
+    if let Some(api) = api {
+        let &(libart_base, _) = LIBART_RANGE.get_or_init(probe_libart_range);
+        if libart_base != 0 {
+            return (api.dlopen)(
+                c_path.as_ptr() as *const i8,
+                flags,
+                libart_base as *const std::ffi::c_void,
+            );
+        }
+    }
+    std::ptr::null_mut()
+}
+
 /// Load a shared object from an existing memfd using the linker's trusted-caller API.
 pub(crate) unsafe fn memfd_dlopen(name: &str, fd: i32) -> *mut std::ffi::c_void {
     let c_name = match CString::new(name) {

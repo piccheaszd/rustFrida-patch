@@ -3,12 +3,11 @@
 //! Native backend: `Java._enumerateInstances(className, includeSubtypes?) → Array<{__jptr, __jclass}>`
 //! JS 侧 (`java_boot.js`) 把返回的裸 wrapper 列表喂进 onMatch / onComplete 回调。
 //!
-//! 两条后端，按设备能力自动选择：
+//! 后端按可靠性排序：
 //!   (A) `dalvik.system.VMDebug.getInstancesOfClasses` —— Android ≤13 有效。
 //!       在 API 34+ 被从 Java 层删除，API 36 同样不可用。
-//!   (B) 直接扫描 ART 堆 `[anon:dalvik-*]` VMA ——  对标 Frida 的 VisitObjects 但走本地
-//!       实现，不依赖已被 strip 的 `art::gc::Heap::VisitObjects/GetInstances`。见
-//!       `heap_scan.rs`。
+//!   (B) ART JVMTI —— Android 8+ 官方 live-object 枚举能力；API 34+ 的可靠主路径。
+//! 实验性 heap-scan 不再作为自动兜底：实测存在 false-positive jobject，会导致目标进程崩溃。
 //!
 //! JNI 初始化阶段的 `bypass_hidden_api_restrictions` 会放行 reflect 级 hidden-API。
 
@@ -18,8 +17,8 @@ use crate::jsapi::console::output_verbose;
 use crate::value::JSValue;
 use std::ffi::CString;
 
-use super::heap_scan::heap_scan_enumerate_instances;
 use super::jni_core::*;
+use super::jvmti::jvmti_enumerate_instances;
 use super::reflect::find_class_safe;
 
 /// JS CFunction: `Java._enumerateInstances(className, includeSubtypes?, maxCount?) → Array<{__jptr,__jclass}>`
@@ -76,18 +75,20 @@ pub(super) unsafe extern "C" fn js_java_enumerate_instances(
     match vmdebug_enumerate(ctx, env, &class_name, include_subtypes, max_count) {
         Ok(arr) => arr,
         Err(vmdebug_err) => {
-            // 2) VMDebug 不可用 —— 降到 heap-scan 路径（Android 14+/API 36 适用）
             output_verbose(&format!("[java.choose] VMDebug 后端失败: {}", vmdebug_err));
-            output_verbose("[java.choose] 降级到 heap-scan 后端");
-            match heap_scan_enumerate_js(ctx, env, &class_name, include_subtypes, max_count) {
+            output_verbose("[java.choose] 尝试 JVMTI 后端");
+            match jvmti_enumerate_js(ctx, env, &class_name, max_count) {
                 Ok(arr) => arr,
-                Err(scan_err) => throw_internal_error(
-                    ctx,
-                    format!(
-                        "Java.choose: both backends failed.\n  VMDebug: {}\n  heap-scan: {}",
-                        vmdebug_err, scan_err
-                    ),
-                ),
+                Err(jvmti_err) => {
+                    output_verbose(&format!("[java.choose] JVMTI 后端失败: {}", jvmti_err));
+                    throw_internal_error(
+                        ctx,
+                        format!(
+                            "Java.choose: reliable backends failed.\n  VMDebug: {}\n  JVMTI: {}\n  heap-scan: disabled as automatic fallback",
+                            vmdebug_err, jvmti_err
+                        ),
+                    )
+                }
             }
         }
     }
@@ -308,52 +309,38 @@ unsafe fn vmdebug_enumerate(
 }
 
 // ============================================================================
-// 后端 B：直接扫描 ART 堆（Android 14+/API 36）
+// 后端 B：ART JVMTI live-object 枚举（Android 8+，Frida-style）
 // ============================================================================
 
-unsafe fn heap_scan_enumerate_js(
+unsafe fn jvmti_enumerate_js(
     ctx: *mut ffi::JSContext,
     env: JniEnv,
     class_name: &str,
-    include_subtypes: bool,
     max_count: usize,
 ) -> Result<ffi::JSValue, String> {
     jni_check_exc(env);
 
-    // 目标 class —— 必须用 global ref（find_class_safe 的 cache 即为 global）
     let target_cls = find_class_safe(env, class_name);
     if target_cls.is_null() {
         return Err(format!("class not found: {}", class_name));
     }
 
-    // 把 local ref 升成真 global ref：heap_scan 的 DecodeGlobalJObject 会检查 IndirectRef tag
-    let new_global_ref: NewGlobalRefFn = jni_fn!(env, NewGlobalRefFn, JNI_NEW_GLOBAL_REF);
+    let hits_result = jvmti_enumerate_instances(env, target_cls, max_count);
     let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
-    let delete_global_ref: DeleteGlobalRefFn = jni_fn!(env, DeleteGlobalRefFn, JNI_DELETE_GLOBAL_REF);
-
-    let class_global = new_global_ref(env, target_cls);
     delete_local_ref(env, target_cls);
-    if class_global.is_null() {
-        return Err("NewGlobalRef(target_cls) failed".to_string());
-    }
-
-    let hits_result = heap_scan_enumerate_instances(env, class_global, include_subtypes, max_count);
-    delete_global_ref(env, class_global);
 
     let hits = hits_result?;
-    output_verbose(&format!(
-        "[java.choose] heap-scan hits={} for {} (subtypes={})",
-        hits.len(),
-        class_name,
-        include_subtypes
-    ));
+    output_verbose(&format!("[java.choose] JVMTI hits={} for {}", hits.len(), class_name));
+    jobjects_to_js_array(ctx, &hits, class_name)
+}
 
-    // subtypes 模式下，命中的对象实际类可能是 needle 的某个子类。__jclass 字段需要回填
-    // 真实类名而非 needle 名，否则 JS 侧 wrapper 会以为它是 needle 类型，调用子类特有方法时
-    // 走错 method id。简化处理：subtypes 模式下用 needle 名（用户在 onMatch 里可以
-    // `obj.getClass().getName()` 拿真实类）。Frida 行为也是用 needle wrapper。
+unsafe fn jobjects_to_js_array(
+    ctx: *mut ffi::JSContext,
+    handles: &[*mut std::ffi::c_void],
+    class_name: &str,
+) -> Result<ffi::JSValue, String> {
     let arr = ffi::JS_NewArray(ctx);
-    for (idx, jobj) in hits.iter().enumerate() {
+    for (idx, jobj) in handles.iter().enumerate() {
         if jobj.is_null() {
             continue;
         }

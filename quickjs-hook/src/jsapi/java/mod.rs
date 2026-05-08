@@ -34,6 +34,7 @@ pub mod art_controller;
 mod art_method;
 mod art_thread;
 pub(crate) mod callback;
+#[allow(dead_code)]
 mod heap_scan;
 mod java_array_api;
 mod java_choose_api;
@@ -43,6 +44,7 @@ pub(crate) mod java_hook_api;
 mod java_inspect_api;
 mod java_method_list_api;
 pub(crate) mod jni_core;
+mod jvmti;
 pub(crate) mod reflect;
 
 mod safe_mem;
@@ -50,6 +52,10 @@ mod safe_mem;
 pub(crate) use art_class::run_pending_checkpoints as run_pending_art_checkpoints;
 pub(crate) use jni_core::ensure_jni_initialized;
 pub(crate) use reflect::get_class_name_unchecked;
+
+pub fn detach_current_jni_thread() {
+    jni_core::detach_current_thread_if_owned();
+}
 
 pub(crate) unsafe fn decode_jobject_raw(env: jni_core::JniEnv, obj: *mut std::ffi::c_void) -> Option<u64> {
     art_class::decode_jobject(env, obj)

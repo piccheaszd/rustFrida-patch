@@ -5,6 +5,7 @@
 
 use crate::jsapi::console::output_verbose;
 use crate::jsapi::module::probe_module_range;
+use std::cell::RefCell;
 use std::ffi::CString;
 use std::os::raw::c_char;
 use std::sync::Mutex;
@@ -853,6 +854,26 @@ unsafe impl Sync for JniState {}
 
 pub(super) static JNI_STATE: Mutex<Option<JniState>> = Mutex::new(None);
 
+struct AttachedThreadGuard {
+    vm: *mut std::ffi::c_void,
+    env: JniEnv,
+}
+
+impl Drop for AttachedThreadGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = super::art_class::transition_current_thread_to_native_for_blocking(self.env);
+            if let Err(err) = detach_current_thread(self.vm) {
+                output_verbose(&format!("[jni] DetachCurrentThread failed: {}", err));
+            }
+        }
+    }
+}
+
+thread_local! {
+    static OWNED_THREAD_ATTACHMENT: RefCell<Option<AttachedThreadGuard>> = const { RefCell::new(None) };
+}
+
 pub(crate) struct ScopedJniEnv {
     vm: *mut std::ffi::c_void,
     env: JniEnv,
@@ -901,10 +922,34 @@ pub(super) unsafe fn get_runtime_addr() -> Option<u64> {
 /// AttachCurrentThread is idempotent (cheap if already attached).
 pub(crate) fn ensure_jni_initialized() -> Result<JniEnv, String> {
     let vm = get_or_init_vm()?;
-    unsafe { attach_current_thread(vm) }
+    if let Some(env) = OWNED_THREAD_ATTACHMENT.with(|slot| {
+        let guard = slot.borrow();
+        guard.as_ref().and_then(|owned| (owned.vm == vm).then_some(owned.env))
+    }) {
+        return Ok(env);
+    }
+
+    unsafe {
+        if let Some(env) = get_current_thread_env(vm)? {
+            return Ok(env);
+        }
+
+        let env = attach_current_thread(vm)?;
+        OWNED_THREAD_ATTACHMENT.with(|slot| {
+            *slot.borrow_mut() = Some(AttachedThreadGuard { vm, env });
+        });
+        Ok(env)
+    }
 }
 
-fn get_or_init_vm() -> Result<*mut std::ffi::c_void, String> {
+pub(crate) fn detach_current_thread_if_owned() {
+    OWNED_THREAD_ATTACHMENT.with(|slot| {
+        let guard = slot.borrow_mut().take();
+        drop(guard);
+    });
+}
+
+pub(super) fn get_or_init_vm() -> Result<*mut std::ffi::c_void, String> {
     {
         let guard = JNI_STATE.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ref state) = *guard {
