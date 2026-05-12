@@ -266,9 +266,7 @@ impl DslSemanticContext {
             DslValue::Int(_)
             | DslValue::ArrayLength(_)
             | DslValue::DirectBufferCapacity { .. }
-            | DslValue::DirectBufferGetU8 { .. } => {
-                Ok(Some("I".to_string()))
-            }
+            | DslValue::DirectBufferGetU8 { .. } => Ok(Some("I".to_string())),
             DslValue::IntBinOp { op, left, right } => {
                 if *op == DslIntBinOp::Add {
                     let left_desc = self.infer_value_descriptor(left)?;
@@ -528,12 +526,7 @@ impl DslSemanticContext {
                 let Some(buffer_desc) = self.infer_value_descriptor(buffer)? else {
                     return Err("dbbCapacity() buffer cannot be null/void".to_string());
                 };
-                if !value_assignable_to_descriptor_strict(
-                    self.env,
-                    buffer,
-                    &buffer_desc,
-                    "Ljava/nio/ByteBuffer;",
-                ) {
+                if !value_assignable_to_descriptor_strict(self.env, buffer, &buffer_desc, "Ljava/nio/ByteBuffer;") {
                     return Err(format!(
                         "dbbCapacity() buffer must be java.nio.ByteBuffer, got {}",
                         buffer_desc
@@ -1200,10 +1193,7 @@ impl DslSemanticContext {
                     return Err("dbbCopyFromByteArray() src cannot be null/void".to_string());
                 };
                 if src_desc != "[B" {
-                    return Err(format!(
-                        "dbbCopyFromByteArray() src must be byte[], got {}",
-                        src_desc
-                    ));
+                    return Err(format!("dbbCopyFromByteArray() src must be byte[], got {}", src_desc));
                 }
                 self.validate_int_arg(src_offset, "dbbCopyFromByteArray() srcOffset")?;
                 self.validate_int_arg(length, "dbbCopyFromByteArray() length")?;

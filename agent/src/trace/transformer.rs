@@ -7,7 +7,8 @@ use crate::communication::write_stream;
 use crate::exec_mem::ExecMem;
 use crate::gumlibc::gum_libc_ptrace;
 use libc::{
-    c_int, mmap, pid_t, CLONE_SETTLS, CLONE_VM, MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, PROT_WRITE, PTRACE_DETACH,
+    c_int, mmap, pid_t, CLONE_SETTLS, CLONE_VM, MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, PROT_WRITE, PR_SET_NAME,
+    PTRACE_DETACH,
 };
 use once_cell::unsync::Lazy;
 use std::ptr::null_mut;
@@ -126,6 +127,7 @@ pub fn gum_modify_thread(thread_id: usize) -> Result<pid_t> {
 
 extern "C" fn tracer(thread_id: i32) -> c_int {
     unsafe {
+        let _ = libc::prctl(PR_SET_NAME, b"wwb-tracer\0".as_ptr(), 0, 0, 0);
         match attach_to_thread(thread_id) {
             Ok(_) => {
                 write_stream(b"attach success!! ");

@@ -155,30 +155,33 @@ fn handle_socket_connection(stream: UnixStream, session: Arc<Session>) {
                         }
                     };
                     let session2 = session.clone();
-                    thread::spawn(move || {
-                        let mut stream_clone = stream_clone;
-                        let (sd, rx) = channel();
-                        match session2.sender.set(sd) {
-                            Ok(_) => {}
-                            Err(_) => {
-                                log_error!("[#{}] sender already set!", session2.id);
-                                return;
+                    thread::Builder::new()
+                        .name("wwb-socktx".into())
+                        .spawn(move || {
+                            let mut stream_clone = stream_clone;
+                            let (sd, rx) = channel();
+                            match session2.sender.set(sd) {
+                                Ok(_) => {}
+                                Err(_) => {
+                                    log_error!("[#{}] sender already set!", session2.id);
+                                    return;
+                                }
                             }
-                        }
-                        session2.connected.store(true, Ordering::Release);
-                        while let Ok(msg) = rx.recv() {
-                            let (kind, payload) = match msg {
-                                HostToAgentMessage::Command(cmd) => (FRAME_KIND_CMD, cmd.into_bytes()),
-                                #[cfg(feature = "qbdi")]
-                                HostToAgentMessage::QbdiHelper(blob) => (FRAME_KIND_QBDI_HELPER, blob),
-                            };
-                            if let Err(e) = write_frame(&mut stream_clone, kind, &payload) {
-                                log_error!("[#{}] stream 写入失败: {}", session2.id, e);
-                                session2.disconnected.store(true, Ordering::Release);
-                                break;
+                            session2.connected.store(true, Ordering::Release);
+                            while let Ok(msg) = rx.recv() {
+                                let (kind, payload) = match msg {
+                                    HostToAgentMessage::Command(cmd) => (FRAME_KIND_CMD, cmd.into_bytes()),
+                                    #[cfg(feature = "qbdi")]
+                                    HostToAgentMessage::QbdiHelper(blob) => (FRAME_KIND_QBDI_HELPER, blob),
+                                };
+                                if let Err(e) = write_frame(&mut stream_clone, kind, &payload) {
+                                    log_error!("[#{}] stream 写入失败: {}", session2.id, e);
+                                    session2.disconnected.store(true, Ordering::Release);
+                                    break;
+                                }
                             }
-                        }
-                    });
+                        })
+                        .expect("spawn wwb-socktx thread");
                 }
                 FRAME_KIND_COMPLETE => {
                     let text = String::from_utf8(payload).unwrap_or_default();
@@ -262,7 +265,10 @@ fn handle_socket_connection(stream: UnixStream, session: Arc<Session>) {
 /// 包装 socketpair 的 host_fd 为 UnixStream，启动处理线程
 pub(crate) fn start_socketpair_handler(host_fd: RawFd, session: Arc<Session>) -> JoinHandle<()> {
     let stream = unsafe { UnixStream::from_raw_fd(host_fd) };
-    thread::spawn(move || {
-        handle_socket_connection(stream, session);
-    })
+    thread::Builder::new()
+        .name("wwb-sockrx".into())
+        .spawn(move || {
+            handle_socket_connection(stream, session);
+        })
+        .expect("spawn wwb-sockrx thread")
 }

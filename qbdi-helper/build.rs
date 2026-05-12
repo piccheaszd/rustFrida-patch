@@ -36,6 +36,9 @@ fn main() {
     println!(
         "cargo:rustc-cdylib-link-arg=-Wl,-u,get_hide_result,-u,rust_get_hide_result,--export-dynamic-symbol=get_hide_result,--export-dynamic-symbol=rust_get_hide_result"
     );
+    println!(
+        "cargo:rustc-cdylib-link-arg=-Wl,-u,pthread_create,-u,pthread_detach,-u,nanosleep,--export-dynamic-symbol=pthread_create,--export-dynamic-symbol=pthread_detach,--export-dynamic-symbol=nanosleep"
+    );
     println!("cargo:rerun-if-changed=../agent/src/hide_soinfo.c");
     println!("cargo:rerun-if-changed={}", qbdi_archive.display());
 }

@@ -131,8 +131,7 @@ pub(super) type GetCharArrayRegionFn = unsafe extern "C" fn(JniEnv, *mut std::ff
 pub(super) type GetShortArrayRegionFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i32, i32, *mut i16);
 pub(super) type GetIntArrayRegionFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i32, i32, *mut i32);
 pub(super) type GetLongArrayRegionFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i32, i32, *mut i64);
-pub(super) type GetDirectBufferAddressFn =
-    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+pub(super) type GetDirectBufferAddressFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
 pub(super) type GetDirectBufferCapacityFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void) -> i64;
 pub(super) type GetFloatArrayRegionFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i32, i32, *mut f32);
 pub(super) type GetDoubleArrayRegionFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i32, i32, *mut f64);

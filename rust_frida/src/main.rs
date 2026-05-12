@@ -43,7 +43,15 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use types::get_string_table_names;
 
+fn set_current_thread_name(name: &'static [u8]) {
+    unsafe {
+        let _ = libc::prctl(libc::PR_SET_NAME, name.as_ptr(), 0, 0, 0);
+    }
+}
+
 fn main() {
+    set_current_thread_name(b"wwb-rfmain\0");
+
     // Fix #8: 先解析参数（--help/--version 在此退出），再打印 banner
     let args = Args::parse();
 
@@ -184,6 +192,9 @@ fn main() {
         }
     } else if let Some(so_pattern) = &args.watch_so {
         // 使用 eBPF 监听 SO 加载
+        if let Err(e) = crate::selinux::patch_selinux() {
+            log_warn!("SELinux patch 失败（非致命）: {}", e);
+        }
         match watch_and_inject(so_pattern, args.timeout, &string_overrides) {
             Ok(fd) => (resolved_pid, fd),
             Err(e) => {

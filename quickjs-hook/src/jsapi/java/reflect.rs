@@ -1418,7 +1418,7 @@ pub(super) unsafe fn reprobe_classloader() -> bool {
     // Poll: app 初始化需要时间，重试几次
     for attempt in 0..50 {
         if attempt > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            crate::raw_thread::sleep_ms(100);
         }
         if reprobe_classloader_once() {
             crate::jsapi::console::output_verbose(&format!("[Java.ready] reprobe succeeded after {}ms", attempt * 100));

@@ -212,46 +212,49 @@ fn do_spawn(
     verbose: bool,
 ) {
     let sid = session.id;
-    std::thread::spawn(move || {
-        // ensure_zymbiote_loaded 内部有幂等保护，并发安全
-        match spawn::spawn_and_inject(&package, &string_overrides) {
-            Ok((pid, host_fd)) => {
-                session.pid.store(pid, Ordering::Relaxed);
-                let _handle = start_socketpair_handler(host_fd, session.clone());
+    std::thread::Builder::new()
+        .name("wwb-spawn".into())
+        .spawn(move || {
+            // ensure_zymbiote_loaded 内部有幂等保护，并发安全
+            match spawn::spawn_and_inject(&package, &string_overrides) {
+                Ok((pid, host_fd)) => {
+                    session.pid.store(pid, Ordering::Relaxed);
+                    let _handle = start_socketpair_handler(host_fd, session.clone());
 
-                if !session.wait_connected(30) {
-                    log_error!("[#{}] 等待 agent 连接超时", sid);
-                    session.failed.store(true, Ordering::Release);
-                    // 尝试恢复子进程
-                    let _ = spawn::resume_child(pid as u32);
-                    return;
-                }
-
-                // 传递 verbose 标志
-                if verbose {
-                    if let Some(sender) = session.get_sender() {
-                        let _ = send_command(sender, "__set_verbose__");
+                    if !session.wait_connected(30) {
+                        log_error!("[#{}] 等待 agent 连接超时", sid);
+                        session.failed.store(true, Ordering::Release);
+                        // 尝试恢复子进程
+                        let _ = spawn::resume_child(pid as u32);
+                        return;
                     }
-                }
 
-                // 在子进程暂停期间加载脚本
-                if let Some(ref script_path) = script {
-                    load_script_on_session(&session, script_path);
-                }
+                    // 传递 verbose 标志
+                    if verbose {
+                        if let Some(sender) = session.get_sender() {
+                            let _ = send_command(sender, "__set_verbose__");
+                        }
+                    }
 
-                // resume 子进程
-                if let Err(e) = spawn::resume_child(pid as u32) {
-                    log_error!("[#{}] 恢复子进程失败: {}", sid, e);
-                }
+                    // 在子进程暂停期间加载脚本
+                    if let Some(ref script_path) = script {
+                        load_script_on_session(&session, script_path);
+                    }
 
-                log_success!("[#{}] {} 已就绪 (PID: {})", sid, package, pid);
+                    // resume 子进程
+                    if let Err(e) = spawn::resume_child(pid as u32) {
+                        log_error!("[#{}] 恢复子进程失败: {}", sid, e);
+                    }
+
+                    log_success!("[#{}] {} 已就绪 (PID: {})", sid, package, pid);
+                }
+                Err(e) => {
+                    log_error!("[#{}] Spawn {} 失败: {}", sid, package, e);
+                    session.failed.store(true, Ordering::Release);
+                }
             }
-            Err(e) => {
-                log_error!("[#{}] Spawn {} 失败: {}", sid, package, e);
-                session.failed.store(true, Ordering::Release);
-            }
-        }
-    });
+        })
+        .expect("spawn wwb-spawn thread");
 }
 
 fn do_attach(
@@ -263,37 +266,40 @@ fn do_attach(
     verbose: bool,
 ) {
     let sid = session.id;
-    std::thread::spawn(move || {
-        match inject_via_bootstrapper(pid, &string_overrides) {
-            Ok(host_fd) => {
-                session.pid.store(pid, Ordering::Relaxed);
-                let _handle = start_socketpair_handler(host_fd, session.clone());
+    std::thread::Builder::new()
+        .name("wwb-attach".into())
+        .spawn(move || {
+            match inject_via_bootstrapper(pid, &string_overrides) {
+                Ok(host_fd) => {
+                    session.pid.store(pid, Ordering::Relaxed);
+                    let _handle = start_socketpair_handler(host_fd, session.clone());
 
-                if !session.wait_connected(30) {
-                    log_error!("[#{}] 等待 agent 连接超时", sid);
-                    session.failed.store(true, Ordering::Release);
-                    return;
-                }
-
-                if verbose {
-                    if let Some(sender) = session.get_sender() {
-                        let _ = send_command(sender, "__set_verbose__");
+                    if !session.wait_connected(30) {
+                        log_error!("[#{}] 等待 agent 连接超时", sid);
+                        session.failed.store(true, Ordering::Release);
+                        return;
                     }
-                }
 
-                // 非 spawn 模式：先连接再加载脚本
-                if let Some(ref script_path) = script {
-                    load_script_on_session(&session, script_path);
-                }
+                    if verbose {
+                        if let Some(sender) = session.get_sender() {
+                            let _ = send_command(sender, "__set_verbose__");
+                        }
+                    }
 
-                log_success!("[#{}] {} 已就绪 (PID: {})", sid, label, pid);
+                    // 非 spawn 模式：先连接再加载脚本
+                    if let Some(ref script_path) = script {
+                        load_script_on_session(&session, script_path);
+                    }
+
+                    log_success!("[#{}] {} 已就绪 (PID: {})", sid, label, pid);
+                }
+                Err(e) => {
+                    log_error!("[#{}] 注入 {} 失败: {}", sid, label, e);
+                    session.failed.store(true, Ordering::Release);
+                }
             }
-            Err(e) => {
-                log_error!("[#{}] 注入 {} 失败: {}", sid, label, e);
-                session.failed.store(true, Ordering::Release);
-            }
-        }
-    });
+        })
+        .expect("spawn wwb-attach thread");
 }
 
 // ────────────────────────── Session REPL ──────────────────────────

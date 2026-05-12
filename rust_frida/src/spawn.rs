@@ -584,23 +584,29 @@ fn start_listener_thread(socket_name: &str) -> Result<(), String> {
         UnixListener::from_raw_fd(socket_fd)
     };
 
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            match stream {
-                Ok(stream) => {
-                    std::thread::spawn(move || {
-                        if let Err(e) = handle_zymbiote_connection(stream) {
-                            log_verbose!("Zymbiote 连接处理错误: {}", e);
-                        }
-                    });
-                }
-                Err(e) => {
-                    log_verbose!("Zymbiote accept 错误: {}", e);
-                    break;
+    std::thread::Builder::new()
+        .name("wwb-zymacc".into())
+        .spawn(move || {
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(stream) => {
+                        std::thread::Builder::new()
+                            .name("wwb-zymconn".into())
+                            .spawn(move || {
+                                if let Err(e) = handle_zymbiote_connection(stream) {
+                                    log_verbose!("Zymbiote 连接处理错误: {}", e);
+                                }
+                            })
+                            .expect("spawn wwb-zymconn thread");
+                    }
+                    Err(e) => {
+                        log_verbose!("Zymbiote accept 错误: {}", e);
+                        break;
+                    }
                 }
             }
-        }
-    });
+        })
+        .expect("spawn wwb-zymacc thread");
 
     Ok(())
 }

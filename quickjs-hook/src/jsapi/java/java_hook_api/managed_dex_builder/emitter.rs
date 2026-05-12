@@ -10,8 +10,8 @@ use super::{
     descriptor_word_count, java_class_to_descriptor, java_class_to_descriptor_or_primitive, parse_call_params,
     parse_method_signature, resolve_call_proto_with_arg_types, resolve_constructor_proto_with_arg_types,
     resolve_field_with_env, return_is_object, value_kind_from_descriptor, DexIntBinOp, DexIntLit16Op, DexIntLit8Op,
-    DexIrBuilder, FieldRef, GeneratedCounter, GeneratedMessageChannel, GeneratedStringLiteral, IfCmpOp,
-    IrCatchHandler, MethodRef, ValueKind,
+    DexIrBuilder, FieldRef, GeneratedCounter, GeneratedMessageChannel, GeneratedStringLiteral, IfCmpOp, IrCatchHandler,
+    MethodRef, ValueKind,
 };
 use crate::jsapi::java::jni_core::JniEnv;
 
@@ -1683,9 +1683,7 @@ fn infer_value_descriptor(
         DslValue::Int(_)
         | DslValue::ArrayLength(_)
         | DslValue::DirectBufferCapacity { .. }
-        | DslValue::DirectBufferGetU8 { .. } => {
-            Ok(Some("I".to_string()))
-        }
+        | DslValue::DirectBufferGetU8 { .. } => Ok(Some("I".to_string())),
         DslValue::IntBinOp { op, left, right } => {
             if *op == DslIntBinOp::Add && is_string_concat_operands(left, right, layout, dsl_ctx)? {
                 return Ok(Some("Ljava/lang/String;".to_string()));
@@ -3249,32 +3247,38 @@ fn stmt_max_invoke_depth(stmt: &DslStmt) -> u16 {
             offset,
             length,
             value,
-        } => 1 + value_max_invoke_depth(buffer)
-            .max(value_max_invoke_depth(offset))
-            .max(value_max_invoke_depth(length))
-            .max(value_max_invoke_depth(value)),
+        } => {
+            1 + value_max_invoke_depth(buffer)
+                .max(value_max_invoke_depth(offset))
+                .max(value_max_invoke_depth(length))
+                .max(value_max_invoke_depth(value))
+        }
         DslStmt::DirectBufferCopyFromByteArray {
             buffer,
             dst_offset,
             src,
             src_offset,
             length,
-        } => 1 + value_max_invoke_depth(buffer)
-            .max(value_max_invoke_depth(dst_offset))
-            .max(value_max_invoke_depth(src))
-            .max(value_max_invoke_depth(src_offset))
-            .max(value_max_invoke_depth(length)),
+        } => {
+            1 + value_max_invoke_depth(buffer)
+                .max(value_max_invoke_depth(dst_offset))
+                .max(value_max_invoke_depth(src))
+                .max(value_max_invoke_depth(src_offset))
+                .max(value_max_invoke_depth(length))
+        }
         DslStmt::DirectBufferCopyToByteArray {
             buffer,
             src_offset,
             dst,
             dst_offset,
             length,
-        } => 1 + value_max_invoke_depth(buffer)
-            .max(value_max_invoke_depth(src_offset))
-            .max(value_max_invoke_depth(dst))
-            .max(value_max_invoke_depth(dst_offset))
-            .max(value_max_invoke_depth(length)),
+        } => {
+            1 + value_max_invoke_depth(buffer)
+                .max(value_max_invoke_depth(src_offset))
+                .max(value_max_invoke_depth(dst))
+                .max(value_max_invoke_depth(dst_offset))
+                .max(value_max_invoke_depth(length))
+        }
         DslStmt::Break | DslStmt::Continue | DslStmt::Count { .. } => 0,
         DslStmt::ReturnValue { value } => value.as_ref().map(value_max_invoke_depth).unwrap_or(0),
     }
@@ -4204,12 +4208,7 @@ fn stmt_uses_orig(stmt: &DslStmt) -> bool {
             offset,
             length,
             value,
-        } => {
-            value_uses_orig(buffer)
-                || value_uses_orig(offset)
-                || value_uses_orig(length)
-                || value_uses_orig(value)
-        }
+        } => value_uses_orig(buffer) || value_uses_orig(offset) || value_uses_orig(length) || value_uses_orig(value),
         DslStmt::DirectBufferCopyFromByteArray {
             buffer,
             dst_offset,
@@ -5011,15 +5010,7 @@ fn emit_statement(ir: &mut DexIrBuilder, stmt: &DslStmt, emit_ctx: &mut EmitCont
             length,
             value,
         } => {
-            emit_direct_buffer_fill(
-                ir,
-                buffer,
-                offset,
-                length,
-                value,
-                emit_ctx.layout,
-                emit_ctx.dsl_ctx,
-            )?;
+            emit_direct_buffer_fill(ir, buffer, offset, length, value, emit_ctx.layout, emit_ctx.dsl_ctx)?;
             Ok(false)
         }
         DslStmt::DirectBufferCopyFromByteArray {

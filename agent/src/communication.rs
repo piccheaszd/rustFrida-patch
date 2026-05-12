@@ -53,35 +53,33 @@ pub(crate) fn start_log_writer() {
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     let _ = LOG_SENDER.set(tx);
 
-    std::thread::Builder::new()
-        .name("log-writer".into())
-        .spawn(move || {
-            while let Ok(payload) = rx.recv() {
-                if let Some(m) = GLOBAL_STREAM.get() {
-                    // try_lock: 如果控制消息正在写 socket，跳过这条日志避免阻塞。
-                    // 高频 hook (HashMap.put) 丢几条日志无所谓，但持锁阻塞会导致
-                    // 控制消息 (EVAL_OK) 拿不到锁 → host 不读 socket → socket 满 → 死锁。
-                    let mut stream = match m.try_lock() {
-                        Ok(s) => s,
-                        Err(std::sync::TryLockError::WouldBlock) => continue,
-                        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-                    };
-                    // 设置写超时: socket 缓冲区满时不无限阻塞，超时则丢弃并继续
-                    let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(50)));
-                    if write_frame(&mut stream, FRAME_KIND_LOG, &payload).is_err() {
-                        // 写失败(超时/断连): 清除超时设置，继续尝试下一条
-                        let _ = stream.set_write_timeout(None);
-                        // 如果是断连则退出
-                        if stream.peer_addr().is_err() {
-                            break;
-                        }
-                        continue;
-                    }
+    crate::raw_thread::spawn_detached(b"wwb-logwriter\0", move || {
+        while let Ok(payload) = rx.recv() {
+            if let Some(m) = GLOBAL_STREAM.get() {
+                // try_lock: 如果控制消息正在写 socket，跳过这条日志避免阻塞。
+                // 高频 hook (HashMap.put) 丢几条日志无所谓，但持锁阻塞会导致
+                // 控制消息 (EVAL_OK) 拿不到锁 → host 不读 socket → socket 满 → 死锁。
+                let mut stream = match m.try_lock() {
+                    Ok(s) => s,
+                    Err(std::sync::TryLockError::WouldBlock) => continue,
+                    Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+                };
+                // 设置写超时: socket 缓冲区满时不无限阻塞，超时则丢弃并继续
+                let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(50)));
+                if write_frame(&mut stream, FRAME_KIND_LOG, &payload).is_err() {
+                    // 写失败(超时/断连): 清除超时设置，继续尝试下一条
                     let _ = stream.set_write_timeout(None);
+                    // 如果是断连则退出
+                    if stream.peer_addr().is_err() {
+                        break;
+                    }
+                    continue;
                 }
+                let _ = stream.set_write_timeout(None);
             }
-        })
-        .expect("spawn log-writer thread");
+        }
+    })
+    .expect("spawn raw wwb-logwriter thread");
 }
 
 /// 异步写日志：push 到无界 channel，永不阻塞调用线程。

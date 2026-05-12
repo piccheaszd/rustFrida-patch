@@ -1,6 +1,8 @@
 #![cfg(all(target_os = "android", target_arch = "aarch64"))]
 
 mod data;
+mod pthread_shim;
+mod raw_thread;
 mod state;
 mod trace_api;
 mod vm_api;

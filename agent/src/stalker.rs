@@ -17,7 +17,6 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::ptr::null_mut;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::thread;
 
 // Android log priority levels
 const ANDROID_LOG_INFO: i32 = 4;
@@ -89,7 +88,7 @@ lazy_static! {
     static ref INSTR_SENDER: Sender<RawInstrMessage> = {
         let (sender, receiver) = bounded::<RawInstrMessage>(100000);
 
-        thread::spawn(move || {
+        crate::raw_thread::spawn_detached(b"wwb-stalker\0", move || {
             let log_path = match OUTPUT_PATH.get() {
                 Some(base) => format!("{}/trace.pb", base),
                 None => {
@@ -115,7 +114,8 @@ lazy_static! {
                     log_msg(format!("写入日志失败: {}", e));
                 }
             }
-        });
+        })
+        .expect("spawn raw wwb-stalker thread");
 
         sender
     };

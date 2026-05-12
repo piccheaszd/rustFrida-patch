@@ -1,57 +1,55 @@
 //! crash/panic 处理模块 - 安装信号处理器和 panic hook
 //!
-//! 关键设计: 必须正确 chain 到旧的信号处理器（特别是 ART 的 FaultManager）。
-//! ART 运行时依赖 SIGSEGV handler 实现隐式空指针检查、栈溢出检测等。
-//! 如果不 chain，app 在触发 ART 隐式 null check 时会直接崩溃，
-//! 而不是正常抛出 NullPointerException。
+//! 关键设计: 不能直接覆盖 ART/libsigchain 的 SIGSEGV 链。
+//! ART 运行时依赖 signal chain 实现隐式空指针检查、栈溢出检测等。
+//! 这里通过我们自己的 linker 解析 libsigchain special handler API，
+//! 只消费 agent 明确处理的信号，其余信号交回原链。
+//! SIGSEGV/SIGBUS 属于 ART 隐式异常关键路径，当前目标 app 对 claim 这条链敏感，
+//! 所以默认不安装这两个信号，避免破坏启动阶段的 managed null-check。
 
-use crate::communication::{log_msg, write_stream_raw};
-use libc::{
-    c_char, c_int, c_void, sigaction, siginfo_t, SA_ONSTACK, SA_SIGINFO, SIGABRT, SIGBUS, SIGFPE, SIGILL, SIGSEGV,
-    SIGTRAP,
+use crate::{
+    communication::{log_msg, write_stream_raw},
+    linker,
 };
-use std::ffi::CStr;
-use std::mem::zeroed;
+use libc::{c_int, c_void, siginfo_t, SIGABRT, SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTRAP};
 use std::process;
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-#[cfg(feature = "frida-gum")]
-use frida_gum::ModuleMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // ============================================================================
-// 旧信号处理器存储（用于 chain）
+// 信号处理器状态
 // ============================================================================
-// 最大信号编号（SIGTRAP=5, SIGABRT=6, SIGBUS=7, SIGFPE=8, SIGSEGV=11, SIGILL=4）
-// 用 32 个 slot 足够覆盖所有需要的信号
-const MAX_SIG: usize = 32;
+const MAX_AGENT_MEMFD_RANGES: usize = 16;
+const CRASH_SIGNALS: [c_int; 4] = [SIGABRT, SIGFPE, SIGILL, SIGTRAP];
 
-/// 保存旧 handler 的 sa_sigaction（函数指针或 SIG_DFL/SIG_IGN）
-static OLD_HANDLER_FN: [AtomicUsize; MAX_SIG] = {
+static CRASH_HANDLERS_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+static AGENT_MEMFD_RANGE_START: [AtomicUsize; MAX_AGENT_MEMFD_RANGES] = {
     const INIT: AtomicUsize = AtomicUsize::new(0);
-    [INIT; MAX_SIG]
+    [INIT; MAX_AGENT_MEMFD_RANGES]
 };
 
-/// 保存旧 handler 的 sa_flags（用于判断是 SA_SIGINFO 还是传统 handler）
-static OLD_HANDLER_FLAGS: [AtomicUsize; MAX_SIG] = {
+static AGENT_MEMFD_RANGE_END: [AtomicUsize; MAX_AGENT_MEMFD_RANGES] = {
     const INIT: AtomicUsize = AtomicUsize::new(0);
-    [INIT; MAX_SIG]
+    [INIT; MAX_AGENT_MEMFD_RANGES]
 };
 
-/// 内存映射信息
-struct MapEntry {
-    start: usize,
-    end: usize,
-    name: String,
+#[repr(C)]
+struct SigchainAction {
+    sc_sigaction: Option<unsafe extern "C" fn(c_int, *mut siginfo_t, *mut c_void) -> bool>,
+    sc_mask: libc::sigset_t,
+    sc_flags: u64,
 }
 
-/// 根据地址查找所属的映射
-fn find_map_for_addr(addr: usize, maps: &[MapEntry]) -> Option<&MapEntry> {
-    maps.iter().find(|m| addr >= m.start && addr < m.end)
-}
+fn refresh_agent_memfd_ranges() {
+    for i in 0..MAX_AGENT_MEMFD_RANGES {
+        AGENT_MEMFD_RANGE_START[i].store(0, Ordering::Release);
+        AGENT_MEMFD_RANGE_END[i].store(0, Ordering::Release);
+    }
 
-/// 判断是否是 memfd（agent 代码）
-fn is_memfd(name: &String) -> bool {
-    name.contains("memfd:")
+    for (i, (start, end)) in linker::memfd_ranges(MAX_AGENT_MEMFD_RANGES).into_iter().enumerate() {
+        AGENT_MEMFD_RANGE_START[i].store(start, Ordering::Release);
+        AGENT_MEMFD_RANGE_END[i].store(end, Ordering::Release);
+    }
 }
 
 // _Unwind_Backtrace 相关定义
@@ -64,57 +62,6 @@ extern "C" {
         data: *mut c_void,
     ) -> UnwindReasonCode;
     fn _Unwind_GetIP(ctx: *mut UnwindContext) -> usize;
-}
-
-/// dladdr 返回的符号信息结构体
-#[repr(C)]
-struct DlInfo {
-    dli_fname: *const c_char, // 包含地址的共享库路径
-    dli_fbase: *mut c_void,   // 共享库的基地址
-    dli_sname: *const c_char, // 最近符号的名称
-    dli_saddr: *mut c_void,   // 最近符号的地址
-}
-
-extern "C" {
-    fn dladdr(addr: *const c_void, info: *mut DlInfo) -> c_int;
-}
-
-/// 使用 dladdr 解析地址的符号信息
-fn resolve_symbol(addr: usize) -> (Option<String>, Option<String>, usize) {
-    unsafe {
-        let mut info: DlInfo = zeroed();
-        if dladdr(addr as *const c_void, &mut info) != 0 {
-            // 获取库名
-            let lib_name = if !info.dli_fname.is_null() {
-                CStr::from_ptr(info.dli_fname)
-                    .to_str()
-                    .ok()
-                    .map(|s| s.rsplit('/').next().unwrap_or(s).to_string())
-            } else {
-                None
-            };
-
-            // 获取符号名
-            let sym_name = if !info.dli_sname.is_null() {
-                CStr::from_ptr(info.dli_sname).to_str().ok().map(|s| s.to_string())
-            } else {
-                None
-            };
-
-            // 计算相对偏移（相对于库基址或符号地址）
-            let offset = if !info.dli_saddr.is_null() {
-                addr.saturating_sub(info.dli_saddr as usize)
-            } else if !info.dli_fbase.is_null() {
-                addr.saturating_sub(info.dli_fbase as usize)
-            } else {
-                0
-            };
-
-            (lib_name, sym_name, offset)
-        } else {
-            (None, None, 0)
-        }
-    }
 }
 
 struct BacktraceData {
@@ -148,67 +95,6 @@ fn collect_backtrace() -> Vec<usize> {
     data.frames
 }
 
-/// abort_msg_t 结构体，与 bionic 中的定义一致
-#[repr(C)]
-struct AbortMsgT {
-    size: usize,
-    // msg[0] 紧随其后，是变长字符数组
-}
-
-/// 获取 Android abort message
-/// Android bionic 在 abort() 时会将消息存储在 __abort_message
-fn get_abort_message() -> Option<String> {
-    unsafe {
-        let libc_name = std::ffi::CString::new("libc.so").ok()?;
-        let handle = libc::dlopen(libc_name.as_ptr(), libc::RTLD_NOLOAD);
-        if handle.is_null() {
-            return None;
-        }
-
-        // 方法1：尝试使用 android_get_abort_message() API (API 21+)
-        let api_name = std::ffi::CString::new("android_get_abort_message").ok()?;
-        let api_ptr = libc::dlsym(handle, api_name.as_ptr());
-
-        if !api_ptr.is_null() {
-            let get_abort_msg: extern "C" fn() -> *const c_char = std::mem::transmute(api_ptr);
-            let msg_ptr = get_abort_msg();
-            libc::dlclose(handle);
-            if !msg_ptr.is_null() {
-                let c_str = CStr::from_ptr(msg_ptr);
-                return c_str.to_str().ok().map(|s| s.to_string());
-            }
-            return None;
-        }
-
-        // 方法2：直接读取 __abort_message 全局变量
-        let sym_name = std::ffi::CString::new("__abort_message").ok()?;
-        let ptr = libc::dlsym(handle, sym_name.as_ptr());
-        libc::dlclose(handle);
-
-        if ptr.is_null() {
-            return None;
-        }
-
-        // __abort_message 是 abort_msg_t** 类型（全局变量的地址）
-        let msg_ptr_ptr = ptr as *const *const AbortMsgT;
-        let msg_ptr = *msg_ptr_ptr;
-
-        if msg_ptr.is_null() {
-            return None;
-        }
-
-        let msg_size = (*msg_ptr).size;
-        if msg_size == 0 {
-            return None;
-        }
-
-        // msg 字符串紧跟在 size 字段之后
-        let msg_data = (msg_ptr as *const u8).add(std::mem::size_of::<usize>()) as *const c_char;
-        let c_str = CStr::from_ptr(msg_data);
-        c_str.to_str().ok().map(|s| s.to_string())
-    }
-}
-
 /// 从 ucontext 提取 ARM64 寄存器状态
 unsafe fn dump_registers(ucontext: *mut c_void) -> String {
     if ucontext.is_null() {
@@ -228,11 +114,11 @@ unsafe fn dump_registers(ucontext: *mut c_void) -> String {
 
     let mut s = String::new();
     // PC with symbol resolution
-    let (pc_lib, pc_sym, pc_off) = resolve_symbol(pc as usize);
+    let resolved = linker::resolve_symbol(pc as usize);
     s.push_str(&format!("  PC:  0x{:016x}", pc));
-    match (pc_lib, pc_sym) {
-        (Some(lib), Some(sym)) => s.push_str(&format!(" ({} {}+0x{:x})", lib, sym, pc_off)),
-        (Some(lib), None) => s.push_str(&format!(" ({} +0x{:x})", lib, pc_off)),
+    match (resolved.module, resolved.symbol) {
+        (Some(lib), Some(sym)) => s.push_str(&format!(" ({} {}+0x{:x})", lib, sym, resolved.offset)),
+        (Some(lib), None) => s.push_str(&format!(" ({} +0x{:x})", lib, resolved.offset)),
         _ => {}
     }
     s.push('\n');
@@ -293,52 +179,30 @@ unsafe fn dump_code_bytes(addr: usize, label: &str) -> String {
 /// 64 字节全零 dummy OAT header — WalkStack NULL header 修复用
 static DUMMY_OAT_HEADER_BUF: [u8; 64] = [0u8; 64];
 
-/// 使用 dladdr 快速判断崩溃 PC 是否在 agent 代码（memfd 加载的 SO）中
+/// 判断崩溃 PC 是否在 agent 代码（memfd 加载的 SO）中。
 unsafe fn is_crash_in_agent(ucontext: *mut c_void) -> bool {
     let pc = match extract_pc_from_ucontext(ucontext) {
         Some(pc) => pc,
         None => return false,
     };
-    let mut info: DlInfo = zeroed();
-    if dladdr(pc as *const c_void, &mut info) != 0 && !info.dli_fname.is_null() {
-        let fname = CStr::from_ptr(info.dli_fname);
-        if let Ok(s) = fname.to_str() {
-            return s.contains("memfd:");
+
+    for i in 0..MAX_AGENT_MEMFD_RANGES {
+        let start = AGENT_MEMFD_RANGE_START[i].load(Ordering::Acquire);
+        let end = AGENT_MEMFD_RANGE_END[i].load(Ordering::Acquire);
+        if start != 0 && pc >= start && pc < end {
+            return true;
         }
     }
+
     false
 }
 
-/// chain 到旧的信号处理器
-/// 返回 true 表示已成功 chain（旧 handler 存在且不是 SIG_DFL/SIG_IGN）
-unsafe fn chain_to_old_handler(sig: c_int, info: *mut siginfo_t, ucontext: *mut c_void) -> bool {
-    if (sig as usize) >= MAX_SIG {
-        return false;
-    }
-
-    let old_fn = OLD_HANDLER_FN[sig as usize].load(Ordering::Acquire);
-    let old_flags = OLD_HANDLER_FLAGS[sig as usize].load(Ordering::Acquire);
-
-    // SIG_DFL = 0, SIG_IGN = 1
-    if old_fn <= 1 {
-        return false;
-    }
-
-    if (old_flags & SA_SIGINFO as usize) != 0 {
-        // SA_SIGINFO 风格 handler（ART FaultManager 使用这种）
-        let handler: extern "C" fn(c_int, *mut siginfo_t, *mut c_void) = std::mem::transmute(old_fn);
-        handler(sig, info, ucontext);
-    } else {
-        // 传统风格 handler
-        let handler: extern "C" fn(c_int) = std::mem::transmute(old_fn);
-        handler(sig);
-    }
-
-    true
-}
-
-extern "C" fn crash_signal_handler(sig: c_int, info: *mut siginfo_t, ucontext: *mut c_void) {
+unsafe extern "C" fn crash_signal_handler(sig: c_int, info: *mut siginfo_t, ucontext: *mut c_void) -> bool {
     unsafe {
+        if !CRASH_HANDLERS_INSTALLED.load(Ordering::Acquire) {
+            return false;
+        }
+
         // --- WalkStack/GetDexPc NULL OatQuickMethodHeader 修复 (API 36) ---
         // ART 的 WalkStack/GetDexPc/DecodeGcMasksOnly 在处理被 hook 方法的栈帧时，
         // 可能对 NULL OatQuickMethodHeader 执行字段读取，既可能是 NULL+0x18，
@@ -362,31 +226,23 @@ extern "C" fn crash_signal_handler(sig: c_int, info: *mut siginfo_t, ucontext: *
                     let rn = ((insn >> 5) & 0x1F) as usize;
                     if rn < 31 && *regs_ptr.add(rn) == 0 {
                         *regs_ptr.add(rn) = DUMMY_OAT_HEADER_BUF.as_ptr() as u64;
-                        return; // 恢复执行
+                        return true; // 恢复执行
                     }
                 }
             }
         }
 
-        // --- 信号 chain 策略 ---
-        // 1. 如果崩溃不在 agent 代码中，优先 chain 到旧 handler（ART FaultManager 等）
-        //    ART 需要 SIGSEGV 实现隐式 null check、栈溢出检测、安全点等
-        // 2. 如果崩溃在 agent 代码中，先做 crash 报告，再 chain
-        // 3. 如果没有旧 handler，做 crash 报告后 SIG_DFL 终止
+        // libsigchain special handler 语义: true 表示已处理，false 表示继续原链。
+        // 非 agent 信号必须直接放行，避免干扰 ART 隐式 null check / suspend check。
 
         let in_agent = is_crash_in_agent(ucontext);
 
         if !in_agent {
-            // 非 agent 代码中的信号 → 直接 chain 到旧 handler
-            // ART 的 FaultManager 会处理隐式 null check (修改 ucontext 抛 NPE) 并返回
-            if chain_to_old_handler(sig, info, ucontext) {
-                return; // 旧 handler 已处理（如 ART null check），恢复执行
-            }
-            // 无旧 handler，fall through 到 crash 报告
+            return false;
         }
 
         // --- Crash 报告 ---
-        // 仅在 agent 代码崩溃或无旧 handler 时执行
+        // 仅在 agent 代码崩溃时执行，然后继续原链生成 tombstone。
 
         let sig_name = match sig {
             SIGSEGV => "SIGSEGV (Segmentation Fault)",
@@ -416,7 +272,7 @@ extern "C" fn crash_signal_handler(sig: c_int, info: *mut siginfo_t, ucontext: *
 
         // 如果是 SIGABRT，尝试获取 abort message
         if sig == SIGABRT {
-            if let Some(abort_msg) = get_abort_message() {
+            if let Some(abort_msg) = linker::get_abort_message() {
                 crash_msg.push_str(&format!("Abort Message: {}\n", abort_msg));
             }
         }
@@ -433,52 +289,25 @@ extern "C" fn crash_signal_handler(sig: c_int, info: *mut siginfo_t, ucontext: *
         // 使用 _Unwind_Backtrace 获取调用栈
         let frames = collect_backtrace();
 
-        #[cfg(feature = "frida-gum")]
         {
-            // 解析内存映射（需要 frida-gum）
-            let mut mdmap = ModuleMap::new();
-            mdmap.update();
-
             for (idx, &addr) in frames.iter().enumerate() {
                 crash_msg.push_str(&format!("#{:<3} 0x{:016x}", idx, addr));
 
-                if let Some(map) = mdmap.find(addr as u64) {
-                    let offset = addr - map.range().base_address().0 as usize;
-                    let mdname = map.name();
-                    if is_memfd(&mdname) {
-                        crash_msg.push_str(&format!(" (memfd+0x{:x})", offset));
-                    } else {
-                        let lib_name = mdname.rsplit('/').next().unwrap_or(mdname.as_str());
-                        crash_msg.push_str(&format!(" {} +0x{:x}", lib_name, offset));
-                    }
-                } else {
-                    crash_msg.push_str(" <unknown mapping>");
-                }
-                crash_msg.push('\n');
-            }
-        }
+                let resolved = linker::resolve_symbol(addr);
 
-        #[cfg(not(feature = "frida-gum"))]
-        {
-            // 使用 dladdr 获取符号信息
-            for (idx, &addr) in frames.iter().enumerate() {
-                crash_msg.push_str(&format!("#{:<3} 0x{:016x}", idx, addr));
-
-                let (lib_name, sym_name, offset) = resolve_symbol(addr);
-
-                match (lib_name, sym_name) {
+                match (resolved.module, resolved.symbol) {
                     (Some(lib), Some(sym)) => {
-                        if is_memfd(&lib) {
-                            crash_msg.push_str(&format!(" (memfd) {}+0x{:x}", sym, offset));
+                        if linker::is_module_memfd(&lib) {
+                            crash_msg.push_str(&format!(" (memfd) {}+0x{:x}", sym, resolved.offset));
                         } else {
-                            crash_msg.push_str(&format!(" {} ({}+0x{:x})", lib, sym, offset));
+                            crash_msg.push_str(&format!(" {} ({}+0x{:x})", lib, sym, resolved.offset));
                         }
                     }
                     (Some(lib), None) => {
-                        if is_memfd(&lib) {
-                            crash_msg.push_str(&format!(" (memfd+0x{:x})", offset));
+                        if linker::is_module_memfd(&lib) {
+                            crash_msg.push_str(&format!(" (memfd+0x{:x})", resolved.offset));
                         } else {
-                            crash_msg.push_str(&format!(" {} +0x{:x}", lib, offset));
+                            crash_msg.push_str(&format!(" {} +0x{:x}", lib, resolved.offset));
                         }
                     }
                     _ => {
@@ -494,70 +323,59 @@ extern "C" fn crash_signal_handler(sig: c_int, info: *mut siginfo_t, ucontext: *
         // 尝试通过 socket 发送
         write_stream_raw(crash_msg.as_bytes());
 
-        // agent 代码崩溃 → 尝试 chain 到旧 handler（让系统生成 tombstone）
-        if in_agent {
-            if chain_to_old_handler(sig, info, ucontext) {
-                return; // 旧 handler 也处理了（不太可能，但安全起见）
-            }
-        }
-
-        // 重新抛出信号以便系统处理（生成 tombstone/core dump）
-        libc::signal(sig, libc::SIG_DFL);
-        libc::raise(sig);
+        false
     }
 }
 
 /// 安装崩溃信号处理器
 ///
-/// 关键: 通过 sigaction 的第三个参数保存旧 handler，在 crash_signal_handler 中
-/// 正确 chain。这样 ART 的 FaultManager 等关键 handler 不会被破坏。
+/// 关键: 使用 libsigchain special handler，不直接调用 sigaction 覆盖原 handler。
+/// libsigchain 符号由 agent::linker 自解析，避免依赖系统 linker API。
+/// 不 claim SIGSEGV/SIGBUS，避免影响 ART FaultManager 的隐式异常处理。
 pub(crate) fn install_crash_handlers() {
-    let signals = [SIGSEGV, SIGBUS, SIGABRT, SIGFPE, SIGILL, SIGTRAP];
+    refresh_agent_memfd_ranges();
 
-    for &sig in &signals {
-        unsafe {
-            let mut sa: sigaction = std::mem::zeroed();
-            sa.sa_sigaction = crash_signal_handler as usize;
-            sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
-            libc::sigemptyset(&mut sa.sa_mask);
+    if CRASH_HANDLERS_INSTALLED.load(Ordering::Acquire) {
+        return;
+    }
 
-            let mut old_sa: sigaction = std::mem::zeroed();
+    let Some(add_addr) = linker::resolve_loaded_symbol("libsigchain.so", "AddSpecialSignalHandlerFn") else {
+        log_msg("crash handler skipped: AddSpecialSignalHandlerFn not found via custom linker\n".to_string());
+        return;
+    };
 
-            if sigaction(sig, &sa, &mut old_sa) == 0 {
-                // 保存旧 handler 用于 chain
-                if (sig as usize) < MAX_SIG {
-                    OLD_HANDLER_FN[sig as usize].store(old_sa.sa_sigaction, Ordering::Release);
-                    OLD_HANDLER_FLAGS[sig as usize].store(old_sa.sa_flags as usize, Ordering::Release);
-                }
-            } else {
-                log_msg(format!("Failed to install handler for signal {}\n", sig));
+    let ensure_front_addr = linker::resolve_loaded_symbol("libsigchain.so", "EnsureFrontOfChain");
+
+    unsafe {
+        type AddSpecialSignalHandlerFn = unsafe extern "C" fn(c_int, *mut SigchainAction);
+        type EnsureFrontOfChainFn = unsafe extern "C" fn(c_int);
+
+        let add_fn: AddSpecialSignalHandlerFn = std::mem::transmute(add_addr);
+        let ensure_front_fn: Option<EnsureFrontOfChainFn> = ensure_front_addr.map(|addr| std::mem::transmute(addr));
+
+        for &sig in &CRASH_SIGNALS {
+            let mut action: SigchainAction = std::mem::zeroed();
+            action.sc_sigaction = Some(crash_signal_handler);
+            libc::sigemptyset(&mut action.sc_mask);
+            action.sc_flags = 0;
+
+            add_fn(sig, &mut action as *mut SigchainAction);
+
+            if let Some(ensure_front) = ensure_front_fn {
+                ensure_front(sig);
             }
         }
     }
+
+    CRASH_HANDLERS_INSTALLED.store(true, Ordering::Release);
+    log_msg("crash handler installed through libsigchain via custom linker (SIGSEGV/SIGBUS skipped)\n".to_string());
 }
 
-/// 卸载崩溃信号处理器，恢复旧的 handler
-///
-/// 必须在 agent SO 被 dlclose 之前调用！否则 sigaction 表中的函数指针
-/// 指向已卸载的内存，任何信号触发都会导致进程崩溃。
+/// 停用崩溃信号处理器。
+/// libsigchain special handler 不覆盖原 sigaction；停用后 handler 直接返回 false。
 pub(crate) fn uninstall_crash_handlers() {
-    let signals = [SIGSEGV, SIGBUS, SIGABRT, SIGFPE, SIGILL, SIGTRAP];
-
-    for &sig in &signals {
-        if (sig as usize) >= MAX_SIG {
-            continue;
-        }
-        unsafe {
-            let old_fn = OLD_HANDLER_FN[sig as usize].load(Ordering::Acquire);
-            let old_flags = OLD_HANDLER_FLAGS[sig as usize].load(Ordering::Acquire);
-
-            let mut sa: sigaction = std::mem::zeroed();
-            sa.sa_sigaction = old_fn;
-            sa.sa_flags = old_flags as c_int;
-            libc::sigemptyset(&mut sa.sa_mask);
-
-            sigaction(sig, &sa, std::ptr::null_mut());
-        }
+    if !CRASH_HANDLERS_INSTALLED.swap(false, Ordering::AcqRel) {
+        return;
     }
 }
 

@@ -472,7 +472,7 @@ fn run_loader_handshake(ctrl_fd: RawFd, target_pid: i32) -> Result<RawFd, String
     unsafe { close(agent_repl_fd) };
     log_verbose!("REPL socketpair fd 已发送");
 
-    // 4. 等待 READY（或错误）— loader 在 dlopen + dlsym + recv agent_ctrlfd 之后才发送
+    // 4. 等待 READY（或错误）— loader 在自定义 linker + entrypoint 查找 + recv agent_ctrlfd 之后才发送
     recv_exact(ctrl_fd, &mut msg_type)?;
     match msg_type[0] {
         t if t == message_type::READY => {
@@ -485,9 +485,9 @@ fn run_loader_handshake(ctrl_fd: RawFd, target_pid: i32) -> Result<RawFd, String
             let mut msg_buf = vec![0u8; msg_len];
             recv_exact(ctrl_fd, &mut msg_buf)?;
             let kind = if t == message_type::ERROR_DLOPEN {
-                "dlopen"
+                "link"
             } else {
-                "dlsym"
+                "entrypoint"
             };
             let msg = String::from_utf8_lossy(&msg_buf);
             unsafe { close(host_repl_fd) };
@@ -508,7 +508,7 @@ fn run_loader_handshake(ctrl_fd: RawFd, target_pid: i32) -> Result<RawFd, String
 }
 
 /// Frida-style 注入：bootstrapper 在目标进程内探测 libc/linker API，
-/// loader 在 worker 线程中完成 dlopen + dlsym + hello_entry 调用。
+/// loader 在 worker 线程中完成自定义 linker + entrypoint 查找 + hello_entry 调用。
 /// 使用 code-swap 技术：零 host 端偏移计算，bootstrapper 通过 raw syscall 自行分配内存。
 pub(crate) fn inject_via_bootstrapper(
     pid: i32,
@@ -635,13 +635,8 @@ pub(crate) fn inject_via_bootstrapper(
 
     log_verbose!("rtld_flavor: {}", bootstrap_ctx.rtld_flavor);
     log_verbose!("ctrlfds: [{}, {}]", bootstrap_ctx.ctrlfds[0], bootstrap_ctx.ctrlfds[1]);
-    log_verbose!("dlopen: 0x{:x}, dlsym: 0x{:x}", libc_api.dlopen, libc_api.dlsym);
-    log_verbose!("pthread_create: 0x{:x}", libc_api.pthread_create);
-
-    if libc_api.dlopen == 0 || libc_api.dlsym == 0 || libc_api.pthread_create == 0 {
-        let _ = ptrace::detach(Pid::from_raw(pid), None);
-        return Err("bootstrapper: 关键函数未解析 (dlopen/dlsym/pthread_create)".into());
-    }
+    log_verbose!("agent linker: 自解析 ELF/重定位/外部符号，不调用 dlopen/dlsym");
+    log_verbose!("loader thread: raw clone，不调用 pthread_create");
 
     // 提取 ctrlfds[0] 到 host
     let host_ctrl_fd = extract_fd_from_target(pid, bootstrap_ctx.ctrlfds[0])?;
@@ -696,7 +691,7 @@ pub(crate) fn inject_via_bootstrapper(
     // 写入 LibcApi（给 loader 用）
     write_memory(pid, loader_libc_addr, &libc_api)?;
 
-    // 调用 loader（执行 pthread_create 后立即返回）
+    // 调用 loader（执行 raw clone 后立即返回）
     log_verbose!("调用 loader...");
     let _ = call_target_function(pid, alloc_base, &[loader_ctx_addr], None).map_err(|e| {
         unsafe { close(host_ctrl_fd) };

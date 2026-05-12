@@ -1520,7 +1520,7 @@ pub fn drain_thunk_in_flight() -> bool {
             return true;
         }
         if callbacks_done {
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            crate::raw_thread::sleep_ms(500);
         }
         rounds += 1;
         if rounds % 10 == 0 {

@@ -16,6 +16,9 @@ mod communication;
 mod crash_handler;
 mod exec_mem;
 mod gumlibc;
+mod linker;
+mod pthread_shim;
+mod raw_thread;
 pub mod recompiler;
 pub mod safepoint;
 mod trace;
@@ -33,7 +36,7 @@ use crate::communication::{
     send_eval_err, send_eval_ok, send_hello, send_rpc_err, send_rpc_ok, shutdown_stream, start_log_writer,
     write_stream, GLOBAL_STREAM,
 };
-use crate::crash_handler::{install_crash_handlers, install_panic_hook};
+use crate::crash_handler::install_panic_hook;
 use libc::{kill, pid_t, SIGSTOP};
 use std::ffi::c_void;
 use std::os::unix::io::FromRawFd;
@@ -41,8 +44,7 @@ use std::os::unix::net::UnixStream;
 use std::process;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::sync::{mpsc, Mutex, OnceLock};
 
 // hide_soinfo.c 中的调试结果函数（.init_array 构造函数填充）
 // 通过 Rust #[no_mangle] 重导出到动态符号表，供 host 端 dlsym 查询
@@ -100,6 +102,8 @@ impl StringTable {
 
 static SHOULD_EXIT: AtomicBool = AtomicBool::new(false);
 pub static OUTPUT_PATH: OnceLock<String> = OnceLock::new();
+type AgentTask = Box<dyn FnOnce() + Send + 'static>;
+static JS_WORKER_TX: Mutex<Option<mpsc::Sender<AgentTask>>> = Mutex::new(None);
 
 /// 注入参数结构体（与 rust_frida/src/types.rs 和 loader.c 完全一致）
 #[repr(C)]
@@ -111,9 +115,9 @@ pub struct AgentArgs {
 
 #[no_mangle]
 pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
-    // 安装Rust panic hook（需要在最前面，捕获Rust层面的panic）
     install_panic_hook();
-    install_crash_handlers();
+    // Keep native crash handlers disabled for this target.
+    // install_crash_handlers();
 
     // 从 AgentArgs 读取 ctrl_fd 和 StringTable 指针
     let (ctrl_fd, table) = unsafe {
@@ -147,7 +151,7 @@ pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
     // 启动异步日志 writer 线程：write_stream() 只 push channel，此线程通过 GLOBAL_STREAM 写 socket
     start_log_writer();
     send_hello();
-    std::thread::sleep(Duration::from_millis(100));
+    raw_thread::sleep_ms(100);
     flush_cached_logs();
 
     let mut reader = sock;
@@ -245,6 +249,35 @@ fn eval_and_respond(script: &str, filename: &str, empty_err: &[u8]) {
     }
 }
 
+#[cfg(feature = "quickjs")]
+fn dispatch_js_task<F>(task: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    let sender = {
+        let mut guard = JS_WORKER_TX.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            let (tx, rx) = mpsc::channel::<AgentTask>();
+            match raw_thread::spawn_pthread_detached(b"wwb-js\0", move || {
+                while let Ok(task) = rx.recv() {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task));
+                }
+            }) {
+                Ok(_) => *guard = Some(tx),
+                Err(e) => {
+                    send_eval_err(&format!("[quickjs] JS worker 启动失败: {}", e));
+                    return;
+                }
+            }
+        }
+        guard.as_ref().expect("JS worker sender missing").clone()
+    };
+
+    if sender.send(Box::new(task)).is_err() {
+        send_eval_err("[quickjs] JS worker 已退出");
+    }
+}
+
 fn process_cmd(command: &str) {
     match command.split_whitespace().next() {
         Some("trace") => {
@@ -253,7 +286,7 @@ fn process_cmd(command: &str) {
                 .nth(1)
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
-            std::thread::spawn(move || {
+            raw_thread::spawn_detached(b"wwb-trace\0", move || {
                 match trace::gum_modify_thread(tid) {
                     Ok(pid) => {
                         write_stream(format!("clone success {}", pid).as_bytes());
@@ -262,8 +295,11 @@ fn process_cmd(command: &str) {
                         write_stream(format!("error: {}", e).as_bytes());
                     }
                 }
-                unsafe { kill(process::id() as pid_t, SIGSTOP) }
-            });
+                unsafe {
+                    kill(process::id() as pid_t, SIGSTOP);
+                }
+            })
+            .expect("spawn raw wwb-trace thread");
         }
         #[cfg(feature = "frida-gum")]
         Some("stalker") => {
@@ -298,34 +334,39 @@ fn process_cmd(command: &str) {
                 .nth(1)
                 .and_then(|s| s.parse::<i64>().ok())
                 .unwrap_or(0);
-            match quickjs_loader::init_hook_runtime()
-                .and_then(|_| quickjs_hook::jsapi::java::set_host_stealth_mode(mode).map(|m| m.to_string()))
-            {
-                Ok(mode) => send_eval_ok(&format!("javastealth={}", mode)),
-                Err(e) => send_eval_err(&format!("javastealth failed: {}", e)),
-            }
+            dispatch_js_task(move || {
+                match quickjs_loader::init_hook_runtime()
+                    .and_then(|_| quickjs_hook::jsapi::java::set_host_stealth_mode(mode).map(|m| m.to_string()))
+                {
+                    Ok(mode) => send_eval_ok(&format!("javastealth={}", mode)),
+                    Err(e) => send_eval_err(&format!("javastealth failed: {}", e)),
+                }
+            });
         }
         #[cfg(feature = "quickjs")]
         Some("artinit") => {
             // 预初始化 artController Layer 1+2 (spawn 模式, 进程暂停时调用)
-            match quickjs_loader::init_hook_runtime().and_then(|_| quickjs_hook::jsapi::java::pre_init_art_controller())
-            {
-                Ok(_) => send_eval_ok("artinit_ok"),
-                Err(e) => send_eval_err(&format!("artinit failed: {}", e)),
-            }
+            dispatch_js_task(|| {
+                match quickjs_loader::init_hook_runtime()
+                    .and_then(|_| quickjs_hook::jsapi::java::pre_init_art_controller())
+                {
+                    Ok(_) => send_eval_ok("artinit_ok"),
+                    Err(e) => send_eval_err(&format!("artinit failed: {}", e)),
+                }
+            });
         }
         #[cfg(feature = "quickjs")]
-        Some("jsinit") => match quickjs_loader::init() {
+        Some("jsinit") => dispatch_js_task(|| match quickjs_loader::init() {
             Ok(_) => send_eval_ok("initialized"),
             Err(e) => send_eval_err(&e),
-        },
+        }),
         // javainit: 延迟 JNI 初始化（spawn 模式 resume 后调用）
         // AttachCurrentThread + cache reflect IDs
         #[cfg(feature = "quickjs")]
-        Some("javainit") => match quickjs_hook::deferred_java_init() {
+        Some("javainit") => dispatch_js_task(|| match quickjs_hook::deferred_java_init() {
             Ok(_) => send_eval_ok("java_initialized"),
             Err(e) => send_eval_err(&e),
-        },
+        }),
         #[cfg(feature = "quickjs")]
         Some("loadjs") => {
             // 支持两种格式:
@@ -340,7 +381,9 @@ fn process_cmd(command: &str) {
                 .or_else(|| command.strip_prefix("loadjs"))
                 .unwrap_or("");
             let (filename, script) = parse_loadjs_payload(rest);
-            eval_and_respond(script, filename, b"[quickjs] Error: empty script");
+            let filename = filename.to_string();
+            let script = script.to_string();
+            dispatch_js_task(move || eval_and_respond(&script, &filename, b"[quickjs] Error: empty script"));
         }
         #[cfg(feature = "quickjs")]
         Some("jseval") => {
@@ -350,7 +393,8 @@ fn process_cmd(command: &str) {
                 .or_else(|| command.strip_prefix("jseval"))
                 .unwrap_or("")
                 .trim();
-            eval_and_respond(expr, "", "[quickjs] 用法: jseval <expression>".as_bytes());
+            let expr = expr.to_string();
+            dispatch_js_task(move || eval_and_respond(&expr, "", "[quickjs] 用法: jseval <expression>".as_bytes()));
         }
         // rpccall <method> <args_json>
         //   method    — 注册在 rpc.exports 上的函数名
@@ -363,39 +407,47 @@ fn process_cmd(command: &str) {
             let rest = command.strip_prefix("rpccall").unwrap_or("").trim_start();
             if rest.is_empty() {
                 send_rpc_err("rpccall: 缺少 method 参数");
-            } else if !quickjs_loader::is_initialized() {
-                send_rpc_err("JS 引擎未初始化，请先执行 jsinit");
             } else {
-                // 第一个空白前为 method，其余为 args_json（可为空）
-                let (method, args_json) = match rest.split_once(char::is_whitespace) {
-                    Some((m, a)) => (m, a.trim()),
-                    None => (rest, ""),
-                };
-                match quickjs_hook::dispatch_rpc(method, args_json) {
-                    Ok(result) => send_rpc_ok(&result),
-                    Err(e) => send_rpc_err(&e),
-                }
+                let rest = rest.to_string();
+                dispatch_js_task(move || {
+                    if !quickjs_loader::is_initialized() {
+                        send_rpc_err("JS 引擎未初始化，请先执行 jsinit");
+                    } else {
+                        // 第一个空白前为 method，其余为 args_json（可为空）
+                        let (method, args_json) = match rest.split_once(char::is_whitespace) {
+                            Some((m, a)) => (m, a.trim()),
+                            None => (rest.as_str(), ""),
+                        };
+                        match quickjs_hook::dispatch_rpc(method, args_json) {
+                            Ok(result) => send_rpc_ok(&result),
+                            Err(e) => send_rpc_err(&e),
+                        }
+                    }
+                });
             }
         }
         #[cfg(feature = "quickjs")]
         Some("jscomplete") => {
             let prefix = command.strip_prefix("jscomplete").unwrap_or("").trim();
-            let result = quickjs_loader::complete(prefix);
-            send_complete(&result);
+            let prefix = prefix.to_string();
+            dispatch_js_task(move || {
+                let result = quickjs_loader::complete(&prefix);
+                send_complete(&result);
+            });
         }
         #[cfg(feature = "quickjs")]
-        Some("jsclean") => {
+        Some("jsclean") => dispatch_js_task(|| {
             if !quickjs_loader::is_initialized() {
                 send_eval_err("[quickjs] JS 引擎未初始化");
             } else {
                 quickjs_loader::cleanup();
                 send_eval_ok("cleaned up");
             }
-        }
+        }),
         // jsclean_soft: %reload 专用。完整 unhook + drain=0 + 销毁 runtime，
         // 但保留 art_controller / pool / recomp / wxshadow（同进程 reload 复用）。
         #[cfg(feature = "quickjs")]
-        Some("jsclean_soft") => {
+        Some("jsclean_soft") => dispatch_js_task(|| {
             if !quickjs_loader::is_initialized() {
                 send_eval_err("[quickjs] JS 引擎未初始化");
             } else {
@@ -404,7 +456,7 @@ fn process_cmd(command: &str) {
                     Err(e) => send_eval_err(&format!("[quickjs] {}", e)),
                 }
             }
-        }
+        }),
         Some("recomp") => {
             let addr_str = command.split_whitespace().nth(1).unwrap_or("");
             let addr_str = addr_str.strip_prefix("0x").unwrap_or(addr_str);
@@ -467,9 +519,6 @@ fn process_cmd(command: &str) {
             if quickjs_loader::is_initialized() {
                 quickjs_loader::cleanup();
             }
-            // 关键: 在 agent SO 被 dlclose 之前恢复旧信号处理器，
-            // 否则 sigaction 表中的 handler 指针指向已卸载的内存，
-            // 进程触发任何信号(如 ART 隐式 null check)即崩溃
             crash_handler::uninstall_crash_handlers();
             log_msg("退出清理完成，准备关闭 socket\n".to_string());
             SHOULD_EXIT.store(true, Ordering::Relaxed);

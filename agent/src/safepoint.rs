@@ -300,7 +300,7 @@ fn wait_until_clean_impl(ranges: &[(u64, u64)], total_timeout_ms: u64, scan_stac
             ));
             last_report = Instant::now();
         }
-        std::thread::sleep(Duration::from_millis(20));
+        crate::raw_thread::sleep_ms(20);
     }
 }
 

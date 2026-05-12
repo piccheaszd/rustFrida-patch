@@ -1,4 +1,5 @@
 use crate::data::TraceBundleMetadata;
+use crate::raw_thread::RawThreadHandle;
 use crossbeam_channel::Sender;
 use lazy_static::lazy_static;
 use qbdi::{VirtualStack, VM};
@@ -6,7 +7,6 @@ use std::collections::HashMap;
 use std::ffi::{c_char, CStr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
-use std::thread::JoinHandle;
 
 pub(crate) const TRACE_BUNDLE_MAGIC: &[u8; 4] = b"TRB1";
 pub(crate) const DYNAMIC_EXEC_CHUNK_SIZE: usize = 1024 * 1024;
@@ -27,7 +27,7 @@ pub(crate) struct TraceWriter {
     pub(crate) session_id: u64,
     pub(crate) shard_senders: Vec<Sender<TraceChunk>>,
     pub(crate) dynamic_senders: Vec<Sender<TraceChunk>>,
-    pub(crate) joins: Vec<JoinHandle<()>>,
+    pub(crate) joins: Vec<RawThreadHandle>,
     pub(crate) base: String,
 }
 
@@ -69,7 +69,7 @@ pub(crate) static TRACE_OUTPUT_DIR: OnceLock<String> = OnceLock::new();
 pub(crate) static LAST_ERROR: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 pub(crate) static TRACE_BUNDLE_METADATA: Mutex<Option<TraceBundleMetadata>> = Mutex::new(None);
 pub(crate) static TRACE_WRITER: Mutex<Option<TraceWriter>> = Mutex::new(None);
-pub(crate) static TRACE_FINALIZERS: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
+pub(crate) static TRACE_FINALIZERS: Mutex<Vec<RawThreadHandle>> = Mutex::new(Vec::new());
 pub(crate) static TRACE_NEXT_SEQ: AtomicU64 = AtomicU64::new(0);
 pub(crate) static TRACE_SESSION_SEQ: AtomicU64 = AtomicU64::new(0);
 pub(crate) static TRACE_EVENT_COUNT: AtomicU64 = AtomicU64::new(0);

@@ -11,7 +11,6 @@ use crossbeam_channel::unbounded;
 use std::fs::{remove_file, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::sync::atomic::Ordering;
-use std::thread;
 
 thread_local! {
     pub(crate) static TRACE_CHUNK_BUFFER: std::cell::RefCell<Vec<u8>> =
@@ -48,7 +47,7 @@ fn spawn_trace_writer(base: &str, session_id: u64) -> Result<TraceWriter, String
             .truncate(true)
             .open(&path)
             .map_err(|err| format!("open {} failed: {}", path, err))?;
-        let join = thread::spawn(move || {
+        let join = crate::raw_thread::spawn(b"wwb-qbdiwr\0", move || {
             let mut writer = BufWriter::new(file);
             let mut encoded = Vec::new();
             while let Ok(chunk) = receiver.recv() {
@@ -87,7 +86,8 @@ fn spawn_trace_writer(base: &str, session_id: u64) -> Result<TraceWriter, String
                 TRACE_QUEUE_BUDGET.release(chunk.payload.len());
             }
             let _ = writer.flush();
-        });
+        })
+        .expect("spawn wwb-qbdiwr thread");
         shard_senders.push(sender);
         joins.push(join);
     }
@@ -101,7 +101,7 @@ fn spawn_trace_writer(base: &str, session_id: u64) -> Result<TraceWriter, String
             .truncate(true)
             .open(&path)
             .map_err(|err| format!("open {} failed: {}", path, err))?;
-        let join = thread::spawn(move || {
+        let join = crate::raw_thread::spawn(b"wwb-qbdidyn\0", move || {
             let mut writer = BufWriter::new(file);
             let mut encoded = Vec::new();
             while let Ok(chunk) = receiver.recv() {
@@ -140,7 +140,8 @@ fn spawn_trace_writer(base: &str, session_id: u64) -> Result<TraceWriter, String
                 TRACE_QUEUE_BUDGET.release(chunk.payload.len());
             }
             let _ = writer.flush();
-        });
+        })
+        .expect("spawn wwb-qbdidyn thread");
         dynamic_senders.push(sender);
         joins.push(join);
     }
@@ -404,7 +405,8 @@ pub(crate) fn finalize_trace_session_async() {
         guard.take()
     };
     if let Some(writer) = writer {
-        let handle = std::thread::spawn(move || finalize_trace_writer(writer));
+        let handle = crate::raw_thread::spawn(b"wwb-qbdifin\0", move || finalize_trace_writer(writer))
+            .expect("spawn wwb-qbdifin thread");
         TRACE_FINALIZERS.lock().unwrap_or_else(|e| e.into_inner()).push(handle);
     }
 }

@@ -12,7 +12,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use tokio::io::unix::AsyncFd;
-use tokio::runtime::Runtime;
+use tokio::runtime::Builder as TokioRuntimeBuilder;
 
 pub use ldmonitor_common::{DlopenEvent, MAX_PATH_LEN};
 
@@ -143,14 +143,20 @@ impl DlopenMonitor {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_clone = stop_flag.clone();
 
-        let handle = thread::spawn(move || {
-            let rt = Runtime::new().expect("Failed to create tokio runtime");
-            rt.block_on(async move {
-                if let Err(e) = run_monitor(target_pid, sender, stop_flag_clone).await {
-                    eprintln!("Monitor error: {}", e);
-                }
-            });
-        });
+        let handle = thread::Builder::new()
+            .name("wwb-ldmon".into())
+            .spawn(move || {
+                let rt = TokioRuntimeBuilder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("Failed to create tokio runtime");
+                rt.block_on(async move {
+                    if let Err(e) = run_monitor(target_pid, sender, stop_flag_clone).await {
+                        eprintln!("Monitor error: {}", e);
+                    }
+                });
+            })
+            .expect("spawn wwb-ldmon thread");
 
         Ok(Self {
             receiver,

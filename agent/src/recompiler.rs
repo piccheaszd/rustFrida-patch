@@ -318,14 +318,7 @@ fn log_recomp_range(prefix: &str, orig_base: usize, page: &RecompiledPage) {
     let tramp_end = code_end.saturating_add(page.tramp_capacity);
     log_msg(format!(
         "[recompiler-range] {} orig=0x{:x} code=0x{:x}-0x{:x} tramp=0x{:x}-0x{:x} used={} total={}",
-        prefix,
-        orig_base,
-        base,
-        code_end,
-        code_end,
-        tramp_end,
-        page.tramp_used,
-        page.recomp_total_size
+        prefix, orig_base, base, code_end, code_end, tramp_end, page.tramp_used, page.recomp_total_size
     ));
 }
 
@@ -913,12 +906,7 @@ pub fn alloc_trampoline_slot(orig_addr: usize) -> Result<usize> {
     );
     log_msg(format!(
         "[recompiler-slot] orig=0x{:x} recomp=0x{:x} slot=0x{:x} size={} used={}/{}",
-        orig_addr,
-        recomp_code_addr,
-        slot_addr,
-        slot_size,
-        page.tramp_used,
-        page.tramp_capacity
+        orig_addr, recomp_code_addr, slot_addr, slot_size, page.tramp_used, page.tramp_capacity
     ));
     // 注意: 此时 recomp 代码页上的原始指令未被修改，slot 已分配但内容是 0。
     // 调用方必须在 hook engine 写好 thunk + fixup trampoline 后调用 commit_slot_patch。

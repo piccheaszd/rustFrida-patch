@@ -9,6 +9,9 @@ fn main() -> anyhow::Result<()> {
     cc::Build::new().file("src/hide_soinfo.c").compile("hide_soinfo");
     println!("cargo:rustc-cdylib-link-arg=-Wl,-u,get_hide_result,--export-dynamic-symbol=get_hide_result");
     println!("cargo:rustc-cdylib-link-arg=-Wl,-u,unhide_from_solist,--export-dynamic-symbol=unhide_from_solist");
+    println!("cargo:rustc-cdylib-link-arg=-Wl,-u,pthread_create,--export-dynamic-symbol=pthread_create");
+    println!("cargo:rustc-cdylib-link-arg=-Wl,-u,pthread_detach,--export-dynamic-symbol=pthread_detach");
+    println!("cargo:rustc-cdylib-link-arg=-Wl,-u,nanosleep,--export-dynamic-symbol=nanosleep");
 
     Ok(())
 }

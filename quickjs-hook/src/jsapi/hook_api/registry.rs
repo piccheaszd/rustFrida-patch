@@ -72,15 +72,15 @@ pub(crate) enum HookKind {
 /// Stored hook callback data - stores raw bytes to avoid Send/Sync issues
 #[derive(Clone, Copy)]
 pub(crate) struct HookData {
-    pub(crate) ctx: usize,               // Store as usize to avoid Send/Sync issues
-    pub(crate) callback_bytes: [u8; 16], // on_enter / replace callback (JSValue 16 字节)
-    pub(crate) on_leave_bytes: [u8; 16], // on_leave (attach 模式) — has_on_leave=false 时全 0
-    pub(crate) has_on_enter: bool,       // attach 模式下 onEnter 可缺省
-    pub(crate) has_on_leave: bool,       // attach 模式下 onLeave 可缺省
-    pub(crate) trampoline: u64,          // Trampoline address for callOriginal (replace mode)
-    pub(crate) kind: HookKind,           // Replace or Attach
-    pub(crate) mode: StealthMode,        // hook 模式（unhook 时需要）
-    pub(crate) recomp_addr: u64,         // Recomp 模式下的重编译地址
+    pub(crate) ctx: usize,                // Store as usize to avoid Send/Sync issues
+    pub(crate) callback_bytes: [u8; 16],  // on_enter / replace callback (JSValue 16 字节)
+    pub(crate) on_leave_bytes: [u8; 16],  // on_leave (attach 模式) — has_on_leave=false 时全 0
+    pub(crate) has_on_enter: bool,        // attach 模式下 onEnter 可缺省
+    pub(crate) has_on_leave: bool,        // attach 模式下 onLeave 可缺省
+    pub(crate) trampoline: u64,           // Trampoline address for callOriginal (replace mode)
+    pub(crate) kind: HookKind,            // Replace or Attach
+    pub(crate) mode: StealthMode,         // hook 模式（unhook 时需要）
+    pub(crate) recomp_addr: u64,          // Recomp 模式下的重编译地址
     pub(crate) native_attach_data: usize, // attachNative callback storage (Box<NativeAttachCallbacks>)
 }
 

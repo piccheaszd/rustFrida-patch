@@ -30,6 +30,7 @@ pub mod context;
 pub mod fast_hook;
 pub mod ffi;
 pub mod jsapi;
+mod raw_thread;
 pub mod recomp;
 pub mod runtime;
 pub mod value;
