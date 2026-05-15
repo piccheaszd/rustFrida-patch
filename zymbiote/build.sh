@@ -28,6 +28,7 @@ $NDK_CC -shared -nostdlib \
     -fno-function-sections \
     -fno-data-sections \
     -fno-asynchronous-unwind-tables \
+    -mbranch-protection=bti \
     -Os \
     -o build/zymbiote.elf \
     zymbiote.c

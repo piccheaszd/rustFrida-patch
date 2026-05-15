@@ -217,7 +217,7 @@ fn do_spawn(
         .name("wwb-spawn".into())
         .spawn(move || {
             // ensure_zymbiote_loaded 内部有幂等保护，并发安全
-            match spawn::spawn_and_inject(&package, &string_overrides) {
+            match spawn::spawn_and_inject(&package, 20, &string_overrides) {
                 Ok((pid, injection)) => {
                     session.pid.store(pid, Ordering::Relaxed);
                     session.set_remote_agent_info(injection.loader_ctx_addr, injection.agent_current_thread_eval_impl);

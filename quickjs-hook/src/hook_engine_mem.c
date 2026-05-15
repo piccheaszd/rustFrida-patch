@@ -304,16 +304,31 @@ static int ldr_literal_is_simd(uint32_t insn) {
  * patch_len: patch 覆盖的字节数 (这些字节内的 LDR 不需要修复)
  */
 void wxshadow_relocate_same_page_ldr_literals(void* patch_addr, int patch_len) {
+    typedef struct {
+        uintptr_t pc;
+        uint8_t literal_data[16];
+        uint32_t insn;
+        int data_size;
+        int is_simd;
+        uint32_t rt;
+    } SamePageLdr;
+
     uintptr_t page_start = (uintptr_t)patch_addr & ~0xFFFUL;
     uintptr_t page_end = page_start + 0x1000;
     uintptr_t patch_start = (uintptr_t)patch_addr;
     uintptr_t patch_end = patch_start + patch_len;
+    SamePageLdr ldrs[1024];
+    int ldr_count = 0;
     int fixed = 0;
     int scanned = 0;
 
     hook_log("[stealth_ldr_reloc] scanning page %#lx for patch at %p len=%d",
              (unsigned long)page_start, patch_addr, patch_len);
 
+    /* Collect first, patch later.  Once wxshadow_patch() protects the page,
+     * plain data reads from this code page may fault heavily or livelock on
+     * some kernels.  Keeping the scan read-only on the original page makes the
+     * installer deterministic. */
     for (uintptr_t pc = page_start; pc < page_end; pc += 4) {
         scanned++;
         /* 跳过被 patch 覆盖的区域 */
@@ -332,8 +347,26 @@ void wxshadow_relocate_same_page_ldr_literals(void* patch_addr, int patch_len) {
         uint32_t rt = insn & 0x1F;
 
         /* 读取原始常量值 */
-        uint8_t literal_data[16];
-        memcpy(literal_data, (void*)target, data_size);
+        SamePageLdr* rec = &ldrs[ldr_count++];
+        rec->pc = pc;
+        rec->insn = insn;
+        rec->data_size = data_size;
+        rec->is_simd = is_simd;
+        rec->rt = rt;
+        memcpy(rec->literal_data, (void*)target, data_size);
+    }
+
+    hook_log("[stealth_ldr_reloc] scan done page %#lx scanned=%d candidates=%d",
+             (unsigned long)page_start, scanned, ldr_count);
+
+    for (int idx = 0; idx < ldr_count; idx++) {
+        SamePageLdr* rec = &ldrs[idx];
+        uintptr_t pc = rec->pc;
+        uint32_t insn = rec->insn;
+        int data_size = rec->data_size;
+        int is_simd = rec->is_simd;
+        uint32_t rt = rec->rt;
+        uint8_t* literal_data = rec->literal_data;
 
         /* 分配 trampoline (48 bytes 足够: 加载常量 + 跳回)
          * B 指令范围 ±128MB，必须用 hook_alloc_near_range 严格限制。
@@ -1189,6 +1222,11 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
             size_t second_len = (size_t)jump_result - first_len;
             void* second_addr = (void*)(t + first_len);
 
+            /* LDR literal relocate 必须在 target patch 前扫描原始代码页。
+             * relocate 内部先收集再 patch，避免扫描已受 wxshadow 保护的页。 */
+            wxshadow_relocate_same_page_ldr_literals(target, (int)first_len);
+            wxshadow_relocate_same_page_ldr_literals(second_addr, (int)second_len);
+
             if (wxshadow_patch(second_addr, jump_buf + first_len, second_len) != 0) {
                 hook_log("[STEALTH1] cross-page second segment failed target=%p", target);
                 return HOOK_ERROR_WXSHADOW_FAILED;
@@ -1198,14 +1236,11 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
                 wxshadow_release(second_addr);
                 return HOOK_ERROR_WXSHADOW_FAILED;
             }
-            /* LDR literal relocate: 两页各扫一次 (shadow 页 R/X 互斥按页生效) */
-            wxshadow_relocate_same_page_ldr_literals(target, (int)first_len);
-            wxshadow_relocate_same_page_ldr_literals(second_addr, (int)second_len);
             ok = 1;
             hook_log("[STEALTH1] cross-page patch OK target=%p split=%zu+%zu", target, first_len, second_len);
         } else {
+            wxshadow_relocate_same_page_ldr_literals(target, jump_result);
             if (wxshadow_patch(target, jump_buf, jump_result) == 0) {
-                wxshadow_relocate_same_page_ldr_literals(target, jump_result);
                 ok = 1;
             }
         }
@@ -1343,4 +1378,3 @@ void hook_diag_alloc_near(void* target) {
                  (i >= prev_pool_count) ? " ★NEW" : "");
     }
 }
-

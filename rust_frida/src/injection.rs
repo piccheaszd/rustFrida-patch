@@ -8,7 +8,7 @@ use std::os::unix::io::RawFd;
 
 use crate::proc_mem::ProcMem;
 use crate::process::{
-    attach_to_process, call_target_function, read_memory, read_remote_mem, write_bytes, write_memory,
+    attach_to_process, call_target_function, parse_proc_maps, read_memory, read_remote_mem, write_bytes, write_memory,
 };
 use crate::types::{bootstrap_status, message_type, FridaBootstrapContext, FridaLibcApi, RustFridaLoaderContext};
 use crate::{log_error, log_info, log_success, log_verbose, log_warn};
@@ -362,6 +362,47 @@ fn write_string_table_at(
     Ok(table_addr)
 }
 
+fn collect_resolver_module_bases(pid: i32) -> Result<Vec<u64>, String> {
+    const RESOLVER_MODULE_COUNT: usize = 4;
+
+    let maps = parse_proc_maps(pid as u32)?;
+    let mut bases = [None::<u64>; RESOLVER_MODULE_COUNT];
+
+    for entry in maps {
+        if !entry.is_readable() || entry.offset != 0 || entry.path.is_empty() || !entry.path.starts_with('/') {
+            continue;
+        }
+        if !is_system_resolver_module(&entry.path) {
+            continue;
+        }
+        if let Some(priority) = resolver_module_priority(&entry.path) {
+            if bases[priority].is_none() {
+                bases[priority] = Some(entry.start);
+                log_verbose!("resolver host module: {} @ 0x{:x}", entry.path, entry.start);
+            }
+        }
+    }
+
+    Ok(bases.into_iter().flatten().collect())
+}
+
+fn resolver_module_priority(path: &str) -> Option<usize> {
+    match path.rsplit('/').next().unwrap_or(path) {
+        "linker64" => Some(0),
+        "libc.so" => Some(1),
+        "libm.so" => Some(2),
+        "libdl.so" => Some(3),
+        _ => None,
+    }
+}
+
+fn is_system_resolver_module(path: &str) -> bool {
+    path.starts_with("/apex/")
+        || path.starts_with("/system/")
+        || path.starts_with("/system_ext/")
+        || path.starts_with("/vendor/")
+}
+
 /// Unix socket fd-passing: 通过 SCM_RIGHTS 发送 fd
 fn send_fd(sockfd: RawFd, fd_to_send: RawFd) -> Result<(), String> {
     use std::io::IoSlice;
@@ -385,11 +426,31 @@ fn send_fd(sockfd: RawFd, fd_to_send: RawFd) -> Result<(), String> {
         std::ptr::copy_nonoverlapping(&fd_to_send as *const i32, libc::CMSG_DATA(cmsg) as *mut i32, 1);
     }
 
-    let ret = unsafe { libc::sendmsg(sockfd, &msg, libc::MSG_NOSIGNAL) };
-    if ret < 0 {
-        return Err(format!("sendmsg(SCM_RIGHTS) 失败: {}", std::io::Error::last_os_error()));
+    loop {
+        let ret = unsafe { libc::sendmsg(sockfd, &msg, libc::MSG_NOSIGNAL) };
+        if ret > 0 {
+            return Ok(());
+        }
+        if ret == 0 {
+            return Err("sendmsg(SCM_RIGHTS) 返回 0，fd 未发送".to_string());
+        }
+
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            errno if is_would_block(errno) => {
+                wait_fd(sockfd, libc::POLLOUT, "send_fd")?;
+                continue;
+            }
+            _ => {
+                return Err(format!(
+                    "sendmsg(SCM_RIGHTS) 失败: {} errno={:?}",
+                    err,
+                    err.raw_os_error()
+                ));
+            }
+        }
     }
-    Ok(())
 }
 
 /// 从 ctrl socket 读取指定字节数
@@ -397,8 +458,27 @@ fn recv_exact(sockfd: RawFd, buf: &mut [u8]) -> Result<(), String> {
     let mut done = 0;
     while done < buf.len() {
         let n = unsafe { libc::read(sockfd, buf[done..].as_mut_ptr() as *mut c_void, buf.len() - done) };
-        if n <= 0 {
-            return Err(format!("recv_exact: read 失败 (n={}, done={}/{})", n, done, buf.len()));
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                errno if is_would_block(errno) => {
+                    wait_fd(sockfd, libc::POLLIN, "recv_exact")?;
+                    continue;
+                }
+                _ => {
+                    return Err(format!(
+                        "recv_exact: read 失败: {} errno={:?}, done={}/{}",
+                        err,
+                        err.raw_os_error(),
+                        done,
+                        buf.len()
+                    ));
+                }
+            }
+        }
+        if n == 0 {
+            return Err(format!("recv_exact: EOF, done={}/{}", done, buf.len()));
         }
         done += n as usize;
     }
@@ -417,12 +497,82 @@ fn send_exact(sockfd: RawFd, buf: &[u8]) -> Result<(), String> {
                 libc::MSG_NOSIGNAL,
             )
         };
-        if n <= 0 {
-            return Err(format!("send_exact: send 失败 (n={})", n));
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                errno if is_would_block(errno) => {
+                    wait_fd(sockfd, libc::POLLOUT, "send_exact")?;
+                    continue;
+                }
+                _ => {
+                    return Err(format!(
+                        "send_exact: send 失败: {} errno={:?}, done={}/{}",
+                        err,
+                        err.raw_os_error(),
+                        done,
+                        buf.len()
+                    ));
+                }
+            }
+        }
+        if n == 0 {
+            return Err(format!("send_exact: send 返回 0, done={}/{}", done, buf.len()));
         }
         done += n as usize;
     }
     Ok(())
+}
+
+fn is_would_block(errno: Option<i32>) -> bool {
+    errno == Some(libc::EAGAIN) || errno == Some(libc::EWOULDBLOCK)
+}
+
+fn wait_fd(sockfd: RawFd, events: i16, op: &str) -> Result<(), String> {
+    let mut pfd = libc::pollfd {
+        fd: sockfd,
+        events,
+        revents: 0,
+    };
+
+    loop {
+        let n = unsafe { libc::poll(&mut pfd, 1, 30_000) };
+        if n > 0 {
+            let fatal = pfd.revents & (libc::POLLERR | libc::POLLNVAL);
+            if fatal != 0 {
+                return Err(format!("{}: poll 失败 revents=0x{:x} fd={}", op, pfd.revents, sockfd));
+            }
+            if pfd.revents & events != 0 {
+                return Ok(());
+            }
+            if pfd.revents & libc::POLLHUP != 0 {
+                return Err(format!("{}: poll hangup fd={}", op, sockfd));
+            }
+            continue;
+        }
+        if n == 0 {
+            return Err(format!("{}: poll 超时 fd={} events=0x{:x}", op, sockfd, events));
+        }
+
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        return Err(format!("{}: poll 失败: {} errno={:?}", op, err, err.raw_os_error()));
+    }
+}
+
+fn recv_loader_string(ctrl_fd: RawFd) -> Result<String, String> {
+    let mut len_buf = [0u8; 2];
+    recv_exact(ctrl_fd, &mut len_buf)?;
+    let msg_len = u16::from_le_bytes(len_buf) as usize;
+    if msg_len > 8192 {
+        return Err(format!("Loader 字符串过长: {} bytes", msg_len));
+    }
+
+    let mut msg_buf = vec![0u8; msg_len];
+    recv_exact(ctrl_fd, &mut msg_buf)?;
+    Ok(String::from_utf8_lossy(&msg_buf).into_owned())
 }
 
 /// Host 端执行 loader IPC 握手协议
@@ -481,30 +631,36 @@ fn run_loader_handshake(ctrl_fd: RawFd, target_pid: i32, loader_ctx_addr: usize)
     unsafe { close(agent_repl_fd) };
     log_verbose!("REPL socketpair fd 已发送");
 
-    // 4. 等待 READY（或错误）— loader 在自定义 linker + entrypoint 查找 + recv agent_ctrlfd 之后才发送
-    recv_exact(ctrl_fd, &mut msg_type)?;
-    match msg_type[0] {
-        t if t == message_type::READY => {
-            log_success!("Loader: agent 加载成功");
-        }
-        t if t == message_type::ERROR_DLOPEN || t == message_type::ERROR_DLSYM => {
-            let mut len_buf = [0u8; 2];
-            recv_exact(ctrl_fd, &mut len_buf)?;
-            let msg_len = u16::from_le_bytes(len_buf) as usize;
-            let mut msg_buf = vec![0u8; msg_len];
-            recv_exact(ctrl_fd, &mut msg_buf)?;
-            let kind = if t == message_type::ERROR_DLOPEN {
-                "link"
-            } else {
-                "entrypoint"
-            };
-            let msg = String::from_utf8_lossy(&msg_buf);
-            unsafe { close(host_repl_fd) };
-            return Err(format!("Loader {} 失败: {}", kind, msg));
-        }
-        t => {
-            unsafe { close(host_repl_fd) };
-            return Err(format!("Loader 协议错误: 期望 READY/ERROR, 收到 {}", t));
+    // 4. 等待 READY（或错误）— DEBUG 消息用于定位 READY 前断开的阶段
+    loop {
+        recv_exact(ctrl_fd, &mut msg_type)?;
+        match msg_type[0] {
+            t if t == message_type::READY => {
+                log_success!("Loader: agent 加载成功");
+                break;
+            }
+            t if t == message_type::DEBUG => {
+                let msg = recv_loader_string(ctrl_fd)?;
+                log_verbose!("Loader debug: {}", msg);
+            }
+            t if t == message_type::ERROR_DLOPEN || t == message_type::ERROR_DLSYM => {
+                let msg = recv_loader_string(ctrl_fd)?;
+                let kind = if t == message_type::ERROR_DLOPEN {
+                    "link"
+                } else {
+                    "entrypoint"
+                };
+                unsafe { close(host_repl_fd) };
+                return Err(format!("Loader {} 失败: {}", kind, msg));
+            }
+            t if t == message_type::BYE => {
+                unsafe { close(host_repl_fd) };
+                return Err("Loader 在 READY 前退出 (BYE)，请查看 loader/agent 崩溃日志".to_string());
+            }
+            t => {
+                unsafe { close(host_repl_fd) };
+                return Err(format!("Loader 协议错误: 期望 READY/DEBUG/ERROR, 收到 {}", t));
+            }
         }
     }
 
@@ -689,6 +845,21 @@ pub(crate) fn inject_via_bootstrapper(
     let string_table_addr = write_string_table_at(pid, string_table_base, string_overrides)?;
     log_verbose!("StringTable 写入: 0x{:x}", string_table_addr);
 
+    let resolver_module_bases = collect_resolver_module_bases(pid)?;
+    let resolver_module_bases_addr = (string_table_addr + 2048 + 7) & !7usize;
+    if !resolver_module_bases.is_empty() {
+        let mut resolver_module_bytes = Vec::with_capacity(resolver_module_bases.len() * size_of::<u64>());
+        for base in &resolver_module_bases {
+            resolver_module_bytes.extend_from_slice(&base.to_le_bytes());
+        }
+        write_bytes(pid, resolver_module_bases_addr, &resolver_module_bytes)?;
+    }
+    log_verbose!(
+        "resolver host modules: {} @ 0x{:x}",
+        resolver_module_bases.len(),
+        resolver_module_bases_addr
+    );
+
     // === 阶段 2: 写入 + 执行 loader ===
     write_bytes(pid, alloc_base, FRIDA_LOADER)?;
     log_verbose!("loader 写入完成 ({} bytes)", FRIDA_LOADER.len());
@@ -721,6 +892,10 @@ pub(crate) fn inject_via_bootstrapper(
     loader_ctx.libc = loader_libc_addr as u64;
     loader_ctx.string_table_addr = string_table_addr as u64;
     loader_ctx.agent_current_thread_eval = current_thread_eval_str_addr as u64;
+    if !resolver_module_bases.is_empty() {
+        loader_ctx.resolver_module_bases = resolver_module_bases_addr as u64;
+        loader_ctx.resolver_module_count = resolver_module_bases.len() as u64;
+    }
     write_memory(pid, loader_ctx_addr, &loader_ctx)?;
 
     // 写入 LibcApi（给 loader 用）

@@ -58,6 +58,7 @@ pub(crate) mod message_type {
     pub const BYE: u8 = 3;
     pub const ERROR_DLOPEN: u8 = 4;
     pub const ERROR_DLSYM: u8 = 5;
+    pub const DEBUG: u8 = 6;
 }
 
 /// FridaBootstrapContext — bootstrapper 的输入/输出参数
@@ -110,6 +111,7 @@ pub(crate) struct FridaLibcApi {
     pub(crate) dlclose: u64,
     pub(crate) dlsym: u64,
     pub(crate) dlerror: u64,
+    pub(crate) dl_iterate_phdr: u64,
 }
 
 impl Default for FridaLibcApi {
@@ -130,6 +132,8 @@ pub(crate) struct RustFridaLoaderContext {
     pub(crate) libc: u64,             // FridaLibcApi *
     pub(crate) string_table_addr: u64,
     pub(crate) agent_current_thread_eval: u64,      // const char *
+    pub(crate) resolver_module_bases: u64,          // const Elf64_Addr *
+    pub(crate) resolver_module_count: u64,          // size_t
     pub(crate) worker: u64,                         // pthread_t (runtime, zeroed)
     pub(crate) agent_handle: u64,                   // void * (runtime, zeroed)
     pub(crate) agent_entrypoint_impl: u64,          // fn ptr (runtime, zeroed)

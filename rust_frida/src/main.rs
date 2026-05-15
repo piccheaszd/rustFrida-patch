@@ -185,7 +185,8 @@ fn main() {
         // Spawn 模式：注册信号处理函数，确保 Ctrl+C 时还原 Zygote patch
         spawn::register_cleanup_handler();
         // Spawn 模式：注入 Zygote 后启动 App
-        match spawn::spawn_and_inject(package, &string_overrides) {
+        let spawn_timeout = args.timeout.unwrap_or(20).max(1);
+        match spawn::spawn_and_inject(package, spawn_timeout, &string_overrides) {
             Ok((pid, result)) => (Some(pid), result),
             Err(e) => {
                 log_error!("Spawn 注入失败: {}", e);

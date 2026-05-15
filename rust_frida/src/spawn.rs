@@ -221,7 +221,7 @@ fn find_dynsym_addr(elf: &goblin::elf::Elf, name: &str, base: u64) -> Option<u64
 
 /// 共享的 spawn 前置步骤：确保 zymbiote 加载、注册请求、启动 App、等待 hello
 /// 返回收到的 SpawnHello（子进程此时处于暂停状态）
-fn spawn_and_wait_hello(package: &str) -> Result<SpawnHello, String> {
+fn spawn_and_wait_hello(package: &str, timeout_secs: u64) -> Result<SpawnHello, String> {
     // 1. 确保 zymbiote 已加载到所有 zygote 进程
     ensure_zymbiote_loaded()?;
 
@@ -253,9 +253,9 @@ fn spawn_and_wait_hello(package: &str) -> Result<SpawnHello, String> {
     log_info!("正在启动应用 {}...", target.package);
     launch_app(&target.package)?;
 
-    // 4. 等待 SpawnHello（20s 超时）
-    log_info!("等待进程 {} 启动... (最长 20s)", target.process_name);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    // 4. 等待 SpawnHello
+    log_info!("等待进程 {} 启动... (最长 {}s)", target.process_name, timeout_secs);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     let poll_interval = std::time::Duration::from_millis(100);
     let hello = loop {
         if let Some(hello) = notifier.try_recv() {
@@ -284,8 +284,8 @@ fn spawn_and_wait_hello(package: &str) -> Result<SpawnHello, String> {
                 format!("  4. 当前目标包相关进程:\n{}", live_processes.join("\n"))
             };
             return Err(format!(
-                "等待进程 {} 启动超时 (20s)，请检查:\n  1. 包名是否正确\n  2. 应用是否已安装\n  3. Zygote 是否已被正确 patch\n{}",
-                target.process_name, live_hint
+                "等待进程 {} 启动超时 ({}s)，请检查:\n  1. 包名是否正确\n  2. 应用是否已安装\n  3. Zygote 是否已被正确 patch\n{}",
+                target.process_name, timeout_secs, live_hint
             ));
         };
 
@@ -311,11 +311,12 @@ fn spawn_and_wait_hello(package: &str) -> Result<SpawnHello, String> {
 /// Spawn 注入主入口
 pub(crate) fn spawn_and_inject(
     package: &str,
+    timeout_secs: u64,
     string_overrides: &HashMap<String, String>,
 ) -> Result<(i32, InjectionResult), String> {
     log_info!("Spawn 模式: 准备注入 {}", package);
 
-    let hello = spawn_and_wait_hello(package)?;
+    let hello = spawn_and_wait_hello(package, timeout_secs)?;
 
     // 属性伪装: mount 在 capset hook 中完成，remap 在 setArgV0 中完成
 

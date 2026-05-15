@@ -277,11 +277,17 @@ frida_collect_libc_symbol (const FridaElfExportDetails * details, void * user_da
   FRIDA_TRY_COLLECT (fcntl)
   FRIDA_TRY_COLLECT (close)
 
+  if (api->dl_iterate_phdr == NULL && strcmp (details->name, "dl_iterate_phdr") == 0)
+  {
+    api->dl_iterate_phdr = details->address;
+    goto beach;
+  }
+
 #undef FRIDA_TRY_COLLECT_NAMED
 #undef FRIDA_TRY_COLLECT
 
 beach:
-  return ctx->total_missing > 0;
+  return ctx->total_missing > 0 || api->dl_iterate_phdr == NULL;
 }
 
 static bool

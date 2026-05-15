@@ -88,6 +88,7 @@ struct _FridaLibcApi
   int (* dlclose) (void * handle);
   void * (* dlsym) (void * handle, const char * symbol, const void * caller_addr);
   char * (* dlerror) (void);
+  int (* dl_iterate_phdr) (int (* callback) (struct dl_phdr_info * info, size_t size, void * data), void * data);
 };
 
 enum _FridaMessageType
@@ -98,6 +99,7 @@ enum _FridaMessageType
   FRIDA_MESSAGE_BYE,
   FRIDA_MESSAGE_ERROR_DLOPEN,
   FRIDA_MESSAGE_ERROR_DLSYM,
+  FRIDA_MESSAGE_DEBUG,
 };
 
 struct _FridaHelloMessage

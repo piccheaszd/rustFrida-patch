@@ -27,7 +27,13 @@ def find_ndk():
     if not os.path.isdir(NDK_BASE):
         print(f"错误: NDK 目录不存在: {NDK_BASE}")
         sys.exit(1)
-    versions = sorted(os.listdir(NDK_BASE), reverse=True)
+    versions = []
+    for name in os.listdir(NDK_BASE):
+        path = os.path.join(NDK_BASE, name)
+        toolchain = os.path.join(path, "toolchains", "llvm", "prebuilt", "linux-x86_64", "bin")
+        if os.path.isdir(toolchain):
+            versions.append(name)
+    versions = sorted(versions, reverse=True)
     if not versions:
         print("错误: 未找到 NDK 版本")
         sys.exit(1)
