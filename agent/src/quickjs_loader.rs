@@ -3,8 +3,6 @@
 //! This module provides JavaScript loading and execution capabilities
 //! using the quickjs-hook crate.
 
-#![cfg(feature = "quickjs")]
-
 use crate::vma_name::set_anon_vma_name_raw;
 use libc::{munmap, sysconf, MAP_FAILED, _SC_PAGESIZE};
 
@@ -12,12 +10,11 @@ use quickjs_hook::{
     cleanup_engine, cleanup_wxshadow_patches, complete_script, cut_art_controller_routing_hooks,
     cut_art_controller_walkstack_guards, cut_java_hooks, cut_native_hooks, detach_current_jni_thread,
     drain_thunk_in_flight, free_art_controller_state, free_java_hooks, free_native_hooks, get_or_init_engine,
-    init_hook_engine, load_script, load_script_with_filename,
-    set_art_controller_reload_paused, set_console_callback, set_qbdi_helper_blob, set_qbdi_output_dir,
+    init_hook_engine, load_script, load_script_with_filename, set_art_controller_reload_paused, set_console_callback,
+    set_qbdi_helper_blob, set_qbdi_output_dir,
 };
 #[cfg(feature = "qbdi")]
 use quickjs_hook::{preload_qbdi_helper, shutdown_qbdi_helper};
-use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
@@ -77,7 +74,7 @@ impl ExecMemory {
     /// hint=0 时退化为普通 mmap。
     fn new_near(size: usize, hint: usize) -> Option<Self> {
         let page_size = unsafe { sysconf(_SC_PAGESIZE) as usize };
-        let alloc_size = ((size + page_size - 1) / page_size) * page_size;
+        let alloc_size = size.div_ceil(page_size) * page_size;
 
         extern "C" {
             fn hook_mmap_near(target: *mut std::ffi::c_void, alloc_size: usize) -> *mut std::ffi::c_void;
@@ -85,14 +82,11 @@ impl ExecMemory {
 
         let ptr = unsafe { hook_mmap_near(hint as *mut std::ffi::c_void, alloc_size) };
 
-        if ptr == MAP_FAILED as *mut std::ffi::c_void {
+        if std::ptr::eq(ptr, MAP_FAILED) {
             return None;
         }
 
-        match set_anon_vma_name_raw(ptr as *mut u8, alloc_size, HOOK_EXEC_VMA_NAME) {
-            Ok(()) => {}
-            Err(_) => {}
-        }
+        let _ = set_anon_vma_name_raw(ptr as *mut u8, alloc_size, HOOK_EXEC_VMA_NAME);
 
         Some(ExecMemory {
             ptr: ptr as *mut u8,
@@ -143,18 +137,18 @@ pub fn init_hook_runtime() -> Result<(), String> {
     init_hook_engine(exec_mem.as_ptr(), exec_mem.size())?;
 
     // 注册 recomp handlers
-    quickjs_hook::recomp::set_handler(|addr| crate::recompiler::ensure_and_translate(addr));
+    quickjs_hook::recomp::set_handler(crate::recompiler::ensure_and_translate);
     quickjs_hook::recomp::set_translate_existing_handler(|addr| crate::recompiler::translate_addr(addr).ok());
-    quickjs_hook::recomp::set_alloc_slot_handler(|addr| crate::recompiler::alloc_trampoline_slot(addr));
+    quickjs_hook::recomp::set_alloc_slot_handler(crate::recompiler::alloc_trampoline_slot);
     quickjs_hook::recomp::set_fixup_handler(|trampoline, addr| {
         crate::recompiler::fixup_slot_trampoline(trampoline, addr)
     });
-    quickjs_hook::recomp::set_commit_handler(|addr| crate::recompiler::commit_slot_patch(addr));
-    quickjs_hook::recomp::set_revert_handler(|addr| crate::recompiler::revert_slot_patch(addr));
-    quickjs_hook::recomp::set_install_patch_handler(|addr, bytes| crate::recompiler::install_patch(addr, bytes));
-    quickjs_hook::recomp::set_try_revert_handler(|addr| crate::recompiler::try_revert_slot_patch(addr));
-    quickjs_hook::recomp::set_try_revert_slot_handler(|slot| crate::recompiler::try_revert_slot_patch_by_slot(slot));
-    quickjs_hook::recomp::set_reverse_translate_handler(|addr| crate::recompiler::translate_recomp_to_orig(addr));
+    quickjs_hook::recomp::set_commit_handler(crate::recompiler::commit_slot_patch);
+    quickjs_hook::recomp::set_revert_handler(crate::recompiler::revert_slot_patch);
+    quickjs_hook::recomp::set_install_patch_handler(crate::recompiler::install_patch);
+    quickjs_hook::recomp::set_try_revert_handler(crate::recompiler::try_revert_slot_patch);
+    quickjs_hook::recomp::set_try_revert_slot_handler(crate::recompiler::try_revert_slot_patch_by_slot);
+    quickjs_hook::recomp::set_reverse_translate_handler(crate::recompiler::translate_recomp_to_orig);
     quickjs_hook::recomp::set_patch_suspend_polls_handler(|addr, entry| {
         crate::recompiler::patch_suspend_polls(addr, entry)
     });
@@ -246,7 +240,7 @@ pub fn cleanup() {
     use std::time::Instant;
     let t0 = Instant::now();
     let mut t = t0;
-    let mut stage = |label: &str, prev: &mut Instant| {
+    let stage = |label: &str, prev: &mut Instant| {
         let now = Instant::now();
         let delta = now.duration_since(*prev).as_millis();
         let total = now.duration_since(t0).as_millis();
@@ -421,7 +415,7 @@ pub fn cleanup_soft() -> Result<(), String> {
 
     let t0 = Instant::now();
     let mut t = t0;
-    let mut stage = |label: &str, prev: &mut Instant| {
+    let stage = |label: &str, prev: &mut Instant| {
         let now = Instant::now();
         let delta = now.duration_since(*prev).as_millis();
         let total = now.duration_since(t0).as_millis();

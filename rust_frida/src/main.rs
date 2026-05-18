@@ -247,7 +247,7 @@ fn main() {
     {
         log_info!("等待 agent 连接... (最长 {}s)", args.connect_timeout);
         let connected = if args.spawn.is_some() {
-            session.wait_connected_with_signal(args.connect_timeout, || spawn::signal_received())
+            session.wait_connected_with_signal(args.connect_timeout, spawn::signal_received)
         } else {
             session.wait_connected(args.connect_timeout)
         };

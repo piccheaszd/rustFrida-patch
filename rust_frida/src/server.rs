@@ -451,7 +451,7 @@ fn run_session_repl(session: &Arc<Session>) -> bool {
 fn print_server_help() {
     use crate::logger::{BOLD, CYAN, DIM, GREEN, RESET, YELLOW};
     println!("\n{BOLD}{CYAN}Server 命令:{RESET}");
-    println!("{DIM}  {:<12} {:<28} {}{RESET}", "命令", "参数", "说明");
+    println!("{DIM}  {:<12} {:<28} 说明{RESET}", "命令", "参数");
     println!("{DIM}  {:-<12} {:-<28} {:-<20}{RESET}", "", "", "");
     for (cmd, args, desc) in SERVER_CMDS {
         println!("  {BOLD}{GREEN}{:<12}{RESET} {YELLOW}{:<28}{RESET} {}", cmd, args, desc);

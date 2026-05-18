@@ -12,14 +12,12 @@ pub fn get_registers(pid: i32) -> Result<UserRegs> {
         iov_base: &mut regs as *mut _ as *mut c_void,
         iov_len: size_of::<UserRegs>(),
     };
-    let result = unsafe {
-        gum_libc_ptrace(
-            libc::PTRACE_GETREGSET,
-            pid as pid_t,
-            1, // 通用寄存器
-            &mut iov as *mut _ as usize,
-        )
-    };
+    let result = gum_libc_ptrace(
+        libc::PTRACE_GETREGSET,
+        pid as pid_t,
+        1, // 通用寄存器
+        &mut iov as *mut _ as usize,
+    );
 
     if result < 0 {
         return Err("获取线程 寄存器失败，错误码: ".to_string() + &(-result).to_string());
@@ -54,7 +52,7 @@ pub(crate) fn attach_to_thread(thread_id: i32) -> Result<()> {
             Ok(())
         }
         res => {
-            let err_msg = match Errno::from_i32(-res) {
+            let err_msg = match Errno::from_raw(-res) {
                 Errno::EPERM => "权限不足，请使用root权限运行 ".to_string(),
                 Errno::ESRCH => "目标线程不存在".to_string(),
                 _ => "附加到线程失败: ".to_string() + &res.to_string(),

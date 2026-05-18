@@ -16,6 +16,10 @@ pub struct ExecMem {
     page_size: usize,
 }
 
+// ExecMem owns one anonymous mapping and all mutable access is serialized by the
+// global Mutex in the trace transformer.
+unsafe impl Send for ExecMem {}
+
 impl ExecMem {
     /// 新建一块可读写可执行内存（自动按页分配）
     pub fn new() -> Result<Self> {
@@ -98,11 +102,6 @@ impl ExecMem {
         Ok(())
     }
 
-    fn drop(&mut self) {
-        unsafe {
-            munmap(self.ptr as *mut _, self.size);
-        }
-    }
     pub fn current_addr(&self) -> usize {
         unsafe { self.ptr.add(self.used) as usize }
     }
@@ -129,5 +128,13 @@ impl ExecMem {
     }
     pub fn page_size(&self) -> usize {
         self.page_size
+    }
+}
+
+impl Drop for ExecMem {
+    fn drop(&mut self) {
+        unsafe {
+            munmap(self.ptr as *mut _, self.size);
+        }
     }
 }

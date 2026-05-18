@@ -85,11 +85,21 @@ impl StringTable {
     }
 
     /// 获取 cmdline
+    ///
+    /// # Safety
+    ///
+    /// The remote string table addresses must be valid for `cmdline_len`
+    /// bytes in the current process.
     pub unsafe fn get_cmdline(&self) -> Option<String> {
         self.read_string(self.cmdline, self.cmdline_len)
     }
 
     /// 获取 output_path
+    ///
+    /// # Safety
+    ///
+    /// The remote string table addresses must be valid for `output_path_len`
+    /// bytes in the current process.
     pub unsafe fn get_output_path(&self) -> Option<String> {
         self.read_string(self.output_path, self.output_path_len)
     }
@@ -248,7 +258,11 @@ fn eval_and_respond(script: &str, filename: &str, empty_err: &[u8]) {
         match result {
             Ok(result) => {
                 send_eval_ok(&result);
-                log_msg(format!("[quickjs] eval ok source={} out_len={}\n", source, result.len()));
+                log_msg(format!(
+                    "[quickjs] eval ok source={} out_len={}\n",
+                    source,
+                    result.len()
+                ));
             }
             // 错误直接透传（包含 \n 换行），host 侧用 println! 显示多行
             Err(e) => {
@@ -280,7 +294,11 @@ fn init_eval_and_respond(script: &str, filename: &str) {
 
 #[cfg(feature = "quickjs")]
 #[no_mangle]
-pub extern "C" fn rustfrida_loadjs_current_thread(
+/// # Safety
+///
+/// `script_ptr` and `filename_ptr` must either be non-null valid buffers of
+/// their corresponding lengths, or may be null only when the length is zero.
+pub unsafe extern "C" fn rustfrida_loadjs_current_thread(
     script_ptr: *const u8,
     script_len: usize,
     filename_ptr: *const u8,
@@ -297,8 +315,16 @@ pub extern "C" fn rustfrida_loadjs_current_thread(
             return -1;
         }
 
-        let script_bytes = unsafe { std::slice::from_raw_parts(script_ptr, script_len) };
-        let filename_bytes = unsafe { std::slice::from_raw_parts(filename_ptr, filename_len) };
+        let script_bytes = if script_len == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(script_ptr, script_len) }
+        };
+        let filename_bytes = if filename_len == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(filename_ptr, filename_len) }
+        };
         let script = match std::str::from_utf8(script_bytes) {
             Ok(s) => s,
             Err(_) => {
@@ -478,7 +504,9 @@ fn process_cmd(command: &str) {
             let (filename, script) = parse_loadjs_payload(rest);
             let filename = filename.to_string();
             let script = script.to_string();
-            dispatch_js_task("loadjs", move || eval_and_respond(&script, &filename, b"[quickjs] Error: empty script"));
+            dispatch_js_task("loadjs", move || {
+                eval_and_respond(&script, &filename, b"[quickjs] Error: empty script")
+            });
         }
         #[cfg(feature = "quickjs")]
         Some("jseval") => {
@@ -489,7 +517,9 @@ fn process_cmd(command: &str) {
                 .unwrap_or("")
                 .trim();
             let expr = expr.to_string();
-            dispatch_js_task("jseval", move || eval_and_respond(&expr, "", "[quickjs] 用法: jseval <expression>".as_bytes()));
+            dispatch_js_task("jseval", move || {
+                eval_and_respond(&expr, "", "[quickjs] 用法: jseval <expression>".as_bytes())
+            });
         }
         // rpccall <method> <args_json>
         //   method    — 注册在 rpc.exports 上的函数名

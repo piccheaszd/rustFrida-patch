@@ -613,6 +613,9 @@ impl NativeRetKind {
     }
 }
 
+// These declarations intentionally use one assembly symbol with different
+// Rust return types so the compiler reads the AAPCS64 result from x0/d0/s0.
+#[allow(clashing_extern_declarations)]
 extern "C" {
     /// ARM64 AAPCS64 shim：
     ///   - gpr[0..8] 载入 x0-x7

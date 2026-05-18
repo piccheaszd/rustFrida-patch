@@ -168,9 +168,9 @@ impl DlopenMonitor {
     /// 停止监听并卸载 eBPF 程序
     pub fn stop(mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
-        // if let Some(handle) = self.handle.take() {
-        //     let _ = handle.join();
-        // }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
         println!("eBPF 监听已停止");
     }
 

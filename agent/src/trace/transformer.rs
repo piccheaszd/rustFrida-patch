@@ -10,16 +10,15 @@ use libc::{
     c_int, mmap, pid_t, CLONE_SETTLS, CLONE_VM, MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, PROT_WRITE, PR_SET_NAME,
     PTRACE_DETACH,
 };
-use once_cell::unsync::Lazy;
 use std::ptr::null_mut;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 
 type Result<T> = std::result::Result<T, String>;
 
 // ============== 静态变量 ==============
 
 static mut INSTRUCT_PTR: *const u32 = null_mut();
-static mut EXE_MEM: Lazy<Mutex<ExecMem>> = Lazy::new(|| Mutex::new(ExecMem::new().unwrap()));
+static EXE_MEM: LazyLock<Mutex<ExecMem>> = LazyLock::new(|| Mutex::new(ExecMem::new().unwrap()));
 
 // ============== 转换器 ==============
 
@@ -29,12 +28,16 @@ extern "C" {
 
 /// 返回 mtransform 函数地址，供 arm64_codegen 使用
 pub fn mtransform_addr() -> usize {
-    mtransform as usize
+    mtransform as *const () as usize
 }
 
 #[no_mangle]
-pub extern "C" fn transformer_wrapper_full(ctx: [usize; 32]) -> usize {
+pub extern "C" fn transformer_wrapper_full(ctx: *const usize) -> usize {
     unsafe {
+        if ctx.is_null() {
+            return 0;
+        }
+        let ctx = std::slice::from_raw_parts(ctx, 32);
         let mut vall = UserRegs::default();
         let mut log = String::from("context: \n");
         for i in 0..31 {
@@ -77,7 +80,7 @@ pub fn transformer_global(addr: usize) -> Result<usize> {
             Err(e) => {
                 write_stream(e);
                 exe_mem.reset();
-                transformer_global(addr);
+                let _ = transformer_global(addr);
             }
         }
 

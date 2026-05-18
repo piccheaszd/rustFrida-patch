@@ -839,8 +839,9 @@ pub(super) fn ensure_art_controller_initialized(
     // through our hook pool can leave a thread unsuspendable if a signal handler
     // blocks there, so keep this guard disabled and rely on the OAT-header and
     // SIGSEGV walkstack guards below.
+    const ENABLE_PRETTY_METHOD_HOOK: bool = false;
     let mut pretty_method_hook_target: u64 = 0;
-    if false && bridge.pretty_method != 0 {
+    if ENABLE_PRETTY_METHOD_HOOK && bridge.pretty_method != 0 {
         let (ha, sf) = unsafe { prepare_hook_target(bridge.pretty_method, std::ptr::null_mut()) }
             .unwrap_or((bridge.pretty_method, 0));
         let ret = unsafe {
@@ -1172,7 +1173,7 @@ unsafe extern "C" fn bypass_stack_destructor(ptr: *mut std::ffi::c_void) {
 
 fn ensure_bypass_key() {
     BYPASS_KEY_INIT.call_once(|| unsafe {
-        libc::pthread_key_create(&mut BYPASS_KEY as *mut _, Some(bypass_stack_destructor));
+        libc::pthread_key_create(&raw mut BYPASS_KEY, Some(bypass_stack_destructor));
     });
 }
 
@@ -1811,7 +1812,7 @@ unsafe extern "C" fn walkstack_sigsegv_handler(
     context: *mut libc::c_void,
 ) {
     unsafe fn chain_prev_sigsegv(sig: libc::c_int, info: *mut libc::siginfo_t, context: *mut libc::c_void) {
-        let prev = &PREV_SIGSEGV_ACTION;
+        let prev = PREV_SIGSEGV_ACTION;
         let prev_handler = prev.sa_sigaction;
         if prev.sa_flags & libc::SA_SIGINFO != 0 {
             let handler: unsafe extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) =
@@ -2011,11 +2012,11 @@ unsafe fn install_walkstack_sigsegv_guard() {
     }
 
     let mut sa: libc::sigaction = std::mem::zeroed();
-    sa.sa_sigaction = walkstack_sigsegv_handler as usize;
+    sa.sa_sigaction = walkstack_sigsegv_handler as *const () as usize;
     sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
     libc::sigemptyset(&mut sa.sa_mask);
 
-    let ret = bionic_sigaction(libc::SIGSEGV, &sa, &mut PREV_SIGSEGV_ACTION);
+    let ret = bionic_sigaction(libc::SIGSEGV, &sa, &raw mut PREV_SIGSEGV_ACTION);
     if ret == 0 {
         output_verbose("[artController] WalkStack SIGSEGV guard 已安装");
     } else {
@@ -2042,12 +2043,12 @@ pub(crate) unsafe fn refresh_walkstack_sigsegv_guard() {
     if bionic_sigaction(libc::SIGSEGV, std::ptr::null(), &mut current) != 0 {
         return;
     }
-    if current.sa_sigaction == walkstack_sigsegv_handler as usize {
+    if current.sa_sigaction == walkstack_sigsegv_handler as *const () as usize {
         return;
     }
 
     let mut sa: libc::sigaction = std::mem::zeroed();
-    sa.sa_sigaction = walkstack_sigsegv_handler as usize;
+    sa.sa_sigaction = walkstack_sigsegv_handler as *const () as usize;
     sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
     libc::sigemptyset(&mut sa.sa_mask);
 

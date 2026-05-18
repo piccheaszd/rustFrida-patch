@@ -193,7 +193,7 @@ fn page_permissions(page: usize) -> Option<(bool, bool)> {
             continue;
         };
         if page >= start && page < end {
-            let readable = perms.as_bytes().get(0).is_some_and(|b| *b == b'r');
+            let readable = perms.as_bytes().first().is_some_and(|b| *b == b'r');
             let executable = perms.as_bytes().get(2).is_some_and(|b| *b == b'x');
             return Some((readable, executable));
         }
@@ -361,7 +361,7 @@ fn ensure_recomp_region_writable(page: &RecompiledPage, context: &str) -> Result
 /// - `pid`: 目标进程 pid（0 = 当前进程）
 ///
 /// 返回重编译页的基地址和统计信息
-pub fn recompile(addr: usize, pid: u32) -> Result<(usize, RecompileStats)> {
+pub fn recompile(addr: usize, _pid: u32) -> Result<(usize, RecompileStats)> {
     ensure_init();
 
     let page_size = unsafe { sysconf(_SC_PAGESIZE) as usize };
@@ -470,7 +470,7 @@ pub fn recompile(addr: usize, pid: u32) -> Result<(usize, RecompileStats)> {
 }
 
 /// 释放重编译页
-pub fn release(addr: usize, pid: u32) -> Result<()> {
+pub fn release(addr: usize, _pid: u32) -> Result<()> {
     ensure_init();
 
     let page_size = unsafe { sysconf(_SC_PAGESIZE) as usize };
@@ -707,7 +707,7 @@ pub fn patch_suspend_polls(orig_addr: usize, implicit_suspend_entry: usize) -> R
         let recomp_next = (recomp_code_addr + 4) as u64;
 
         let b_offset = (slot_addr as i64) - (recomp_code_addr as i64);
-        if b_offset < -(1 << 27) || b_offset >= (1 << 27) {
+        if !(-(1 << 27)..(1 << 27)).contains(&b_offset) {
             return Err(format!("suspend poll B 指令范围超限: offset={}", b_offset));
         }
         let b_imm26 = ((b_offset >> 2) & 0x03ff_ffff) as u32;
@@ -827,7 +827,7 @@ pub fn patch_with_trampoline(orig_addr: usize, jump_dest: usize) -> Result<usize
         // 2. 在 recomp 代码页写 B slot（ARM64 B imm26: ±128MB）
         let recomp_code_addr = page.recomp_ptr.add(offset) as usize;
         let b_offset = (slot_addr as i64) - (recomp_code_addr as i64);
-        if b_offset < -(1 << 27) || b_offset >= (1 << 27) {
+        if !(-(1 << 27)..(1 << 27)).contains(&b_offset) {
             return Err(format!("B 指令范围超限: offset={}", b_offset));
         }
         let b_imm26 = ((b_offset >> 2) & 0x3FF_FFFF) as u32;
@@ -890,7 +890,7 @@ pub fn alloc_trampoline_slot(orig_addr: usize) -> Result<usize> {
 
     // B 指令范围预检查（commit_slot_patch 时才真正写入）
     let b_offset = (slot_addr as i64) - (recomp_code_addr as i64);
-    if b_offset < -(1 << 27) || b_offset >= (1 << 27) {
+    if !(-(1 << 27)..(1 << 27)).contains(&b_offset) {
         return Err(format!("B 指令范围超限: offset={}", b_offset));
     }
 
@@ -926,10 +926,10 @@ pub fn alloc_trampoline_slot(orig_addr: usize) -> Result<usize> {
 pub fn install_patch(orig_addr: usize, user_bytes: &[u8]) -> Result<()> {
     ensure_init();
 
-    if orig_addr % 4 != 0 {
+    if !orig_addr.is_multiple_of(4) {
         return Err("orig_addr must be 4-byte aligned".into());
     }
-    if user_bytes.is_empty() || user_bytes.len() % 4 != 0 {
+    if user_bytes.is_empty() || !user_bytes.len().is_multiple_of(4) {
         return Err("patch must be non-empty and 4-byte multiple".into());
     }
 
@@ -976,7 +976,7 @@ pub fn install_patch(orig_addr: usize, user_bytes: &[u8]) -> Result<()> {
 
     // B 指令范围预检查
     let b_offset = (slot_addr as i64) - (recomp_code_addr as i64);
-    if b_offset < -(1 << 27) || b_offset >= (1 << 27) {
+    if !(-(1 << 27)..(1 << 27)).contains(&b_offset) {
         return Err(format!("B range exceeded: offset={}", b_offset));
     }
 

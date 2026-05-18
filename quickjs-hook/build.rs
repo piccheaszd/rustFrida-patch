@@ -106,7 +106,7 @@ fn main() {
             .opt_level(2)
             .flag("-fPIC")
             .flag("-fno-exceptions")
-            .flag(&format!("-DCONFIG_VERSION=\"{}\"", quickjs_version))
+            .flag(format!("-DCONFIG_VERSION=\"{}\"", quickjs_version))
             .flag("-D_GNU_SOURCE")
             .flag_if_supported("-Wno-implicit-const-int-float-conversion")
             .warnings(false);

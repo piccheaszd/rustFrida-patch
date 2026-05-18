@@ -54,9 +54,7 @@ pub(crate) fn sleep_ms(ms: i64) {
         tv_sec: ms / 1000,
         tv_nsec: (ms % 1000) * 1_000_000,
     };
-    unsafe {
-        gum_libc_syscall_4(SYS_nanosleep as c_long, &req as *const timespec as usize, 0, 0, 0);
-    }
+    gum_libc_syscall_4(SYS_nanosleep as c_long, &req as *const timespec as usize, 0, 0, 0);
 }
 
 unsafe fn raw_clone(child_func: *mut usize, arg: usize, flags: u64, child_stack: *mut usize) -> Result<pid_t, String> {
@@ -94,15 +92,13 @@ unsafe fn raw_clone(child_func: *mut usize, arg: usize, flags: u64, child_stack:
 
 extern "C" fn raw_thread_entry(arg: usize) -> c_int {
     let mut start = unsafe { Box::from_raw(arg as *mut RawThreadStart) };
-    unsafe {
-        gum_libc_syscall_4(
-            libc::SYS_prctl as c_long,
-            PR_SET_NAME as usize,
-            start.name.as_ptr() as usize,
-            0,
-            0,
-        );
-    }
+    gum_libc_syscall_4(
+        libc::SYS_prctl as c_long,
+        PR_SET_NAME as usize,
+        start.name.as_ptr() as usize,
+        0,
+        0,
+    );
 
     if let Some(func) = start.func.take() {
         func();

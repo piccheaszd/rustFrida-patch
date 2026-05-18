@@ -251,7 +251,7 @@ typedef void (*remove_soinfo_fn)(void *);
  * Keep the implementation available for explicit diagnostics/experiments, but
  * do not run it automatically unless the build opts in.
  */
-#ifdef RUSTFRIDA_ENABLE_SOINfo_CONSTRUCTOR
+#if defined(RUSTFRIDA_ENABLE_SOINFO_CONSTRUCTOR) || defined(RUSTFRIDA_ENABLE_SOINfo_CONSTRUCTOR)
 __attribute__((constructor))
 #endif
 static void hide_from_solist(void) {

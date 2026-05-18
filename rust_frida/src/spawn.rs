@@ -198,11 +198,6 @@ fn is_boot_heap(entry: &MapEntry) -> bool {
             || entry.path.contains("dalvik-LinearAlloc"))
 }
 
-/// 判断给定地址是否在 boot heap 区域中
-fn is_boot_heap_addr(addr: u64, maps: &[MapEntry]) -> bool {
-    maps.iter().any(|e| is_boot_heap(e) && addr >= e.start && addr < e.end)
-}
-
 fn is_private_rw_mapping(entry: &MapEntry) -> bool {
     entry.is_readable() && entry.is_writable() && !entry.is_executable() && !entry.is_shared()
 }
@@ -215,7 +210,7 @@ fn is_readable_mapping(entry: &MapEntry) -> bool {
 fn find_dynsym_addr(elf: &goblin::elf::Elf, name: &str, base: u64) -> Option<u64> {
     elf.dynsyms
         .iter()
-        .find(|sym| elf.dynstrtab.get_at(sym.st_name).map_or(false, |n| n == name))
+        .find(|sym| elf.dynstrtab.get_at(sym.st_name).is_some_and(|n| n == name))
         .map(|sym| base + sym.st_value)
 }
 
@@ -1027,9 +1022,7 @@ fn normalize_component_name(package: &str, name: &str) -> String {
 }
 
 fn normalize_process_name(package: &str, process: &str) -> String {
-    if process.starts_with(':') {
-        format!("{}{}", package, process)
-    } else if process.starts_with('.') {
+    if process.starts_with(':') || process.starts_with('.') {
         format!("{}{}", package, process)
     } else {
         process.to_string()
@@ -1397,7 +1390,7 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
     );
 
     // 2. 与 Frida 一致：提前检查 boot heap 候选区是否存在
-    let has_heap_candidates = maps.iter().any(|e| is_boot_heap(e));
+    let has_heap_candidates = maps.iter().any(is_boot_heap);
     if !has_heap_candidates {
         return Err("未检测到 VM heap 候选区域（boot.art / dalvik-LinearAlloc）".to_string());
     }
@@ -1591,22 +1584,18 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
     // 11. 替换 setcontext GOT slot（可选）
     //     与 Frida 一致：already-patched 时 GOT 中可能是旧的替换值，
     //     必须用原始函数地址作为备份，而非从内存中读取当前值
-    let setcontext_got = if let Some((func_addr, got_addr)) = &setcontext_info {
-        if let Some(got) = got_addr {
-            let backup = if already_patched {
-                // already-patched: GOT 中是旧 patch 的替换值，使用原始函数地址
-                func_addr.to_ne_bytes()
-            } else {
-                let mut buf = [0u8; 8];
-                mem.pread_exact(&mut buf, *got)?;
-                buf
-            };
-            mem.pwrite_all(&replacement_setcontext_addr.to_ne_bytes(), *got)?;
-            log_verbose!("setcontext GOT 已替换: 0x{:x}", got);
-            Some((*got, backup))
+    let setcontext_got = if let Some((func_addr, Some(got))) = &setcontext_info {
+        let backup = if already_patched {
+            // already-patched: GOT 中是旧 patch 的替换值，使用原始函数地址
+            func_addr.to_ne_bytes()
         } else {
-            None
-        }
+            let mut buf = [0u8; 8];
+            mem.pread_exact(&mut buf, *got)?;
+            buf
+        };
+        mem.pwrite_all(&replacement_setcontext_addr.to_ne_bytes(), *got)?;
+        log_verbose!("setcontext GOT 已替换: 0x{:x}", got);
+        Some((*got, backup))
     } else {
         None
     };
@@ -2393,7 +2382,7 @@ extern "C" fn signal_cleanup_handler(_sig: libc::c_int) {
 /// 注册 SIGINT/SIGTERM 信号处理函数
 pub(crate) fn register_cleanup_handler() {
     unsafe {
-        libc::signal(libc::SIGINT, signal_cleanup_handler as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, signal_cleanup_handler as libc::sighandler_t);
+        libc::signal(libc::SIGINT, signal_cleanup_handler as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, signal_cleanup_handler as *const () as libc::sighandler_t);
     }
 }

@@ -49,7 +49,6 @@ pub(crate) mod reflect;
 
 mod safe_mem;
 
-pub(crate) use art_class::run_pending_checkpoints as run_pending_art_checkpoints;
 pub(crate) use jni_core::ensure_jni_initialized;
 pub(crate) use reflect::get_class_name_unchecked;
 
@@ -1358,7 +1357,7 @@ pub fn register_java_api(ctx: &JSContext) {
 // ============================================================================
 
 /// 恢复 ArtMethod 原始字段 (access_flags, data_, entry_point) + flush icache。
-pub(super) unsafe fn restore_art_method_fields(data: &JavaHookData) {
+pub(in crate::jsapi::java) unsafe fn restore_art_method_fields(data: &JavaHookData) {
     if let Some(spec) = ART_METHOD_SPEC.get() {
         std::ptr::write_volatile(
             (data.art_method as usize + spec.access_flags_offset) as *mut u32,
@@ -1380,7 +1379,7 @@ pub(super) unsafe fn restore_art_method_fields(data: &JavaHookData) {
 }
 
 /// 移除 Layer 3 per-method inline hook + stealth2 revert_slot_patch。
-pub(super) unsafe fn remove_per_method_hook(data: &JavaHookData) {
+pub(in crate::jsapi::java) unsafe fn remove_per_method_hook(data: &JavaHookData) {
     if data.quick_trampoline == 0 {
         // Standalone shared-stub routers are written directly into ArtMethod.entry_point_.
         // They are not installed with hook_install_art_router(), so hook_remove(target)
@@ -1409,19 +1408,19 @@ pub(super) unsafe fn remove_per_method_hook(data: &JavaHookData) {
 }
 
 /// 移除 registered native fnPtr inline hook。
-pub(super) unsafe fn remove_native_entry_hook(data: &JavaHookData) {
+pub(in crate::jsapi::java) unsafe fn remove_native_entry_hook(data: &JavaHookData) {
     if data.native_entry_hook_target != 0 {
         hook_ffi::hook_remove(data.native_entry_hook_target as *mut std::ffi::c_void);
     }
 }
 
 /// 移除 native trampoline (hook_remove_redirect)。
-pub(super) unsafe fn remove_native_trampoline(data: &JavaHookData) {
+pub(in crate::jsapi::java) unsafe fn remove_native_trampoline(data: &JavaHookData) {
     hook_ffi::hook_remove_redirect(data.art_method);
 }
 
 /// 释放 replacement/clone ArtMethod 堆内存 + JNI global ref + JS callback。
-pub(super) unsafe fn free_java_hook_resources(data: &JavaHookData, env_opt: Option<JniEnv>) {
+pub(in crate::jsapi::java) unsafe fn free_java_hook_resources(data: &JavaHookData, env_opt: Option<JniEnv>) {
     let replacement_addr = match &data.hook_type {
         callback::HookType::Replaced { replacement_addr, .. } | callback::HookType::Quick { replacement_addr, .. } => {
             *replacement_addr
@@ -1568,9 +1567,7 @@ pub fn free_java_hooks() {
         let guard = JAVA_HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(registry) = guard.as_ref() {
             for (_art_method, data) in registry.iter() {
-                unsafe {
-                    callback::delete_replacement_method(data.art_method);
-                }
+                callback::delete_replacement_method(data.art_method);
             }
         }
     }

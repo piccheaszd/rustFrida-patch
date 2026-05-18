@@ -24,6 +24,10 @@
 //! ```
 
 #![allow(clippy::missing_safety_doc)]
+// QuickJS callback registration exposes raw-pointer C ABI entry points as Rust
+// functions. The call sites validate and route them through QuickJS, so making
+// the whole public JS API surface unsafe would only push noise to every caller.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 mod completion;
 pub mod context;

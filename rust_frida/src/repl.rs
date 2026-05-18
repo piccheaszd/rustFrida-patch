@@ -483,7 +483,7 @@ pub(crate) fn print_eval_result(session: &Session, timeout_secs: u64) {
 pub(crate) fn print_help() {
     use crate::logger::{BOLD, CYAN, DIM, GREEN, RESET, YELLOW};
     println!("\n{BOLD}{CYAN}可用命令:{RESET}");
-    println!("{DIM}  {:<10} {:<22} {}{RESET}", "命令", "参数", "说明");
+    println!("{DIM}  {:<10} {:<22} 说明{RESET}", "命令", "参数");
     println!("{DIM}  {:-<10} {:-<22} {:-<20}{RESET}", "", "", "");
     for (cmd, args, desc) in commands() {
         println!("  {BOLD}{GREEN}{:<10}{RESET} {YELLOW}{:<22}{RESET} {}", cmd, args, desc);

@@ -125,7 +125,7 @@ fn relabel_fd_for_injection(fd: RawFd, target_pid: i32) {
         let ret = unsafe {
             libc::fsetxattr(
                 fd,
-                b"security.selinux\0".as_ptr() as *const libc::c_char,
+                c"security.selinux".as_ptr(),
                 label_cstr.as_ptr() as *const c_void,
                 label_cstr.len() - 1, // 不包含 NUL
                 0,
@@ -137,7 +137,7 @@ fn relabel_fd_for_injection(fd: RawFd, target_pid: i32) {
             let n = unsafe {
                 libc::fgetxattr(
                     fd,
-                    b"security.selinux\0".as_ptr() as *const libc::c_char,
+                    c"security.selinux".as_ptr(),
                     readback.as_mut_ptr() as *mut c_void,
                     readback.len(),
                 )
@@ -794,7 +794,7 @@ fn run_loader_handshake(ctrl_fd: RawFd, target_pid: i32, loader_ctx_addr: usize)
     // 2. 发送 agent SO fd (创建 memfd → 写入 AGENT_SO → sendmsg)
     //    关键: 必须设置 SELinux label 为 frida_memfd (带 mlstrustedobject 属性)，
     //    否则 untrusted_app 因 MLS 分类不匹配无法通过 SCM_RIGHTS 接收 tmpfs fd。
-    let agent_memfd = unsafe { libc::memfd_create(b"wwb_so\0".as_ptr() as _, 0) };
+    let agent_memfd = unsafe { libc::memfd_create(c"wwb_so".as_ptr(), 0) };
     if agent_memfd < 0 {
         return Err(format!("memfd_create 失败: {}", std::io::Error::last_os_error()));
     }
@@ -822,13 +822,14 @@ fn run_loader_handshake(ctrl_fd: RawFd, target_pid: i32, loader_ctx_addr: usize)
             return Err(e);
         }
     };
-    if padded_len > AGENT_SO.len() {
-        if unsafe { libc::ftruncate(agent_memfd, padded_len as libc::off_t) } != 0 {
-            unsafe { close(agent_memfd) };
-            return Err(format!("扩展 agent SO memfd 失败: {}", std::io::Error::last_os_error()));
-        }
+    if padded_len > AGENT_SO.len() && unsafe { libc::ftruncate(agent_memfd, padded_len as libc::off_t) } != 0 {
+        unsafe { close(agent_memfd) };
+        return Err(format!("扩展 agent SO memfd 失败: {}", std::io::Error::last_os_error()));
     }
-    send_fd(ctrl_fd, agent_memfd)?;
+    if let Err(e) = send_fd(ctrl_fd, agent_memfd) {
+        unsafe { close(agent_memfd) };
+        return Err(e);
+    }
     unsafe { close(agent_memfd) };
     log_verbose!("agent SO fd 已发送 ({} bytes, padded {})", AGENT_SO.len(), padded_len);
 
@@ -842,7 +843,13 @@ fn run_loader_handshake(ctrl_fd: RawFd, target_pid: i32, loader_ctx_addr: usize)
     let agent_repl_fd = sv[1];
     // 注意：socketpair 在 sockfs 上，不支持 fsetxattr relabel（associate 被拒），
     // 但 Unix socket fd 的 SCM_RIGHTS 传递不受 MLS file 检查约束，无需 relabel
-    send_fd(ctrl_fd, agent_repl_fd)?;
+    if let Err(e) = send_fd(ctrl_fd, agent_repl_fd) {
+        unsafe {
+            close(agent_repl_fd);
+            close(host_repl_fd);
+        }
+        return Err(e);
+    }
     unsafe { close(agent_repl_fd) };
     log_verbose!("REPL socketpair fd 已发送");
 
@@ -961,10 +968,7 @@ fn inject_via_bootstrapper_once(
 
     let mem = ProcMem::open(pid as u32)?;
 
-    let initial_regs = match crate::process::get_registers_pub(trace_tid) {
-        Ok(regs) => regs,
-        Err(e) => return Err(e),
-    };
+    let initial_regs = crate::process::get_registers_pub(trace_tid)?;
 
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if page_size <= 0 || (page_size & (page_size - 1)) != 0 {
@@ -972,7 +976,7 @@ fn inject_via_bootstrapper_once(
     }
     let page_size = page_size as usize;
     let code_size = BOOTSTRAPPER.len().max(FRIDA_LOADER.len());
-    let code_pages = ((code_size + page_size - 1) / page_size) * page_size;
+    let code_pages = code_size.div_ceil(page_size) * page_size;
     let data_size = 4 * page_size;
     let total_alloc = code_pages + data_size;
 
@@ -1133,14 +1137,16 @@ fn inject_via_bootstrapper_once(
     mem.pwrite_all(fallback_str.as_bytes(), fallback_str_addr as u64)?;
 
     // 构造 LoaderContext
-    let mut loader_ctx = RustFridaLoaderContext::default();
-    loader_ctx.ctrlfds = bootstrap_ctx.ctrlfds;
-    loader_ctx.agent_entrypoint = str_base as u64;
-    loader_ctx.agent_data = data_str_addr as u64;
-    loader_ctx.fallback_address = fallback_str_addr as u64;
-    loader_ctx.libc = loader_libc_addr as u64;
-    loader_ctx.string_table_addr = string_table_addr as u64;
-    loader_ctx.agent_current_thread_eval = current_thread_eval_str_addr as u64;
+    let mut loader_ctx = RustFridaLoaderContext {
+        ctrlfds: bootstrap_ctx.ctrlfds,
+        agent_entrypoint: str_base as u64,
+        agent_data: data_str_addr as u64,
+        fallback_address: fallback_str_addr as u64,
+        libc: loader_libc_addr as u64,
+        string_table_addr: string_table_addr as u64,
+        agent_current_thread_eval: current_thread_eval_str_addr as u64,
+        ..Default::default()
+    };
     if !resolver_module_bases.is_empty() {
         loader_ctx.resolver_module_bases = resolver_module_bases_addr as u64;
         loader_ctx.resolver_module_count = resolver_module_bases.len() as u64;
@@ -1177,9 +1183,8 @@ fn inject_via_bootstrapper_once(
     log_success!("已分离目标进程");
 
     // === Host 端 loader IPC 握手 ===
-    let result = run_loader_handshake(host_ctrl_fd, pid, loader_ctx_addr).map_err(|e| {
+    let result = run_loader_handshake(host_ctrl_fd, pid, loader_ctx_addr).inspect_err(|_| {
         unsafe { close(host_ctrl_fd) };
-        e
     })?;
 
     Ok(result)

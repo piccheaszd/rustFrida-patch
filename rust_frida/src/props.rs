@@ -31,7 +31,7 @@ fn set_selinux_context(path: &str, context: &str) {
     let ret = unsafe {
         libc::lsetxattr(
             path_cstr.as_ptr() as *const libc::c_char,
-            b"security.selinux\0".as_ptr() as *const libc::c_char,
+            c"security.selinux".as_ptr(),
             ctx_cstr.as_ptr() as *const c_void,
             ctx_cstr.len(),
             0,
@@ -471,12 +471,6 @@ fn lookup_property_context(profile_dir: &str, key: &str) -> Option<String> {
         return None;
     }
 
-    let contexts_off = u32::from_le_bytes(data[12..16].try_into().ok()?) as usize;
-    let root_off = u32::from_le_bytes(data[28..32].try_into().ok()?) as usize;
-
-    // 读取 contexts 字符串表（null-separated list）
-    let contexts_data = &data[contexts_off..];
-
     // 遍历 property_info trie 查找最佳匹配的 context
     // property_info_area_node 布局:
     //   uint32_t name_offset     +0  (相对于 context_area 起始)
@@ -639,7 +633,7 @@ fn add_prop_to_profile(profile_dir: &str, key: &str, value: &str) -> Result<(), 
 /// 沿着已有 trie 路径找到插入点，不改变任何已有节点的偏移。
 /// 分配 prop_info (short 或 long)，返回 data section 内偏移
 fn alloc_prop_info(
-    data: &mut Vec<u8>,
+    data: &mut [u8],
     data_start: usize,
     alloc_pos: &mut usize,
     data_cap: usize,
@@ -703,7 +697,7 @@ fn alloc_prop_info(
     Ok(pi_off)
 }
 
-fn insert_prop_inplace(data: &mut Vec<u8>, key: &str, value: &str) -> Result<(), String> {
+fn insert_prop_inplace(data: &mut [u8], key: &str, value: &str) -> Result<(), String> {
     let data_start = PROP_AREA_HEADER_SIZE;
     let data_cap = data.len() - data_start;
 
@@ -1104,139 +1098,4 @@ fn read_prop_info(data: &[u8], offset: usize) -> Option<(String, String)> {
         return None;
     }
     Some((name, value))
-}
-
-/// 检测文件是否有 long property 空洞
-fn has_long_prop_holes(data: &[u8]) -> bool {
-    // 如果文件中包含 "Must use __system_property" 占位符，说明有 long prop（可能已被改短）
-    find_bytes(data, b"Must use _").is_some()
-}
-
-/// 从 (key, value) 列表构建 prop_area 二进制数据
-fn build_prop_area(props: &[(String, String)]) -> Vec<u8> {
-    let area_size = 128 * 1024;
-    let mut data = vec![0u8; area_size];
-    let data_start = PROP_AREA_HEADER_SIZE;
-
-    // Header
-    data[8..12].copy_from_slice(&PROP_AREA_MAGIC.to_le_bytes());
-    data[12..16].copy_from_slice(&0xfc6ed0abu32.to_le_bytes());
-
-    // Bump allocator
-    let mut alloc_pos = 0usize;
-    let data_cap = area_size - data_start;
-
-    let mut bump = |size: usize| -> Option<usize> {
-        let aligned = (alloc_pos + 3) & !3;
-        if aligned + size > data_cap {
-            return None;
-        }
-        alloc_pos = aligned + size;
-        Some(aligned)
-    };
-
-    // 根哨兵节点 (namelen=0, 只有 children 指针有意义)
-    let root_off = bump(20).unwrap(); // offset 0, 20 bytes (namelen=0, no name data)
-                                      // root node: all zeros = namelen=0, prop=0, left=0, right=0, children=0
-
-    // 辅助: 在 data section 中读/写 u32
-    let read_u32 = |data: &[u8], off: usize| -> u32 {
-        u32::from_le_bytes(data[data_start + off..data_start + off + 4].try_into().unwrap())
-    };
-
-    // 插入每个属性到 trie
-    for (name, value) in props {
-        let parts: Vec<&str> = name.split('.').collect();
-        // 从根节点开始，逐级找/建 trie 节点
-        let mut parent_children_ptr_off = root_off + 16; // root.children 在 root_off+16
-
-        for (depth, part) in parts.iter().enumerate() {
-            let is_leaf = depth == parts.len() - 1;
-
-            // 在当前层的 BST 中查找或插入
-            let mut cur_ptr_off = parent_children_ptr_off;
-            loop {
-                let cur = read_u32(&data, cur_ptr_off);
-                if cur == 0 {
-                    // 空位，创建新节点
-                    let namelen = part.len();
-                    let node_off = match bump(20 + namelen) {
-                        Some(o) => o,
-                        None => break,
-                    };
-                    data[data_start + node_off..data_start + node_off + 4]
-                        .copy_from_slice(&(namelen as u32).to_le_bytes());
-                    data[data_start + node_off + 20..data_start + node_off + 20 + namelen]
-                        .copy_from_slice(part.as_bytes());
-                    // 写指针
-                    data[data_start + cur_ptr_off..data_start + cur_ptr_off + 4]
-                        .copy_from_slice(&(node_off as u32).to_le_bytes());
-
-                    if is_leaf {
-                        // 分配 prop_info
-                        let nbytes = name.as_bytes();
-                        if let Some(pi_off) = bump(4 + PROP_VALUE_MAX + nbytes.len() + 1) {
-                            let vb = value.as_bytes();
-                            let vlen = vb.len().min(PROP_VALUE_MAX - 1);
-                            let serial = prop_info_serial(0, vlen, false);
-                            data[data_start + pi_off..data_start + pi_off + 4].copy_from_slice(&serial.to_le_bytes());
-                            data[data_start + pi_off + 4..data_start + pi_off + 4 + vlen].copy_from_slice(&vb[..vlen]);
-                            let noff = pi_off + 4 + PROP_VALUE_MAX;
-                            data[data_start + noff..data_start + noff + nbytes.len()].copy_from_slice(nbytes);
-                            // prop 指针
-                            data[data_start + node_off + 4..data_start + node_off + 8]
-                                .copy_from_slice(&(pi_off as u32).to_le_bytes());
-                        }
-                    }
-                    parent_children_ptr_off = node_off + 16; // children
-                    break;
-                } else {
-                    // 节点存在，比较
-                    let cur_off = cur as usize;
-                    let nl = read_u32(&data, cur_off) as usize;
-                    let cur_name = &data[data_start + cur_off + 20..data_start + cur_off + 20 + nl];
-
-                    // AOSP cmp_prop_name: 先比长度，同长度再比内容
-                    let cmp = if part.len() < nl {
-                        std::cmp::Ordering::Less
-                    } else if part.len() > nl {
-                        std::cmp::Ordering::Greater
-                    } else {
-                        part.as_bytes().cmp(cur_name)
-                    };
-                    match cmp {
-                        std::cmp::Ordering::Less => cur_ptr_off = cur_off + 8,     // left
-                        std::cmp::Ordering::Greater => cur_ptr_off = cur_off + 12, // right
-                        std::cmp::Ordering::Equal => {
-                            if is_leaf {
-                                // 更新已有节点的 prop_info
-                                let nbytes = name.as_bytes();
-                                if let Some(pi_off) = bump(4 + PROP_VALUE_MAX + nbytes.len() + 1) {
-                                    let vb = value.as_bytes();
-                                    let vlen = vb.len().min(PROP_VALUE_MAX - 1);
-                                    let serial = prop_info_serial(0, vlen, false);
-                                    data[data_start + pi_off..data_start + pi_off + 4]
-                                        .copy_from_slice(&serial.to_le_bytes());
-                                    data[data_start + pi_off + 4..data_start + pi_off + 4 + vlen]
-                                        .copy_from_slice(&vb[..vlen]);
-                                    let noff = pi_off + 4 + PROP_VALUE_MAX;
-                                    data[data_start + noff..data_start + noff + nbytes.len()].copy_from_slice(nbytes);
-                                    data[data_start + cur_off + 4..data_start + cur_off + 8]
-                                        .copy_from_slice(&(pi_off as u32).to_le_bytes());
-                                }
-                            }
-                            parent_children_ptr_off = cur_off + 16; // children
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // bytes_used
-    data[0..4].copy_from_slice(&(alloc_pos as u32).to_le_bytes());
-
-    // 保持标准 PA_SIZE (128KB)，不截断，避免文件大小异常被检测
-    data
 }
