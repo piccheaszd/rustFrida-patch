@@ -360,12 +360,10 @@ pub(crate) fn spawn_and_inject(
     Ok((pid, injection))
 }
 
-/// Spawn 后恢复进程，再按 PID attach。
+/// Spawn late: 先恢复进程，再按 PID attach。
 ///
-/// 交互式 `--spawn` 没有 `-l` 时并不需要在 Application.onCreate 前就运行脚本；
-/// 如果仍在 setArgV0/setcontext 阻塞点注入，目标只有 main/Runtime worker/信号线程等
-/// 早期线程可选，容易踩到短命 ART 线程或 UI 初始化窗口。这里先完成 zymbiote ACK
-/// 与 patch 还原，等主线程回到 Looper idle 后再走普通 PID 注入路径。
+/// 这是稳定优先路径，不保证早期 hook。普通 `--spawn` 默认走这里；
+/// `--spawn -l` 或显式 `--spawn-early` 才使用 setArgV0/setcontext 阻塞点注入。
 pub(crate) fn spawn_resume_then_inject(
     package: &str,
     timeout_secs: u64,

@@ -180,13 +180,20 @@ fn main() {
         }
     }
 
+    // Spawn mode split:
+    // - `--spawn -l script.js` defaults to pre-resume injection so early hooks can
+    //   be installed before Application.onCreate()/RegisterNatives.
+    // - plain `--spawn package` defaults to late attach for a stable REPL.
+    // - `--spawn-early` and `--spawn-late` force either side explicitly.
+    let spawn_pre_resume = args.spawn.is_some() && !args.spawn_late && (args.load_script.is_some() || args.spawn_early);
+
     // 根据参数选择注入方式，返回 (target_pid, host_fd)
     let (target_pid, injection): (Option<i32>, InjectionResult) = if let Some(ref package) = args.spawn {
         // Spawn 模式：注册信号处理函数，确保 Ctrl+C 时还原 Zygote patch
         spawn::register_cleanup_handler();
         // Spawn 模式：注入 Zygote 后启动 App
         let spawn_timeout = args.timeout.unwrap_or(20).max(1);
-        let spawn_result = if args.load_script.is_some() {
+        let spawn_result = if spawn_pre_resume {
             spawn::spawn_and_inject(package, spawn_timeout, &string_overrides)
         } else {
             spawn::spawn_resume_then_inject(package, spawn_timeout, &string_overrides)
@@ -277,7 +284,7 @@ fn main() {
             log_warn!("  3. 使用 --verbose 重新运行查看详细注入日志");
             log_warn!("  4. adb logcat | grep rustFrida  （查看 agent 日志）");
             if let Some(pid) = target_pid {
-                if args.spawn.is_some() {
+                if spawn_pre_resume {
                     let _ = spawn::resume_child(pid as u32);
                 }
             }
@@ -310,9 +317,9 @@ fn main() {
         }
     }
 
-    // Spawn + -l 模式: propload → jsinit → loadjs → resume。
-    // 普通交互式 --spawn 已在 spawn_resume_then_inject() 内恢复并 attach。
-    if args.spawn.is_some() && args.load_script.is_some() {
+    // Early spawn: inject while the child is still blocked, optionally load script,
+    // then resume. Late spawn has already resumed before PID attach.
+    if spawn_pre_resume {
         if let Some(pid) = target_pid {
             if spawn::signal_received() {
                 log_info!("收到终止信号，正在清理...");
@@ -338,8 +345,9 @@ fn main() {
         }
     }
 
-    // 非 spawn 模式: --load-script 在 resume 后加载（进程已在运行）
-    if args.spawn.is_none() {
+    // Non-spawn and late spawn: --load-script runs after attach because the process
+    // is already running.
+    if args.spawn.is_none() || !spawn_pre_resume {
         if let Some(script_path) = &args.load_script {
             if let Err(e) = load_script_file(&session, script_path, false) {
                 log_error!("{}", e);

@@ -23,7 +23,10 @@ inline hook、Frida Stalker 追踪等功能。
   rustfrida --pid 1234                         # 注入到指定 PID
   rustfrida --name com.example.app             # 按进程名注入
   rustfrida --watch-so libnative.so            # 等待 SO 加载后自动注入
-  rustfrida --spawn com.example.app            # Spawn 模式：启动前注入
+  rustfrida --spawn com.example.app            # 普通 Spawn：冷启动后再按 PID attach，适合 REPL
+  rustfrida --spawn com.example.app -l early.js # Early Spawn：恢复前加载脚本，抢早期 hook
+  rustfrida --spawn com.example.app --spawn-early # 强制恢复前注入（无脚本也 early）
+  rustfrida --spawn com.example.app -l hook.js --spawn-late # 强制冷启动后加载脚本
   rustfrida --pid 1234 -l script.js            # 注入并执行 JS 脚本
   rustfrida --pid 1234 --verbose               # 显示详细注入调试信息
 
@@ -59,9 +62,17 @@ pub(crate) struct Args {
     #[arg(short = 'n', long = "name", conflicts_with = "spawn")]
     pub(crate) name: Option<String>,
 
-    /// Spawn 模式：启动 App；带 -l 时恢复前注入，确保能 hook 到 Application.onCreate() 等早期代码
+    /// Spawn 模式：不带 -l 时冷启动后再 attach；带 -l 时默认恢复前加载脚本，确保能 hook 到 Application.onCreate() 等早期代码
     #[arg(short = 'f', long = "spawn")]
     pub(crate) spawn: Option<String>,
+
+    /// Spawn early 模式：即使不带 -l，也在子进程恢复前注入（抢早期窗口，稳定性弱于 late）
+    #[arg(long = "spawn-early", requires = "spawn", conflicts_with = "spawn_late")]
+    pub(crate) spawn_early: bool,
+
+    /// Spawn late 模式：即使带 -l，也先恢复 App，等待主线程进入 Looper 后再按 PID attach（稳定优先，不保证早期 hook）
+    #[arg(long = "spawn-late", requires = "spawn", conflicts_with = "spawn_early")]
+    pub(crate) spawn_late: bool,
 
     /// 监听超时时间（秒），默认无限等待
     #[arg(short = 't', long = "timeout")]
