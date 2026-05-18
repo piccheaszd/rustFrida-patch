@@ -1,15 +1,15 @@
 #![cfg(all(target_os = "android", target_arch = "aarch64"))]
 
 use libc::{c_void, close};
+use nix::errno::Errno;
 use nix::sys::ptrace;
+use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::Pid;
 use std::mem::size_of;
 use std::os::unix::io::RawFd;
 
 use crate::proc_mem::ProcMem;
-use crate::process::{
-    attach_to_process, call_target_function, parse_proc_maps, read_memory, read_remote_mem, write_bytes, write_memory,
-};
+use crate::process::{attach_to_process, call_target_function, parse_proc_maps};
 use crate::types::{bootstrap_status, message_type, FridaBootstrapContext, FridaLibcApi, RustFridaLoaderContext};
 use crate::{log_error, log_info, log_success, log_verbose, log_warn};
 
@@ -28,6 +28,46 @@ pub(crate) const QBDI_HELPER_SO: &[u8] = include_bytes!(env!("QBDI_HELPER_SO_PAT
 // aarch64 syscall numbers
 const SYS_PIDFD_OPEN: i64 = 434;
 const SYS_PIDFD_GETFD: i64 = 438;
+const PAGE_SIZE: u64 = 4096;
+
+fn align_down(value: u64, alignment: u64) -> u64 {
+    value & !(alignment - 1)
+}
+
+fn align_up(value: u64, alignment: u64) -> u64 {
+    (value + alignment - 1) & !(alignment - 1)
+}
+
+fn padded_agent_memfd_len() -> Result<usize, String> {
+    let elf = goblin::elf::Elf::parse(AGENT_SO).map_err(|e| format!("解析 agent ELF 失败: {}", e))?;
+    let mut len = AGENT_SO.len() as u64;
+
+    for phdr in elf
+        .program_headers
+        .iter()
+        .filter(|phdr| phdr.p_type == goblin::elf::program_header::PT_LOAD && phdr.p_memsz != 0)
+    {
+        let seg_start = align_down(phdr.p_vaddr, PAGE_SIZE);
+        let seg_end = align_up(phdr.p_vaddr + phdr.p_memsz, PAGE_SIZE);
+        let file_page_start = align_down(phdr.p_offset, PAGE_SIZE);
+        let required = file_page_start + (seg_end - seg_start);
+        len = len.max(required);
+    }
+
+    usize::try_from(len).map_err(|_| "agent padded memfd 长度溢出".to_string())
+}
+
+fn mem_write_value<T>(mem: &ProcMem, addr: usize, value: &T) -> Result<(), String> {
+    let bytes = unsafe { std::slice::from_raw_parts(value as *const T as *const u8, size_of::<T>()) };
+    mem.pwrite_all(bytes, addr as u64)
+}
+
+fn mem_read_value<T: Default>(mem: &ProcMem, addr: usize) -> Result<T, String> {
+    let mut value = T::default();
+    let bytes = unsafe { std::slice::from_raw_parts_mut(&mut value as *mut T as *mut u8, size_of::<T>()) };
+    mem.pread_exact(bytes, addr as u64)?;
+    Ok(value)
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct InjectionResult {
@@ -285,9 +325,171 @@ fn find_executable_region(pid: i32, min_size: usize) -> Result<usize, String> {
     Err("未找到可用的 r-xp 区域".into())
 }
 
+fn choose_injection_thread(pid: i32) -> i32 {
+    let task_dir = format!("/proc/{}/task", pid);
+    let mut best_tid = pid;
+    let mut best_score = i32::MIN;
+
+    let entries = match std::fs::read_dir(task_dir) {
+        Ok(entries) => entries,
+        Err(_) => return pid,
+    };
+
+    for entry in entries.flatten() {
+        let tid = match entry.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) {
+            Some(tid) => tid,
+            None => continue,
+        };
+
+        let status = std::fs::read_to_string(format!("/proc/{}/task/{}/status", pid, tid)).unwrap_or_default();
+        let comm = std::fs::read_to_string(format!("/proc/{}/task/{}/comm", pid, tid)).unwrap_or_default();
+        let wchan = std::fs::read_to_string(format!("/proc/{}/task/{}/wchan", pid, tid)).unwrap_or_default();
+
+        let mut score = 0;
+        if tid == pid {
+            score -= 1000;
+        }
+        if status.contains("State:\tS") {
+            score += 100;
+        }
+        if wchan.contains("epoll") {
+            score += 80;
+        } else if wchan.contains("futex") || wchan.contains("poll") {
+            score += 50;
+        }
+        if comm.contains("LigIO")
+            || comm.contains("LightHTing")
+            || comm.contains("AsyncHTing")
+            || comm.contains("soul_im")
+            || comm.contains("RxCached")
+        {
+            score += 120;
+        }
+        if comm.contains("Signal Catcher")
+            || comm.contains("ADB-JDWP")
+            || comm.contains("perfetto")
+            || comm.contains("binder:")
+            || comm.contains("crash")
+            || comm.contains("npth")
+            || comm.contains("process reaper")
+            || comm.contains("Jit thread")
+            || comm.contains("RenderThread")
+            || comm.contains("HeapTaskDaemon")
+            || comm.contains("FinalizerDaemon")
+            || comm.contains("ReferenceQueue")
+        {
+            score -= 200;
+        }
+
+        if score > best_score {
+            best_score = score;
+            best_tid = tid;
+        }
+    }
+
+    if best_tid != pid {
+        let comm = std::fs::read_to_string(format!("/proc/{}/task/{}/comm", pid, best_tid))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let wchan = std::fs::read_to_string(format!("/proc/{}/task/{}/wchan", pid, best_tid))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        log_verbose!("注入线程候选: tid={} comm={} wchan={}", best_tid, comm, wchan);
+    }
+
+    best_tid
+}
+
+struct StopWorldSession {
+    tids: Vec<i32>,
+    active: bool,
+}
+
+impl StopWorldSession {
+    fn new(selected_tid: i32) -> Self {
+        Self {
+            tids: vec![selected_tid],
+            active: true,
+        }
+    }
+
+    fn attach_siblings(&mut self, pid: i32, selected_tid: i32) -> Result<(), String> {
+        let mut attached_count = 0usize;
+
+        for _ in 0..3 {
+            let entries = match std::fs::read_dir(format!("/proc/{}/task", pid)) {
+                Ok(entries) => entries,
+                Err(e) => return Err(format!("读取线程列表失败: {}", e)),
+            };
+            let mut changed = false;
+
+            for entry in entries.flatten() {
+                let tid = match entry.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) {
+                    Some(tid) => tid,
+                    None => continue,
+                };
+                if tid == selected_tid || self.tids.contains(&tid) {
+                    continue;
+                }
+
+                let target = Pid::from_raw(tid);
+                match ptrace::attach(target) {
+                    Ok(()) => {}
+                    Err(Errno::ESRCH) => continue,
+                    Err(e) => return Err(format!("暂停线程 {} 失败: {}", tid, e)),
+                }
+
+                match waitpid(target, None) {
+                    Ok(WaitStatus::Stopped(_, _)) => {
+                        self.tids.push(tid);
+                        attached_count += 1;
+                        changed = true;
+                    }
+                    Ok(status) => {
+                        let _ = ptrace::detach(target, None);
+                        return Err(format!("暂停线程 {} 状态异常: {:?}", tid, status));
+                    }
+                    Err(Errno::ECHILD) | Err(Errno::ESRCH) => {
+                        let _ = ptrace::detach(target, None);
+                    }
+                    Err(e) => {
+                        let _ = ptrace::detach(target, None);
+                        return Err(format!("等待线程 {} 停止失败: {}", tid, e));
+                    }
+                }
+            }
+
+            if !changed {
+                break;
+            }
+        }
+
+        log_verbose!("stop-the-world: 已暂停 {} 个其他线程", attached_count);
+        Ok(())
+    }
+
+    fn detach_all(&mut self) {
+        if !self.active {
+            return;
+        }
+        for &tid in self.tids.iter().rev() {
+            let _ = ptrace::detach(Pid::from_raw(tid), None);
+        }
+        self.active = false;
+    }
+}
+
+impl Drop for StopWorldSession {
+    fn drop(&mut self) {
+        self.detach_all();
+    }
+}
+
 /// 写入 StringTable 到预分配的内存区域（不使用 malloc）
 fn write_string_table_at(
-    pid: i32,
+    mem: &ProcMem,
     base_addr: usize,
     overrides: &std::collections::HashMap<String, String>,
 ) -> Result<usize, String> {
@@ -355,9 +557,9 @@ fn write_string_table_at(
     }
 
     // 写入 StringTable struct
-    write_bytes(pid, table_addr, &table_data)?;
+    mem.pwrite_all(&table_data, table_addr as u64)?;
     // 写入字符串数据
-    write_bytes(pid, strings_base, &strings_data)?;
+    mem.pwrite_all(&strings_data, strings_base as u64)?;
 
     Ok(table_addr)
 }
@@ -613,9 +815,22 @@ fn run_loader_handshake(ctrl_fd: RawFd, target_pid: i32, loader_ctx_addr: usize)
         }
         written += n as usize;
     }
+    let padded_len = match padded_agent_memfd_len() {
+        Ok(len) => len,
+        Err(e) => {
+            unsafe { close(agent_memfd) };
+            return Err(e);
+        }
+    };
+    if padded_len > AGENT_SO.len() {
+        if unsafe { libc::ftruncate(agent_memfd, padded_len as libc::off_t) } != 0 {
+            unsafe { close(agent_memfd) };
+            return Err(format!("扩展 agent SO memfd 失败: {}", std::io::Error::last_os_error()));
+        }
+    }
     send_fd(ctrl_fd, agent_memfd)?;
     unsafe { close(agent_memfd) };
-    log_verbose!("agent SO fd 已发送 ({} bytes)", AGENT_SO.len());
+    log_verbose!("agent SO fd 已发送 ({} bytes, padded {})", AGENT_SO.len(), padded_len);
 
     // 3. 创建 REPL socketpair 并发送一端给 loader
     //    注意：loader 先接收 agent_ctrlfd，然后才发送 READY
@@ -631,7 +846,7 @@ fn run_loader_handshake(ctrl_fd: RawFd, target_pid: i32, loader_ctx_addr: usize)
     unsafe { close(agent_repl_fd) };
     log_verbose!("REPL socketpair fd 已发送");
 
-    // 4. 等待 READY（或错误）— DEBUG 消息用于定位 READY 前断开的阶段
+    // 4. 等待 READY（或错误）— DEBUG/LOG 消息用于定位 READY 前断开的阶段
     loop {
         recv_exact(ctrl_fd, &mut msg_type)?;
         match msg_type[0] {
@@ -639,7 +854,7 @@ fn run_loader_handshake(ctrl_fd: RawFd, target_pid: i32, loader_ctx_addr: usize)
                 log_success!("Loader: agent 加载成功");
                 break;
             }
-            t if t == message_type::DEBUG => {
+            t if t == message_type::DEBUG || t == message_type::LOG => {
                 let msg = recv_loader_string(ctrl_fd)?;
                 log_verbose!("Loader debug: {}", msg);
             }
@@ -703,14 +918,56 @@ pub(crate) fn inject_via_bootstrapper(
     pid: i32,
     string_overrides: &std::collections::HashMap<String, String>,
 ) -> Result<InjectionResult, String> {
+    let mut last_err = String::new();
+
+    for attempt in 0..3 {
+        match inject_via_bootstrapper_once(pid, string_overrides) {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                let retryable = e.contains("错误码: 3")
+                    || e.contains("目标进程不存在")
+                    || e.contains("No such process")
+                    || e.contains("ESRCH");
+                last_err = e;
+
+                if !retryable || !std::path::Path::new(&format!("/proc/{}", pid)).exists() {
+                    break;
+                }
+
+                log_warn!("注入线程失效，重新选择线程重试 ({}/3): {}", attempt + 1, last_err);
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            }
+        }
+    }
+
+    Err(last_err)
+}
+
+fn inject_via_bootstrapper_once(
+    pid: i32,
+    string_overrides: &std::collections::HashMap<String, String>,
+) -> Result<InjectionResult, String> {
     log_info!("正在附加到进程 PID: {} (Frida-style bootstrapper)", pid);
 
-    // 附加到目标进程
-    attach_to_process(pid)?;
+    let trace_tid = choose_injection_thread(pid);
+    if trace_tid != pid {
+        log_verbose!("选择工作线程执行注入: tid={}", trace_tid);
+    }
+
+    // 附加到选中的目标线程
+    attach_to_process(trace_tid)?;
+    let mut stop_world = StopWorldSession::new(trace_tid);
+    stop_world.attach_siblings(pid, trace_tid)?;
+
+    let mem = ProcMem::open(pid as u32)?;
+
+    let initial_regs = match crate::process::get_registers_pub(trace_tid) {
+        Ok(regs) => regs,
+        Err(e) => return Err(e),
+    };
 
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if page_size <= 0 || (page_size & (page_size - 1)) != 0 {
-        let _ = ptrace::detach(Pid::from_raw(pid), None);
         return Err(format!("非法 page size: {}", page_size));
     }
     let page_size = page_size as usize;
@@ -725,54 +982,52 @@ pub(crate) fn inject_via_bootstrapper(
     log_verbose!("code-swap 区域: 0x{:x} ({} bytes)", swap_addr, BOOTSTRAPPER.len());
 
     // 2. 保存原始代码
-    let original_code = read_remote_mem(pid, swap_addr, BOOTSTRAPPER.len())?;
+    let mut original_code = vec![0u8; BOOTSTRAPPER.len()];
+    mem.pread_exact(&mut original_code, swap_addr as u64)?;
 
     // 3. 写入 bootstrapper
-    write_bytes(pid, swap_addr, BOOTSTRAPPER)?;
+    mem.pwrite_all(BOOTSTRAPPER, swap_addr as u64)?;
 
     // 4. 在 swap 区域旁找一块可写区域放 BootstrapContext + LibcApi
     //    用目标线程栈来存放（SP 下方有空间）
-    let regs = crate::process::get_registers_pub(pid)?;
-    let stack_ctx_addr = (regs.sp as usize - 512) & !0xF; // 16 字节对齐
+    let stack_ctx_addr = (initial_regs.sp as usize - 512) & !0xF; // 16 字节对齐
     let stack_libc_addr = stack_ctx_addr - size_of::<FridaLibcApi>();
 
     // 5. 准备 Phase 1 context: allocation_base = NULL → bootstrapper 自行 mmap
     let zero_api = FridaLibcApi::default();
-    write_memory(pid, stack_libc_addr, &zero_api)?;
+    mem_write_value(&mem, stack_libc_addr, &zero_api)?;
 
     let mut phase1_ctx = FridaBootstrapContext::default();
     phase1_ctx.allocation_base = 0; // NULL → 触发 Phase 1 mmap
     phase1_ctx.allocation_size = total_alloc as u64;
     phase1_ctx.page_size = page_size as u64;
     phase1_ctx.libc = stack_libc_addr as u64;
-    write_memory(pid, stack_ctx_addr, &phase1_ctx)?;
+    mem_write_value(&mem, stack_ctx_addr, &phase1_ctx)?;
 
     // 6. 调用 bootstrapper Phase 1（raw mmap syscall 分配内存）
     log_verbose!("bootstrapper Phase 1: mmap 分配...");
-    let status = call_target_function(pid, swap_addr, &[stack_ctx_addr], None).map_err(|e| {
+    let status = call_target_function(trace_tid, swap_addr, &[stack_ctx_addr], None).map_err(|e| {
         // 恢复原始代码后再报错
-        let _ = write_bytes(pid, swap_addr, &original_code);
-        let _ = ptrace::detach(Pid::from_raw(pid), None);
+        let _ = mem.pwrite_all(&original_code, swap_addr as u64);
         format!("bootstrapper Phase 1 失败: {}", e)
     })?;
 
     if status != bootstrap_status::ALLOCATION_SUCCESS {
-        let _ = write_bytes(pid, swap_addr, &original_code);
-        let _ = ptrace::detach(Pid::from_raw(pid), None);
+        let _ = mem.pwrite_all(&original_code, swap_addr as u64);
         return Err(format!("bootstrapper mmap 失败 (status={})", status));
     }
 
     // 读回 allocation_base
-    let phase1_result: FridaBootstrapContext = read_memory(pid, stack_ctx_addr)?;
+    let phase1_result: FridaBootstrapContext = mem_read_value(&mem, stack_ctx_addr)?;
     let alloc_base = phase1_result.allocation_base as usize;
     log_verbose!("bootstrapper 分配 RWX 区域: 0x{:x} ({} bytes)", alloc_base, total_alloc);
 
     // 7. 恢复 code-swap 区域的原始代码
-    write_bytes(pid, swap_addr, &original_code)?;
+    mem.pwrite_all(&original_code, swap_addr as u64)?;
     log_verbose!("code-swap 区域已恢复");
 
     // === 阶段 1: 在新分配的区域执行 bootstrapper Phase 2 ===
-    write_bytes(pid, alloc_base, BOOTSTRAPPER)?;
+    mem.pwrite_all(BOOTSTRAPPER, alloc_base as u64)?;
     log_verbose!("bootstrapper 写入完成 ({} bytes)", BOOTSTRAPPER.len());
 
     let data_base = alloc_base + code_pages;
@@ -780,7 +1035,7 @@ pub(crate) fn inject_via_bootstrapper(
     let ctx_addr = libc_api_addr + size_of::<FridaLibcApi>();
 
     let zero_api = FridaLibcApi::default();
-    write_memory(pid, libc_api_addr, &zero_api)?;
+    mem_write_value(&mem, libc_api_addr, &zero_api)?;
 
     let mut bootstrap_ctx = FridaBootstrapContext::default();
     bootstrap_ctx.allocation_base = alloc_base as u64; // 非 NULL → Phase 2
@@ -788,39 +1043,33 @@ pub(crate) fn inject_via_bootstrapper(
     bootstrap_ctx.page_size = page_size as u64;
     bootstrap_ctx.enable_ctrlfds = 1;
     bootstrap_ctx.libc = libc_api_addr as u64;
-    write_memory(pid, ctx_addr, &bootstrap_ctx)?;
+    mem_write_value(&mem, ctx_addr, &bootstrap_ctx)?;
 
     log_verbose!("调用 bootstrapper Phase 2...");
-    let status = call_target_function(pid, alloc_base, &[ctx_addr], None).map_err(|e| {
-        let _ = ptrace::detach(Pid::from_raw(pid), None);
-        format!("bootstrapper Phase 2 失败: {}", e)
-    })?;
+    let status = call_target_function(trace_tid, alloc_base, &[ctx_addr], None)
+        .map_err(|e| format!("bootstrapper Phase 2 失败: {}", e))?;
 
     match status {
         s if s == bootstrap_status::SUCCESS => {
             log_success!("bootstrapper 完成: libc API 已解析");
         }
         s if s == bootstrap_status::AUXV_NOT_FOUND => {
-            let _ = ptrace::detach(Pid::from_raw(pid), None);
             return Err("bootstrapper: 未找到 /proc/self/auxv".into());
         }
         s if s == bootstrap_status::TOO_EARLY => {
-            let _ = ptrace::detach(Pid::from_raw(pid), None);
             return Err("bootstrapper: libc 尚未加载（TOO_EARLY）".into());
         }
         s if s == bootstrap_status::LIBC_UNSUPPORTED => {
-            let _ = ptrace::detach(Pid::from_raw(pid), None);
             return Err("bootstrapper: libc API 不完整".into());
         }
         s => {
-            let _ = ptrace::detach(Pid::from_raw(pid), None);
             return Err(format!("bootstrapper 返回未知状态: {}", s));
         }
     }
 
     // 读回结果
-    let bootstrap_ctx: FridaBootstrapContext = read_memory(pid, ctx_addr)?;
-    let libc_api: FridaLibcApi = read_memory(pid, libc_api_addr)?;
+    let bootstrap_ctx: FridaBootstrapContext = mem_read_value(&mem, ctx_addr)?;
+    let libc_api: FridaLibcApi = mem_read_value(&mem, libc_api_addr)?;
 
     log_verbose!("rtld_flavor: {}", bootstrap_ctx.rtld_flavor);
     log_verbose!("ctrlfds: [{}, {}]", bootstrap_ctx.ctrlfds[0], bootstrap_ctx.ctrlfds[1]);
@@ -842,7 +1091,7 @@ pub(crate) fn inject_via_bootstrapper(
         + size_of::<FridaLibcApi>()
         + 256; // 预留字符串区
     let string_table_base = data_base + string_table_offset;
-    let string_table_addr = write_string_table_at(pid, string_table_base, string_overrides)?;
+    let string_table_addr = write_string_table_at(&mem, string_table_base, string_overrides)?;
     log_verbose!("StringTable 写入: 0x{:x}", string_table_addr);
 
     let resolver_module_bases = collect_resolver_module_bases(pid)?;
@@ -852,7 +1101,7 @@ pub(crate) fn inject_via_bootstrapper(
         for base in &resolver_module_bases {
             resolver_module_bytes.extend_from_slice(&base.to_le_bytes());
         }
-        write_bytes(pid, resolver_module_bases_addr, &resolver_module_bytes)?;
+        mem.pwrite_all(&resolver_module_bytes, resolver_module_bases_addr as u64)?;
     }
     log_verbose!(
         "resolver host modules: {} @ 0x{:x}",
@@ -861,7 +1110,7 @@ pub(crate) fn inject_via_bootstrapper(
     );
 
     // === 阶段 2: 写入 + 执行 loader ===
-    write_bytes(pid, alloc_base, FRIDA_LOADER)?;
+    mem.pwrite_all(FRIDA_LOADER, alloc_base as u64)?;
     log_verbose!("loader 写入完成 ({} bytes)", FRIDA_LOADER.len());
 
     // Loader 数据区（复用 data_base 后面的区域）
@@ -875,13 +1124,13 @@ pub(crate) fn inject_via_bootstrapper(
     let current_thread_eval_str = b"rustfrida_loadjs_current_thread\0";
     let data_str = b"\0";
     let fallback_str = format!("\x00rustfrida-{}\0", pid); // abstract socket: \0 prefix
-    write_bytes(pid, str_base, entrypoint_str)?;
+    mem.pwrite_all(entrypoint_str, str_base as u64)?;
     let current_thread_eval_str_addr = str_base + entrypoint_str.len();
-    write_bytes(pid, current_thread_eval_str_addr, current_thread_eval_str)?;
+    mem.pwrite_all(current_thread_eval_str, current_thread_eval_str_addr as u64)?;
     let data_str_addr = current_thread_eval_str_addr + current_thread_eval_str.len();
-    write_bytes(pid, data_str_addr, data_str)?;
+    mem.pwrite_all(data_str, data_str_addr as u64)?;
     let fallback_str_addr = data_str_addr + data_str.len();
-    write_bytes(pid, fallback_str_addr, fallback_str.as_bytes())?;
+    mem.pwrite_all(fallback_str.as_bytes(), fallback_str_addr as u64)?;
 
     // 构造 LoaderContext
     let mut loader_ctx = RustFridaLoaderContext::default();
@@ -896,22 +1145,21 @@ pub(crate) fn inject_via_bootstrapper(
         loader_ctx.resolver_module_bases = resolver_module_bases_addr as u64;
         loader_ctx.resolver_module_count = resolver_module_bases.len() as u64;
     }
-    write_memory(pid, loader_ctx_addr, &loader_ctx)?;
+    mem_write_value(&mem, loader_ctx_addr, &loader_ctx)?;
 
     // 写入 LibcApi（给 loader 用）
-    write_memory(pid, loader_libc_addr, &libc_api)?;
+    mem_write_value(&mem, loader_libc_addr, &libc_api)?;
 
     // 调用 loader（执行 raw clone 后立即返回）
     log_verbose!("调用 loader...");
-    let _ = call_target_function(pid, alloc_base, &[loader_ctx_addr], None).map_err(|e| {
+    let _ = call_target_function(trace_tid, alloc_base, &[loader_ctx_addr], None).map_err(|e| {
         unsafe { close(host_ctrl_fd) };
-        let _ = ptrace::detach(Pid::from_raw(pid), None);
         format!("loader 执行失败: {}", e)
     })?;
 
     // === 分离前验证寄存器状态 ===
     {
-        let final_regs = crate::process::get_registers_pub(pid);
+        let final_regs = crate::process::get_registers_pub(trace_tid);
         if let Ok(r) = final_regs {
             log_verbose!(
                 "分离前寄存器: PC={:#x} SP={:#x} LR={:#x} FP(x29)={:#x} x19={:#x}",
@@ -925,11 +1173,8 @@ pub(crate) fn inject_via_bootstrapper(
     }
 
     // === ptrace 分离 ===
-    if let Err(e) = ptrace::detach(Pid::from_raw(pid), None) {
-        log_error!("分离目标进程失败: {}", e);
-    } else {
-        log_success!("已分离目标进程");
-    }
+    stop_world.detach_all();
+    log_success!("已分离目标进程");
 
     // === Host 端 loader IPC 握手 ===
     let result = run_loader_handshake(host_ctrl_fd, pid, loader_ctx_addr).map_err(|e| {

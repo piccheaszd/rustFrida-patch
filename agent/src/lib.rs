@@ -47,15 +47,9 @@ use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
-// hide_soinfo.c 中的调试结果函数（.init_array 构造函数填充）
-// 通过 Rust #[no_mangle] 重导出到动态符号表，供 host 端 dlsym 查询
-extern "C" {
-    fn get_hide_result() -> *const c_void;
-}
-
 #[no_mangle]
 pub extern "C" fn rust_get_hide_result() -> *const c_void {
-    unsafe { get_hide_result() }
+    null_mut()
 }
 
 // 定义我们自己的Result类型，错误统一为String

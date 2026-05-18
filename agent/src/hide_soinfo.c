@@ -242,7 +242,18 @@ typedef const char *(*get_path_fn)(void *);
 typedef void *(*get_head_fn)(void);
 typedef void (*remove_soinfo_fn)(void *);
 
+/*
+ * The current rustFrida injection path uses our in-process ELF linker instead
+ * of Android's dlopen(). Such modules are never inserted into linker's soinfo
+ * list, so running this as an .init_array constructor is both unnecessary and
+ * unsafe on apps with hardened linker/crash instrumentation.
+ *
+ * Keep the implementation available for explicit diagnostics/experiments, but
+ * do not run it automatically unless the build opts in.
+ */
+#ifdef RUSTFRIDA_ENABLE_SOINfo_CONSTRUCTOR
 __attribute__((constructor))
+#endif
 static void hide_from_solist(void) {
     g_hide_result.next_offset = -1;
 

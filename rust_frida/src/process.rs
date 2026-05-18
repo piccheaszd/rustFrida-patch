@@ -12,7 +12,7 @@ use std::path::Path;
 use std::process;
 
 use crate::types::{UserFpRegs, UserRegs};
-use crate::{log_info, log_success, log_warn};
+use crate::{log_info, log_success, log_verbose, log_warn};
 
 /// 获取指定库的基址
 ///
@@ -382,6 +382,10 @@ pub(crate) fn call_target_function(
                 } else {
                     return Err("多次 SIGSTOP 中断，无法执行目标函数".to_string());
                 }
+            }
+            WaitStatus::Stopped(_, Signal::SIGCHLD) => {
+                log_verbose!("远程调用期间收到 SIGCHLD，跳过并继续");
+                continue;
             }
             WaitStatus::Stopped(_, sig) => {
                 let regs = get_registers(pid).ok();
