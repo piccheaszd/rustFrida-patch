@@ -59,7 +59,7 @@ pub(crate) struct Args {
     #[arg(short = 'n', long = "name", conflicts_with = "spawn")]
     pub(crate) name: Option<String>,
 
-    /// Spawn 模式：启动 App 前注入，确保能 hook 到 Application.onCreate() 等早期代码
+    /// Spawn 模式：启动 App；带 -l 时恢复前注入，确保能 hook 到 Application.onCreate() 等早期代码
     #[arg(short = 'f', long = "spawn")]
     pub(crate) spawn: Option<String>,
 

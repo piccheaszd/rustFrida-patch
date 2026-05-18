@@ -53,7 +53,9 @@ pub(super) unsafe fn extract_bytes(ctx: *mut ffi::JSContext, val: JSValue) -> Re
     }
 
     if ffi::JS_IsArray(ctx, val.raw()) != 0 {
-        let len_val_raw = ffi::qjs_get_property(ctx, val.raw(), ffi::JS_NewAtom(ctx, b"length\0".as_ptr() as *const _));
+        let length_atom = ffi::JS_NewAtom(ctx, b"length\0".as_ptr() as *const _);
+        let len_val_raw = ffi::qjs_get_property(ctx, val.raw(), length_atom);
+        ffi::JS_FreeAtom(ctx, length_atom);
         let len_val = JSValue(len_val_raw);
         let len_i = len_val.to_i64(ctx).unwrap_or(0);
         len_val.free(ctx);

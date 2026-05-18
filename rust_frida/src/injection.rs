@@ -343,11 +343,12 @@ fn choose_injection_thread(pid: i32) -> i32 {
 
         let status = std::fs::read_to_string(format!("/proc/{}/task/{}/status", pid, tid)).unwrap_or_default();
         let comm = std::fs::read_to_string(format!("/proc/{}/task/{}/comm", pid, tid)).unwrap_or_default();
+        let comm = comm.trim();
         let wchan = std::fs::read_to_string(format!("/proc/{}/task/{}/wchan", pid, tid)).unwrap_or_default();
 
         let mut score = 0;
         if tid == pid {
-            score -= 1000;
+            score -= 500;
         }
         if status.contains("State:\tS") {
             score += 100;
@@ -365,20 +366,8 @@ fn choose_injection_thread(pid: i32) -> i32 {
         {
             score += 120;
         }
-        if comm.contains("Signal Catcher")
-            || comm.contains("ADB-JDWP")
-            || comm.contains("perfetto")
-            || comm.contains("binder:")
-            || comm.contains("crash")
-            || comm.contains("npth")
-            || comm.contains("process reaper")
-            || comm.contains("Jit thread")
-            || comm.contains("RenderThread")
-            || comm.contains("HeapTaskDaemon")
-            || comm.contains("FinalizerDaemon")
-            || comm.contains("ReferenceQueue")
-        {
-            score -= 200;
+        if is_risky_injection_thread(comm) {
+            score -= 10_000;
         }
 
         if score > best_score {
@@ -400,6 +389,33 @@ fn choose_injection_thread(pid: i32) -> i32 {
     }
 
     best_tid
+}
+
+fn is_risky_injection_thread(comm: &str) -> bool {
+    const RISKY_NAMES: &[&str] = &[
+        "Runtime worker",
+        "Signal Catcher",
+        "ADB-JDWP",
+        "JDWP",
+        "perfetto",
+        "binder:",
+        "HwBinder:",
+        "crash",
+        "npth",
+        "process reaper",
+        "Jit thread",
+        "Jit thread pool",
+        "RenderThread",
+        "HeapTaskDaemon",
+        "FinalizerDaemon",
+        "FinalizerWatchd",
+        "ReferenceQueue",
+        "Compiler",
+        "Chrome_",
+        "GpuWatchdog",
+    ];
+
+    RISKY_NAMES.iter().any(|name| comm.contains(name))
 }
 
 struct StopWorldSession {

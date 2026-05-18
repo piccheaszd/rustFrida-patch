@@ -186,7 +186,12 @@ fn main() {
         spawn::register_cleanup_handler();
         // Spawn 模式：注入 Zygote 后启动 App
         let spawn_timeout = args.timeout.unwrap_or(20).max(1);
-        match spawn::spawn_and_inject(package, spawn_timeout, &string_overrides) {
+        let spawn_result = if args.load_script.is_some() {
+            spawn::spawn_and_inject(package, spawn_timeout, &string_overrides)
+        } else {
+            spawn::spawn_resume_then_inject(package, spawn_timeout, &string_overrides)
+        };
+        match spawn_result {
             Ok((pid, result)) => (Some(pid), result),
             Err(e) => {
                 log_error!("Spawn 注入失败: {}", e);
@@ -305,8 +310,9 @@ fn main() {
         }
     }
 
-    // Spawn 模式: propload → jsinit → loadjs → resume
-    if let Some(ref _package) = args.spawn {
+    // Spawn + -l 模式: propload → jsinit → loadjs → resume。
+    // 普通交互式 --spawn 已在 spawn_resume_then_inject() 内恢复并 attach。
+    if args.spawn.is_some() && args.load_script.is_some() {
         if let Some(pid) = target_pid {
             if spawn::signal_received() {
                 log_info!("收到终止信号，正在清理...");
@@ -323,6 +329,11 @@ fn main() {
             // resume: hook 已就位，恢复子进程
             if let Err(e) = spawn::resume_child(pid as u32) {
                 log_error!("恢复子进程失败: {}", e);
+            } else {
+                // 子进程刚恢复时 Android 往往仍处于 bindApplication / 首帧窗口初始化。
+                // 管道输入会在提示符出现后立刻发送 jsinit/loadjs，过早进入 QuickJS
+                // 或主线程 eval 会撞上 ART/UI 初始化竞态；等主线程回到 Looper idle。
+                spawn::wait_for_repl_ready(pid);
             }
         }
     }

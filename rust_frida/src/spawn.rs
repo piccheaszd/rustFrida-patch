@@ -14,6 +14,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::injection::{inject_via_bootstrapper, InjectionResult};
 use crate::proc_mem::ProcMem;
@@ -25,6 +26,9 @@ const ZYMBIOTE_ELF: &[u8] = include_bytes!("../../zymbiote/build/zymbiote.elf");
 
 /// ACK 字节
 const ACK_BYTE: u8 = 0x42;
+const SPAWN_REPL_READY_MIN_WAIT: Duration = Duration::from_millis(750);
+const SPAWN_REPL_READY_TIMEOUT: Duration = Duration::from_secs(5);
+const SPAWN_REPL_READY_POLL: Duration = Duration::from_millis(100);
 
 /// Spawn hello 消息
 #[derive(Debug, Clone)]
@@ -303,6 +307,29 @@ fn spawn_and_wait_hello(package: &str, timeout_secs: u64) -> Result<SpawnHello, 
     Ok(hello)
 }
 
+pub(crate) fn wait_for_repl_ready(pid: i32) {
+    let start = Instant::now();
+    loop {
+        let elapsed = start.elapsed();
+        if elapsed >= SPAWN_REPL_READY_TIMEOUT {
+            break;
+        }
+
+        let status = std::fs::read_to_string(format!("/proc/{}/task/{}/status", pid, pid)).unwrap_or_default();
+        if status.is_empty() {
+            break;
+        }
+        let wchan = std::fs::read_to_string(format!("/proc/{}/task/{}/wchan", pid, pid)).unwrap_or_default();
+        let main_sleeping = status.contains("State:\tS") || status.contains("State:\tI");
+        let looper_idle = wchan.contains("epoll") || wchan.contains("poll");
+        if elapsed >= SPAWN_REPL_READY_MIN_WAIT && main_sleeping && looper_idle {
+            break;
+        }
+
+        std::thread::sleep(SPAWN_REPL_READY_POLL);
+    }
+}
+
 /// Spawn 注入主入口
 pub(crate) fn spawn_and_inject(
     package: &str,
@@ -330,6 +357,33 @@ pub(crate) fn spawn_and_inject(
     // 6. 不立即恢复子进程 — 由 main.rs 在脚本加载完成后调用 resume_child
     //    子进程主线程仍阻塞在 zymbiote recv(ACK)，agent 线程可独立工作
 
+    Ok((pid, injection))
+}
+
+/// Spawn 后恢复进程，再按 PID attach。
+///
+/// 交互式 `--spawn` 没有 `-l` 时并不需要在 Application.onCreate 前就运行脚本；
+/// 如果仍在 setArgV0/setcontext 阻塞点注入，目标只有 main/Runtime worker/信号线程等
+/// 早期线程可选，容易踩到短命 ART 线程或 UI 初始化窗口。这里先完成 zymbiote ACK
+/// 与 patch 还原，等主线程回到 Looper idle 后再走普通 PID 注入路径。
+pub(crate) fn spawn_resume_then_inject(
+    package: &str,
+    timeout_secs: u64,
+    string_overrides: &HashMap<String, String>,
+) -> Result<(i32, InjectionResult), String> {
+    log_info!("Spawn 模式: 启动并在应用就绪后注入 {}", package);
+
+    let hello = spawn_and_wait_hello(package, timeout_secs)?;
+    let pid = hello.pid as i32;
+
+    if let Err(e) = resume_child(hello.pid) {
+        return Err(format!("恢复子进程 {} 失败: {}", pid, e));
+    }
+
+    wait_for_repl_ready(pid);
+
+    log_info!("正在向已恢复的子进程 {} 注入 agent...", pid);
+    let injection = inject_via_bootstrapper(pid, string_overrides)?;
     Ok((pid, injection))
 }
 
