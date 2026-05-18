@@ -56,6 +56,27 @@ cargo build -p rust_frida --release
 
 rustfrida 内嵌了 `bootstrapper.bin` + `rustfrida-loader.bin` + `libagent.so`，是一个自包含的单文件。
 
+### 2026-05-18 upstream 同步说明
+
+本分支已合入 upstream `v0.0.4` 的 PID attach 稳定性修复，并保留本分支的 spawn/wxshadow/QuickJS 修复。相关点需要一起理解：
+
+- PID 注入会优先选择更适合远程调用的工作线程，并在 bootstrap/loader 执行期间短暂停止同进程其他线程，降低主线程或信号线程干扰。
+- host 侧通过 `/proc/<pid>/mem` 批量读写上下文，减少 ptrace word-write 的不稳定窗口。
+- agent memfd 会按 ELF LOAD 段的 `p_memsz` 进行 padding，loader 将完整段映射为文件支撑 VMA，避免单独匿名 BSS 尾段。
+- 自解析 linker 只索引必要平台模块，并继续使用本分支传入的 resolver host module bases，避免在加固 app 中扫描所有 app `.so`。
+- 当前 loader 同时兼容 `DEBUG`/`LOG` 诊断消息；协议值保持一致，避免破坏旧 host/loader 握手。
+
+合并后验证过的 smoke：
+
+```bash
+python3 loader/build_helpers.py
+cargo build -p agent --release
+cargo build -p rust_frida --release
+printf 'jsinit\njseval 1+1\nexit\n' | adb shell su -c '/data/local/tmp/rf --spawn com.coloros.note --verbose'
+```
+
+预期结果是 agent 连接成功，`jsinit` 返回 `=> initialized`，`jseval 1+1` 返回 `=> 2`，退出时 zygote patch 和 QuickJS cleanup 正常完成。
+
 ### 可选组件（单独构建）
 
 这些不在 default-members 里，按需构建：
