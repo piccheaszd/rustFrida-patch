@@ -1458,8 +1458,10 @@ Memory.flushCodeCache(code, 16);
 | --- | --- | --- | --- |
 | `Memory.protect(addr, size, "rwx")` | 任意 | — | 改页权限（页级 mprotect） |
 | `p.writeBytes(bytes, 0)` 默认 | 可写段 | 可见 | 覆盖 N 字节（数据/结构体） |
-| `p.writeBytes(bytes, 1)` | r-x | 不可见 | wxshadow 覆盖 N 字节（短 patch，单页内） |
+| `p.writeBytes(bytes, 1)` | r-x | 不可见 | wxshadow 覆盖 N 字节（短 patch，可跨页） |
 | `p.writest(bytes)` | r-x | 不可见 | 1 条指令 → N 条指令替换（PC-rel 自动 relocate） |
+
+`writeBytes(bytes, 1)` 由 wxshadow KPM 在内核侧完成 dcache/icache 维护；用户态不要再对 execute-only shadow 映射补做 clear-cache，否则部分内核会在 fault path 中卡住。
 
 `unhook(addr)` 统一清理 hook / writest / writeBytes(1) 留下的 patch。
 

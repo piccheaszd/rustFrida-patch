@@ -200,7 +200,10 @@ pub(super) unsafe extern "C" fn memory_write_bytes(
                     let msg = format!("writeBytes(stealth=1): first-page rc={}, second 已回滚\0", rc1);
                     return ffi::JS_ThrowInternalError(ctx, b"%s\0".as_ptr() as *const _, msg.as_ptr());
                 }
-                ffi::hook::hook_flush_cache(addr as *mut _, len);
+                // wxshadow does kernel-side dcache/icache maintenance before
+                // returning. Do not clear-cache through the user VA here: the
+                // page is execute-only after activation and user-side cache
+                // maintenance can spin in the fault path on some kernels.
                 track_wxshadow_addr(addr);
                 track_wxshadow_addr(second_addr);
             } else {
@@ -213,7 +216,8 @@ pub(super) unsafe extern "C" fn memory_write_bytes(
                     let msg = format!("writeBytes(stealth=1): wxshadow_patch rc={}\0", rc);
                     return ffi::JS_ThrowInternalError(ctx, b"%s\0".as_ptr() as *const _, msg.as_ptr());
                 }
-                ffi::hook::hook_flush_cache(addr as *mut _, len);
+                // See the cross-page branch above: the KPM owns cache
+                // maintenance for execute-only shadow mappings.
                 track_wxshadow_addr(addr);
             }
             JSValue::undefined().raw()
