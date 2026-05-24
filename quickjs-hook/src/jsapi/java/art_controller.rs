@@ -18,7 +18,7 @@
 
 use crate::ffi::hook as hook_ffi;
 use crate::jsapi::console::output_verbose;
-use crate::jsapi::module::{libart_dlsym, module_dlsym};
+use crate::jsapi::module::{libart_dlsym, libart_find_symbol_contains, module_dlsym};
 use crate::jsapi::util::{proc_maps_entries, read_proc_self_maps};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -1633,7 +1633,6 @@ struct SigchainAction {
     sc_flags: u64,
 }
 
-static IMPLICIT_SUSPEND_GUARD_INSTALLED: AtomicBool = AtomicBool::new(false);
 static IMPLICIT_SUSPEND_ENTRYPOINT: AtomicU64 = AtomicU64::new(0);
 static IMPLICIT_SUSPEND_TRIGGER_OFFSET: AtomicU64 = AtomicU64::new(INVALID_THREAD_OFFSET);
 static IMPLICIT_SUSPEND_THREAD_CURRENT: AtomicU64 = AtomicU64::new(0);
@@ -1755,29 +1754,14 @@ unsafe fn try_handle_managed_implicit_suspend(
     true
 }
 
-unsafe extern "C" fn managed_implicit_suspend_sigsegv_handler(
-    sig: libc::c_int,
-    info: *mut libc::siginfo_t,
-    context: *mut libc::c_void,
-) -> bool {
-    try_handle_managed_implicit_suspend(sig, info, context)
-}
-
 unsafe fn install_managed_implicit_suspend_guard(spec: &ArtThreadSpec) {
-    if IMPLICIT_SUSPEND_GUARD_INSTALLED.swap(true, Ordering::SeqCst) {
-        return;
-    }
-
-    let add = module_dlsym("libsigchain.so", "AddSpecialSignalHandlerFn");
-    let ensure_front = module_dlsym("libsigchain.so", "EnsureFrontOfChain");
     let entry = libart_dlsym("art_quick_implicit_suspend") as u64;
     let thread_current = libart_dlsym("_ZN3art6Thread7CurrentEv") as u64;
-    if add.is_null() || entry == 0 {
+    if entry == 0 {
         output_verbose(&format!(
-            "[artController] implicit suspend guard 跳过: AddSpecialSignalHandlerFn={:#x}, art_quick_implicit_suspend={:#x}",
-            add as u64, entry
+            "[artController] implicit suspend guard 跳过: art_quick_implicit_suspend={:#x}",
+            entry
         ));
-        IMPLICIT_SUSPEND_GUARD_INSTALLED.store(false, Ordering::SeqCst);
         return;
     }
 
@@ -1785,25 +1769,16 @@ unsafe fn install_managed_implicit_suspend_guard(spec: &ArtThreadSpec) {
     IMPLICIT_SUSPEND_TRIGGER_OFFSET.store(spec.suspend_trigger_offset as u64, Ordering::Relaxed);
     IMPLICIT_SUSPEND_THREAD_CURRENT.store(thread_current, Ordering::Relaxed);
 
-    let mut action: SigchainAction = std::mem::zeroed();
-    action.sc_sigaction = Some(managed_implicit_suspend_sigsegv_handler);
-    libc::sigemptyset(&mut action.sc_mask);
-    action.sc_flags = 0;
-
-    type AddSpecialSignalHandlerFn = unsafe extern "C" fn(libc::c_int, *mut SigchainAction);
-    let add_fn: AddSpecialSignalHandlerFn = std::mem::transmute(add);
-    add_fn(libc::SIGSEGV, &mut action as *mut SigchainAction);
-
-    if !ensure_front.is_null() {
-        type EnsureFrontOfChainFn = unsafe extern "C" fn(libc::c_int);
-        let ensure_front_fn: EnsureFrontOfChainFn = std::mem::transmute(ensure_front);
-        ensure_front_fn(libc::SIGSEGV);
-    }
-
     output_verbose(&format!(
-        "[artController] implicit suspend guard 已安装: entry={:#x}, thread_current={:#x}, suspend_trigger_offset={}",
+        "[artController] implicit suspend guard 已配置: entry={:#x}, thread_current={:#x}, suspend_trigger_offset={} (复用 WalkStack SIGSEGV guard)",
         entry, thread_current, spec.suspend_trigger_offset
     ));
+}
+
+unsafe fn uninstall_managed_implicit_suspend_guard() {
+    IMPLICIT_SUSPEND_ENTRYPOINT.store(0, Ordering::Relaxed);
+    IMPLICIT_SUSPEND_TRIGGER_OFFSET.store(INVALID_THREAD_OFFSET, Ordering::Relaxed);
+    IMPLICIT_SUSPEND_THREAD_CURRENT.store(0, Ordering::Relaxed);
 }
 
 unsafe extern "C" fn walkstack_sigsegv_handler(
@@ -1916,6 +1891,18 @@ unsafe extern "C" fn on_decode_gc_masks_only_enter(ctx: *mut hook_ffi::HookConte
     }
 }
 
+unsafe fn find_decode_gc_masks_only_entry() -> u64 {
+    if let Some((name, addr)) = libart_find_symbol_contains("DecodeGcMasksOnly") {
+        output_verbose(&format!(
+            "[artController] DecodeGcMasksOnly symbol wildcard hit: {} @ {:#x}",
+            name, addr
+        ));
+        return addr;
+    }
+
+    0
+}
+
 unsafe fn find_decode_gc_masks_only_header_load() -> u64 {
     // Android 16 / API 36 libart DecodeGcMasksOnly prologue through the first
     // OatQuickMethodHeader load. Keep the prologue in the signature; the tail
@@ -1955,29 +1942,30 @@ unsafe fn find_decode_gc_masks_only_header_load() -> u64 {
 }
 
 unsafe fn install_decode_gc_masks_only_null_guard() -> u64 {
-    let target = find_decode_gc_masks_only_header_load();
-    if target == 0 {
+    let load_target = find_decode_gc_masks_only_header_load();
+    if load_target == 0 {
         output_verbose("[artController] DecodeGcMasksOnly NULL guard 跳过: pattern not found");
         return 0;
     }
 
+    let (ha, sf) = prepare_hook_target(load_target, std::ptr::null_mut()).unwrap_or((load_target, 0));
     let ret = hook_ffi::hook_attach(
-        target as *mut std::ffi::c_void,
+        ha as *mut std::ffi::c_void,
         Some(on_decode_gc_masks_only_enter),
         None,
         std::ptr::null_mut(),
-        0,
+        sf,
     );
     if ret == 0 {
         output_verbose(&format!(
-            "[artController] DecodeGcMasksOnly NULL guard 安装成功: load={:#x}",
-            target
+            "[artController] DecodeGcMasksOnly NULL guard 安装成功: load={:#x} (hooked={:#x})",
+            load_target, ha
         ));
-        target
+        ha
     } else {
         output_verbose(&format!(
             "[artController] DecodeGcMasksOnly NULL guard 安装失败: load={:#x}, ret={}",
-            target, ret
+            load_target, ret
         ));
         0
     }
@@ -2025,6 +2013,42 @@ unsafe fn install_walkstack_sigsegv_guard() {
             std::io::Error::last_os_error()
         ));
         WALKSTACK_GUARD_INSTALLED.store(false, Ordering::SeqCst);
+    }
+}
+
+unsafe fn uninstall_walkstack_sigsegv_guard() {
+    let installed = WALKSTACK_GUARD_INSTALLED.swap(false, Ordering::SeqCst);
+    let using_sigchain = WALKSTACK_GUARD_USING_SIGCHAIN.swap(false, Ordering::SeqCst);
+
+    if using_sigchain {
+        let remove = module_dlsym("libsigchain.so", "RemoveSpecialSignalHandlerFn");
+        if !remove.is_null() {
+            type RemoveSpecialSignalHandlerFn = unsafe extern "C" fn(
+                libc::c_int,
+                unsafe extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) -> bool,
+            );
+            let remove_fn: RemoveSpecialSignalHandlerFn = std::mem::transmute(remove);
+            remove_fn(libc::SIGSEGV, walkstack_sigchain_handler);
+            output_verbose("[artController] WalkStack SIGSEGV guard 已卸载 (libsigchain)");
+        } else {
+            output_verbose("[artController] WalkStack SIGSEGV guard 卸载失败: RemoveSpecialSignalHandlerFn not found");
+        }
+        return;
+    }
+
+    if !installed {
+        return;
+    }
+
+    let ret = bionic_sigaction(libc::SIGSEGV, &PREV_SIGSEGV_ACTION, std::ptr::null_mut());
+    if ret == 0 {
+        PREV_SIGSEGV_ACTION = std::mem::zeroed();
+        output_verbose("[artController] WalkStack SIGSEGV guard 已卸载");
+    } else {
+        output_verbose(&format!(
+            "[artController] WalkStack SIGSEGV guard 卸载失败: {}",
+            std::io::Error::last_os_error()
+        ));
     }
 }
 
@@ -2170,6 +2194,8 @@ pub fn cut_art_controller_walkstack_guards() {
         if restored > 0 {
             output_verbose(&format!("[artController] 恢复 {} 个内联 OAT patch", restored));
         }
+        uninstall_walkstack_sigsegv_guard();
+        uninstall_managed_implicit_suspend_guard();
     }
 }
 

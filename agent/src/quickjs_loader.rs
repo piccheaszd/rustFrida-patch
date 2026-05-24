@@ -391,6 +391,62 @@ pub fn cleanup() {
 
 // 注：full cleanup 在 callback/exec 两套计数都归零后同步 munmap hook pool/recomp 页。
 
+/// Agent unload path for hot managed hooks.
+///
+/// Cut hook entry points, wait until callback/thunk/managed-helper counters all
+/// drain to zero, then free JS-facing resources. Keep ART guards and executable
+/// pools mapped because ART may still keep historical quick-code PCs in metadata.
+pub fn cleanup_for_unload_leak_safe() {
+    use std::time::Instant;
+    let t0 = Instant::now();
+    let mut t = t0;
+    let stage = |label: &str, prev: &mut Instant| {
+        let now = Instant::now();
+        let delta = now.duration_since(*prev).as_millis();
+        let total = now.duration_since(t0).as_millis();
+        log_msg(format!("[quickjs] {} (+{}ms, total {}ms)\n", label, delta, total));
+        *prev = now;
+    };
+
+    stage("cleanup start (managed-safe unload)", &mut t);
+    ENGINE_INITIALIZED.store(false, Ordering::SeqCst);
+    quickjs_hook::recomp::set_cleanup_release_only(true);
+    crate::recompiler::release_all();
+    stage("phase1 release_all_recomp", &mut t);
+
+    cut_java_hooks();
+    stage("phase1 cut_java_hooks", &mut t);
+    cut_native_hooks();
+    stage("phase1 cut_native_hooks", &mut t);
+    cut_art_controller_routing_hooks();
+    stage("phase1 cut_art_controller_routing", &mut t);
+
+    let _drained = drain_thunk_in_flight();
+    stage("phase2 drain_thunk_in_flight", &mut t);
+
+    crate::recompiler::release_all();
+    stage("phase3 release_all_recomp", &mut t);
+
+    free_java_hooks();
+    stage("phase3 free_java_hooks", &mut t);
+    free_native_hooks();
+    stage("phase3 free_native_hooks", &mut t);
+    #[cfg(feature = "qbdi")]
+    {
+        shutdown_qbdi_helper();
+        stage("phase3 shutdown_qbdi_helper", &mut t);
+    }
+    detach_current_jni_thread();
+    stage("phase3 detach_jni_thread", &mut t);
+    cleanup_engine();
+    stage("phase3 cleanup_engine", &mut t);
+
+    log_msg(format!(
+        "[quickjs] cleanup done (managed-safe unload, executable pools and walkstack guards retained, total {}ms)\n",
+        t0.elapsed().as_millis()
+    ));
+}
+
 /// **软清理**：完整 unhook + drain=0 + 销毁 runtime，保留 hook 基础设施和 RWX 内存。
 ///
 /// `%reload` 使用。与 full `cleanup()` 相同的 hook 释放路径（drain=0 原子不变量保持），

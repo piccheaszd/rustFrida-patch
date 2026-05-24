@@ -49,6 +49,7 @@ pub(crate) mod reflect;
 
 mod safe_mem;
 
+pub use java_hook_api::managed_native_counter_value;
 pub(crate) use jni_core::ensure_jni_initialized;
 pub(crate) use reflect::get_class_name_unchecked;
 
@@ -1244,6 +1245,13 @@ unsafe fn install_java_api(ctx_ptr: *mut ffi::JSContext) -> Result<ffi::JSValue,
     add_cfunction_to_object(ctx_ptr, java_obj, "_artRouteStats", js_art_route_stats, 0);
     add_cfunction_to_object(ctx_ptr, java_obj, "_resetArtRouteStats", js_reset_art_route_stats, 0);
     add_cfunction_to_object(ctx_ptr, java_obj, "_fastHookStats", js_fast_hook_stats, 0);
+    add_cfunction_to_object(
+        ctx_ptr,
+        java_obj,
+        "_artSymbolProbe",
+        java_fast_api::js_art_symbol_probe,
+        0,
+    );
     add_cfunction_to_object(ctx_ptr, java_obj, "_methods", js_java_methods, 1);
     // Instance method invocation helper used by Java object proxies
     add_cfunction_to_object(ctx_ptr, java_obj, "_invokeMethod", js_java_invoke_method, 4);

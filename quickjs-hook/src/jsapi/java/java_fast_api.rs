@@ -75,6 +75,59 @@ static FAST_QUICK_ALLOC_SLOW_PATH: AtomicU64 = AtomicU64::new(0);
 static ART_CALLEE_SAVE_SUSPEND_METHOD: OnceLock<u64> = OnceLock::new();
 static ART_QUICK_TEST_SUSPEND_ENTRYPOINT: OnceLock<u64> = OnceLock::new();
 
+struct ArtSymbolCandidate {
+    label: &'static str,
+    name: &'static str,
+    kind: &'static str,
+}
+
+struct ArtCalleeSaveProfile {
+    label: &'static str,
+    min_sdk: i32,
+    max_sdk: i32,
+    suspend_method_offset: u64,
+}
+
+const ART_CALLEE_SAVE_SYMBOLS: &[ArtSymbolCandidate] = &[
+    ArtSymbolCandidate {
+        label: "getCalleeSaveMethod",
+        name: "_ZN3art7Runtime19GetCalleeSaveMethodENS_14CalleeSaveTypeE",
+        kind: "art::CalleeSaveType",
+    },
+    ArtSymbolCandidate {
+        label: "getCalleeSaveMethodUnchecked",
+        name: "_ZN3art7Runtime28GetCalleeSaveMethodUncheckedENS_14CalleeSaveTypeE",
+        kind: "art::CalleeSaveType",
+    },
+    ArtSymbolCandidate {
+        label: "getCalleeSaveMethodConst",
+        name: "_ZNK3art7Runtime19GetCalleeSaveMethodENS_14CalleeSaveTypeE",
+        kind: "art::CalleeSaveType const",
+    },
+    ArtSymbolCandidate {
+        label: "getCalleeSaveMethodUncheckedConst",
+        name: "_ZNK3art7Runtime28GetCalleeSaveMethodUncheckedENS_14CalleeSaveTypeE",
+        kind: "art::CalleeSaveType const",
+    },
+    ArtSymbolCandidate {
+        label: "getCalleeSaveMethodRuntimeNested",
+        name: "_ZN3art7Runtime19GetCalleeSaveMethodENS0_14CalleeSaveTypeE",
+        kind: "art::Runtime::CalleeSaveType",
+    },
+    ArtSymbolCandidate {
+        label: "getCalleeSaveMethodRuntimeNestedConst",
+        name: "_ZNK3art7Runtime19GetCalleeSaveMethodENS0_14CalleeSaveTypeE",
+        kind: "art::Runtime::CalleeSaveType const",
+    },
+];
+
+const ART_CALLEE_SAVE_PROFILES: &[ArtCalleeSaveProfile] = &[ArtCalleeSaveProfile {
+    label: "aosp-api31-36-callee-save-offsets",
+    min_sdk: 31,
+    max_sdk: 36,
+    suspend_method_offset: 0x28,
+}];
+
 const QUICK_ENTRYPOINTS_OFFSET_FAILED: usize = usize::MAX;
 const QUICK_ENTRYPOINT_COUNT: usize = 174;
 const QUICK_ALLOC_OBJECT_INITIALIZED_INDEX: usize = 6;
@@ -208,11 +261,8 @@ unsafe fn resolve_callee_save_suspend_method() -> Option<u64> {
     let runtime = resolve_art_runtime_instance()?;
 
     type GetCalleeSaveMethodFn = unsafe extern "C" fn(*mut std::ffi::c_void, u32) -> *mut std::ffi::c_void;
-    for sym_name in [
-        "_ZN3art7Runtime19GetCalleeSaveMethodENS_14CalleeSaveTypeE",
-        "_ZN3art7Runtime28GetCalleeSaveMethodUncheckedENS_14CalleeSaveTypeE",
-    ] {
-        let sym = crate::jsapi::module::libart_dlsym(sym_name);
+    for candidate in ART_CALLEE_SAVE_SYMBOLS {
+        let sym = crate::jsapi::module::libart_dlsym(candidate.name);
         if sym.is_null() {
             continue;
         }
@@ -220,14 +270,18 @@ unsafe fn resolve_callee_save_suspend_method() -> Option<u64> {
         let method = get_method(runtime, CALLEE_SAVE_EVERYTHING_FOR_SUSPEND_CHECK);
         if !method.is_null() {
             crate::jsapi::console::output_message(&format!(
-                "[fast] ART callee-save suspend method via {}: {:?}",
-                sym_name, method
+                "[fast] ART callee-save suspend method via {} ({}): {:?}",
+                candidate.label, candidate.kind, method
             ));
             return Some(method as u64);
         }
     }
 
-    if let Some(method) = resolve_callee_save_suspend_method_from_quick_stub(runtime) {
+    crate::jsapi::console::output_message(
+        "[fast] ART callee-save exported Runtime::GetCalleeSaveMethod symbols missing; trying profile fallback",
+    );
+
+    if let Some(method) = resolve_callee_save_suspend_method_from_profile(runtime) {
         return Some(method);
     }
 
@@ -235,39 +289,49 @@ unsafe fn resolve_callee_save_suspend_method() -> Option<u64> {
     None
 }
 
-unsafe fn resolve_callee_save_suspend_method_from_quick_stub(runtime: *mut std::ffi::c_void) -> Option<u64> {
-    let mut entry = crate::jsapi::module::libart_dlsym("art_quick_test_suspend") as u64;
-    if entry == 0 {
-        let env = get_thread_env().unwrap_or(std::ptr::null_mut());
-        entry =
-            current_art_thread(env).and_then(|thread| quick_entrypoint(thread as usize, QUICK_TEST_SUSPEND_INDEX))?;
-    }
-
+unsafe fn resolve_callee_save_suspend_method_from_profile(runtime: *mut std::ffi::c_void) -> Option<u64> {
+    let sdk = get_android_api_level();
     let runtime_addr = runtime as u64;
-    for i in 0..192usize {
-        let insn = std::ptr::read_unaligned((entry as usize + i * 4) as *const u32);
-        if (insn & 0xffc0_0000) != 0xf940_0000 {
+
+    for profile in ART_CALLEE_SAVE_PROFILES {
+        if sdk < profile.min_sdk || sdk > profile.max_sdk {
             continue;
         }
-        let rt = insn & 0x1f;
-        let rn = (insn >> 5) & 0x1f;
-        if rt != rn {
+
+        let method = std::ptr::read_volatile((runtime_addr + profile.suspend_method_offset) as *const u64)
+            & 0x00ff_ffff_ffff_ffff;
+        if method == 0 || !looks_like_callee_save_method_array(runtime_addr, profile.suspend_method_offset) {
             continue;
         }
-        let offset = (((insn >> 10) & 0xfff) as u64) * 8;
-        if offset < 5 * 8 || offset > 0x8000 {
-            continue;
-        }
-        let method = std::ptr::read_volatile((runtime_addr + offset) as *const u64) & 0x00ff_ffff_ffff_ffff;
-        if method == 0 || !looks_like_callee_save_method_array(runtime_addr, offset) {
-            continue;
-        }
+
         crate::jsapi::console::output_message(&format!(
-            "[fast] ART callee-save suspend method from art_quick_test_suspend: method={:#x}, runtime_off=0x{:x}, stub={:#x}",
-            method, offset, entry
+            "[fast] ART callee-save suspend method via profile {}: method={:#x}, runtime_off=0x{:x}, sdk={}",
+            profile.label, method, profile.suspend_method_offset, sdk
         ));
         return Some(method);
     }
+
+    None
+}
+
+unsafe fn probe_callee_save_profile_fallback(
+    runtime: *mut std::ffi::c_void,
+) -> Option<(&'static ArtCalleeSaveProfile, u64)> {
+    let sdk = get_android_api_level();
+    let runtime_addr = runtime as u64;
+
+    for profile in ART_CALLEE_SAVE_PROFILES {
+        if sdk < profile.min_sdk || sdk > profile.max_sdk {
+            continue;
+        }
+
+        let method = std::ptr::read_volatile((runtime_addr + profile.suspend_method_offset) as *const u64)
+            & 0x00ff_ffff_ffff_ffff;
+        if method != 0 && looks_like_callee_save_method_array(runtime_addr, profile.suspend_method_offset) {
+            return Some((profile, method));
+        }
+    }
+
     None
 }
 
@@ -285,6 +349,99 @@ unsafe fn looks_like_callee_save_method_array(runtime: u64, suspend_method_offse
         previous = method;
     }
     true
+}
+
+pub(super) unsafe extern "C" fn js_art_symbol_probe(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    let obj = JSValue(ffi::JS_NewObject(ctx));
+    let sdk = get_android_api_level();
+    obj.set_property(ctx, "sdk", JSValue::int(sdk));
+    obj.set_property(ctx, "codename", JSValue::string(ctx, get_android_codename()));
+    obj.set_property(ctx, "targetRange", JSValue::string(ctx, "Android 12-16 / API 31-36"));
+    obj.set_property(ctx, "inTargetRange", JSValue::bool((31..=36).contains(&sdk)));
+
+    let runtime_instance = crate::jsapi::module::libart_dlsym("_ZN3art7Runtime9instance_E") as u64;
+    let runtime_current = crate::jsapi::module::libart_dlsym("_ZN3art7Runtime7CurrentEv") as u64;
+    obj.set_property(
+        ctx,
+        "runtimeInstanceSymbol",
+        JSValue(ffi::JS_NewBigUint64(ctx, runtime_instance)),
+    );
+    obj.set_property(
+        ctx,
+        "runtimeCurrentSymbol",
+        JSValue(ffi::JS_NewBigUint64(ctx, runtime_current)),
+    );
+
+    let symbols = JSValue(ffi::JS_NewObject(ctx));
+    let mut selected_label = "";
+    let mut selected_name = "";
+    let mut selected_kind = "";
+    let mut selected_addr = 0u64;
+
+    for candidate in ART_CALLEE_SAVE_SYMBOLS {
+        let addr = crate::jsapi::module::libart_dlsym(candidate.name) as u64;
+        let item = JSValue(ffi::JS_NewObject(ctx));
+        item.set_property(ctx, "name", JSValue::string(ctx, candidate.name));
+        item.set_property(ctx, "kind", JSValue::string(ctx, candidate.kind));
+        item.set_property(ctx, "found", JSValue::bool(addr != 0));
+        item.set_property(ctx, "address", JSValue(ffi::JS_NewBigUint64(ctx, addr)));
+        symbols.set_property(ctx, candidate.label, item);
+
+        if selected_addr == 0 && addr != 0 {
+            selected_label = candidate.label;
+            selected_name = candidate.name;
+            selected_kind = candidate.kind;
+            selected_addr = addr;
+        }
+    }
+
+    obj.set_property(ctx, "calleeSaveSymbols", symbols);
+    obj.set_property(ctx, "selectedLabel", JSValue::string(ctx, selected_label));
+    obj.set_property(ctx, "selectedName", JSValue::string(ctx, selected_name));
+    obj.set_property(ctx, "selectedKind", JSValue::string(ctx, selected_kind));
+    obj.set_property(
+        ctx,
+        "selectedAddress",
+        JSValue(ffi::JS_NewBigUint64(ctx, selected_addr)),
+    );
+
+    let fallback = JSValue(ffi::JS_NewObject(ctx));
+    let mut fallback_valid = false;
+    if let Some(runtime) = resolve_art_runtime_instance() {
+        let runtime_addr = runtime as u64;
+        fallback.set_property(ctx, "runtime", JSValue(ffi::JS_NewBigUint64(ctx, runtime_addr)));
+        if let Some((profile, method)) = probe_callee_save_profile_fallback(runtime) {
+            fallback_valid = true;
+            fallback.set_property(ctx, "valid", JSValue::bool(true));
+            fallback.set_property(ctx, "profile", JSValue::string(ctx, profile.label));
+            fallback.set_property(ctx, "minSdk", JSValue::int(profile.min_sdk));
+            fallback.set_property(ctx, "maxSdk", JSValue::int(profile.max_sdk));
+            fallback.set_property(
+                ctx,
+                "runtimeOffset",
+                JSValue(ffi::JS_NewBigUint64(ctx, profile.suspend_method_offset)),
+            );
+            fallback.set_property(ctx, "candidateMethod", JSValue(ffi::JS_NewBigUint64(ctx, method)));
+        } else {
+            fallback.set_property(ctx, "valid", JSValue::bool(false));
+        }
+    } else {
+        fallback.set_property(ctx, "valid", JSValue::bool(false));
+        fallback.set_property(ctx, "runtime", JSValue(ffi::JS_NewBigUint64(ctx, 0)));
+    }
+    obj.set_property(ctx, "calleeSaveProfileFallback", fallback);
+
+    obj.set_property(
+        ctx,
+        "quickCalleeSaveFrameSupported",
+        JSValue::bool(selected_addr != 0 || fallback_valid),
+    );
+    obj.0
 }
 
 unsafe fn resolve_art_runtime_instance() -> Option<*mut std::ffi::c_void> {
