@@ -26,6 +26,7 @@ extern "C" {
 #define HOOK_ERROR_NOT_FOUND        -6
 #define HOOK_ERROR_BUFFER_TOO_SMALL -7
 #define HOOK_ERROR_WXSHADOW_FAILED  -8
+#define HOOK_ERROR_WXSHADOW_PAGE_BUSY -9
 
 /* Hook context - contains all ARM64 registers */
 typedef struct {

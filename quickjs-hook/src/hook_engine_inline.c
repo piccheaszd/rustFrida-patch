@@ -9,6 +9,21 @@
 #include "hook_engine_internal.h"
 #include <stdbool.h>
 
+static int wxshadow_page_has_active_hook(void* target) {
+    uintptr_t page = (uintptr_t)target & ~(uintptr_t)0xFFF;
+    for (HookEntry* e = g_engine.hooks; e; e = e->next) {
+        if (!e->stealth || !e->target) continue;
+        if (((uintptr_t)e->target & ~(uintptr_t)0xFFF) == page) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void log_wxshadow_page_busy(void* target) {
+    hook_log("[STEALTH1] reject same-page wxshadow hook target=%p: page already has an active wxshadow patch", target);
+}
+
 /* --- Simple replacement hook (hook_install) --- */
 
 void* hook_install(void* target, void* replacement, int stealth) {
@@ -17,6 +32,12 @@ void* hook_install(void* target, void* replacement, int stealth) {
     }
 
     pthread_mutex_lock(&g_engine.lock);
+
+    if (stealth == 1 && wxshadow_page_has_active_hook(target)) {
+        log_wxshadow_page_busy(target);
+        pthread_mutex_unlock(&g_engine.lock);
+        return NULL;
+    }
 
     HookEntry* entry = setup_hook_entry(target);
     if (!entry) {
@@ -287,6 +308,12 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
 
     pthread_mutex_lock(&g_engine.lock);
 
+    if (stealth == 1 && wxshadow_page_has_active_hook(target)) {
+        log_wxshadow_page_busy(target);
+        pthread_mutex_unlock(&g_engine.lock);
+        return HOOK_ERROR_WXSHADOW_PAGE_BUSY;
+    }
+
     HookEntry* entry = setup_hook_entry(target);
     if (!entry) {
         pthread_mutex_unlock(&g_engine.lock);
@@ -381,6 +408,12 @@ void* hook_replace(void* target, HookCallback on_enter, void* user_data, int ste
     }
 
     pthread_mutex_lock(&g_engine.lock);
+
+    if (stealth == 1 && wxshadow_page_has_active_hook(target)) {
+        log_wxshadow_page_busy(target);
+        pthread_mutex_unlock(&g_engine.lock);
+        return NULL;
+    }
 
     HookEntry* entry = setup_hook_entry(target);
     if (!entry) {

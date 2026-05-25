@@ -33,8 +33,8 @@ mod stalker;
 
 use crate::communication::{
     flush_cached_logs, is_cmd_frame, is_qbdi_helper_frame, log_msg, log_msg_sync, register_stream_fd, send_bye,
-    send_complete, send_eval_err, send_eval_ok, send_hello, send_rpc_err, send_rpc_ok, shutdown_log_writer,
-    shutdown_stream, start_log_writer, write_stream, GLOBAL_STREAM,
+    send_complete, send_eval_err, send_eval_ok, send_hello_raw_fd, send_rpc_err, send_rpc_ok, shutdown_log_writer,
+    shutdown_stream, start_log_writer, write_log_raw_fd, write_stream, GLOBAL_STREAM,
 };
 use crate::crash_handler::install_panic_hook;
 use libc::{kill, pid_t, SIGSTOP};
@@ -144,21 +144,37 @@ pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
         (args.ctrl_fd, args.table)
     };
 
-    // 先完成 agent <-> host 的 HELLO，后续 StringTable/cmdline 初始化若出错可被 host 观测到。
+    // Send HELLO before any Rust stream setup so entry-stage failures are visible to the host.
+    let _ = send_hello_raw_fd(ctrl_fd);
+    let _ = write_log_raw_fd(
+        ctrl_fd,
+        format!(
+            "[agent] agent-entry: raw hello sent ctrl_fd={} table=0x{:x}\n",
+            ctrl_fd, table_addr
+        )
+        .as_bytes(),
+    );
+
     let sock = unsafe { UnixStream::from_raw_fd(ctrl_fd) };
     let write_half = match sock.try_clone() {
         Ok(stream) => stream,
-        Err(_) => return null_mut(),
+        Err(e) => {
+            let _ = write_log_raw_fd(
+                ctrl_fd,
+                format!("[agent] agent-entry: stream clone failed: {}\n", e).as_bytes(),
+            );
+            return null_mut();
+        }
     };
     register_stream_fd(&write_half);
     if GLOBAL_STREAM.set(std::sync::Mutex::new(write_half)).is_err() {
+        let _ = write_log_raw_fd(ctrl_fd, b"[agent] agent-entry: global stream already initialized\n");
         return null_mut();
     }
     // 启动异步日志 writer 线程：write_stream() 只 push channel，此线程通过 GLOBAL_STREAM 写 socket
     start_log_writer();
-    send_hello();
     log_msg_sync(format!(
-        "agent-entry: hello sent ctrl_fd={} table=0x{:x}\n",
+        "agent-entry: stream ready ctrl_fd={} table=0x{:x}\n",
         ctrl_fd, table_addr
     ));
     raw_thread::sleep_ms(100);

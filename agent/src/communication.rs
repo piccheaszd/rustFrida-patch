@@ -33,6 +33,43 @@ fn write_frame(stream: &mut UnixStream, kind: u8, payload: &[u8]) -> std::io::Re
     stream.write_all(payload)
 }
 
+fn write_all_raw_fd(fd: i32, mut data: &[u8]) -> std::io::Result<()> {
+    while !data.is_empty() {
+        let wrote = unsafe { libc::write(fd, data.as_ptr() as *const libc::c_void, data.len()) };
+        if wrote < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if wrote == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "socket write returned zero",
+            ));
+        }
+        data = &data[wrote as usize..];
+    }
+    Ok(())
+}
+
+fn write_frame_raw_fd(fd: i32, kind: u8, payload: &[u8]) -> std::io::Result<()> {
+    let mut header = [0u8; 5];
+    header[0] = kind;
+    header[1..].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    write_all_raw_fd(fd, &header)?;
+    write_all_raw_fd(fd, payload)
+}
+
+pub(crate) fn send_hello_raw_fd(fd: i32) -> std::io::Result<()> {
+    write_frame_raw_fd(fd, FRAME_KIND_HELLO, &[])
+}
+
+pub(crate) fn write_log_raw_fd(fd: i32, data: &[u8]) -> std::io::Result<()> {
+    write_frame_raw_fd(fd, FRAME_KIND_LOG, data)
+}
+
 pub(crate) fn read_frame(stream: &mut UnixStream) -> std::io::Result<(u8, Vec<u8>)> {
     let mut kind = [0u8; 1];
     stream.read_exact(&mut kind)?;
@@ -85,12 +122,6 @@ pub(crate) fn write_stream_raw(data: &[u8]) {
             }
             offset += wrote as usize;
         }
-    }
-}
-
-pub(crate) fn send_hello() {
-    if let Some(m) = GLOBAL_STREAM.get() {
-        let _ = write_frame(&mut m.lock().unwrap_or_else(|e| e.into_inner()), FRAME_KIND_HELLO, &[]);
     }
 }
 

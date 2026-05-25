@@ -312,8 +312,9 @@ pub fn register_ptr(ctx: &JSContext) {
     unsafe {
         let ctx_ptr = ctx.as_ptr();
 
-        // Register ptr() function
+        // Register Frida-compatible pointer constructors.
         add_cfunction_to_object(ctx_ptr, global.raw(), "ptr", js_ptr, 1);
+        add_cfunction_to_object(ctx_ptr, global.raw(), "NativePointer", js_ptr, 1);
 
         // Create NativePointer prototype with methods
         let proto = ffi::JS_NewObject(ctx_ptr);

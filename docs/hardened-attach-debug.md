@@ -8,15 +8,18 @@ This note records the attach-stability fixes for a hardened arm64 Android app
 tested on a rooted device. The notes are intentionally generic: package names,
 vendor names, app-specific paths, and test-only binary names are omitted.
 
-The working baseline is late PID attach with a minimal QuickJS surface and a
-delayed script load after agent connection:
+The current working baseline is early spawn with probe-based thread selection.
+It reaches the agent before the app-specific startup path runs, then loads the
+script while the child is still paused:
 
 ```sh
 RF_REMOTE_CALL_TIMEOUT_MS=7000 \
-RF_INJECT_THREAD=main \
-RF_LOAD_DELAY_MS=8000 \
-/data/local/tmp/rf_test --pid <pid> \
-  --verbose --quickjs-profile minimal -l /data/local/tmp/rf_probe.js
+RF_INJECT_THREAD=probe \
+RF_THREAD_PROBE_LIMIT=16 \
+RF_THREAD_PROBE_TIMEOUT_MS=150 \
+/data/local/tmp/rf_test --spawn <package> --spawn-early \
+  --verbose --connect-timeout 25 \
+  --quickjs-profile full -l /data/local/tmp/test.js
 ```
 
 ## Findings
@@ -36,9 +39,29 @@ this target at startup. The minimal profile keeps the small evaluation surface
 needed for diagnostics and skips optional bootstrap modules until each module
 can be re-enabled and tested independently.
 
-Automatic script loading immediately after agent connection could overlap with
-the app's own security/runtime initialization. Delaying `-l/--load-script`
-execution avoided that startup race in the validated run.
+Late attach and `--spawn-late` are still unstable on the hardened target. The
+observed failures happen before user JavaScript can run: main-thread injection
+can hit an EOF while restoring the code-swap area, and probe-selected injection
+can reset during the loader fd handoff. No new crash report was produced in
+these failing runs, which points to target-side restart/self-protection rather
+than a normal native crash.
+
+Early spawn is the usable path. `--spawn-early` with `RF_INJECT_THREAD=probe`
+loaded the agent, initialized QuickJS, ran the probe script, resumed the child,
+and cleaned up without a new crash report. The same path also supports the full
+QuickJS profile for targeted API tests.
+
+`Hook.WXSHADOW` works for individual startup hooks, but it has two operational
+limits:
+
+- Multiple `WXSHADOW` hooks on the same 4 KB page are unsupported. The engine
+  now rejects this case immediately instead of hanging the target.
+- During early startup, combining a `WXSHADOW` `android_dlopen_ext` hook and a
+  `WXSHADOW` `RegisterNatives` hook in the same run can stop progress inside the
+  first app-owned loader library: dlopen enter is logged, but no matching leave
+  is observed. Running either hook alone is stable. Use separate runs for loader
+  tracing and JNI-registration tracing, or switch one side to a non-WXSHADOW
+  backend after validating it on the target.
 
 ## Fixes Recorded
 
@@ -52,6 +75,9 @@ execution avoided that startup race in the validated run.
 - The agent sends an early HELLO before reading injected configuration or
   processing command-line state, making early agent-entry failures visible to
   the host.
+- Agent entry now writes the initial HELLO and stage logs directly to the raw
+  control fd before constructing the Rust `UnixStream`, so clone/global-stream
+  setup failures are distinguishable from agent load failures.
 - Host connection waiting now treats HELLO-before-EOF as a concrete failure
   instead of waiting for the full connection timeout.
 - `RF_LOAD_DELAY_MS` delays automatic script execution after agent connection,
@@ -60,18 +86,31 @@ execution avoided that startup race in the validated run.
   `agent` or `quickjs-hook` inputs, preventing stale embedded-agent tests.
 - `--quickjs-profile minimal` now exposes only the small diagnostic surface.
   The generic alias `--quickjs-profile hardened` maps to the same profile.
+- QuickJS exposes the Frida-compatible `NativePointer` global alias in addition
+  to `ptr()`.
+- `WXSHADOW` same-page multi-hook attempts now return an explicit hook error:
+  use `Hook.RECOMP`, `Hook.NORMAL`, or only one `WXSHADOW` hook per page.
 
 ## Validated Result
 
-The delayed minimal-profile path reached the agent, initialized QuickJS, loaded
-the probe script, returned `=> 2`, and shut down through the managed cleanup
-path without producing a new crash report in the successful run.
+The early-spawn minimal-profile path reached the agent, initialized QuickJS,
+loaded the probe script, returned `=> 2`, resumed the child, and shut down
+through the managed cleanup path without producing a new crash report.
+
+The early-spawn full-profile path loaded a `Hook.WXSHADOW` `RegisterNatives`
+script and captured the system connectivity JNI registration table without a new
+crash report.
+
+A loader-only `android_dlopen_ext` `WXSHADOW` trace completed 41 enter/leave
+pairs in the startup window after the same-page guard rejected the second
+same-page dlopen hook with a clear JavaScript error.
 
 Expected success markers:
 
 - `Loader: agent 加载成功`
 - `Agent 已连接`
-- `[agent] agent-entry: hello sent ...`
+- `[agent] agent-entry: raw hello sent ...`
+- `[agent] agent-entry: stream ready ...`
 - `[quickjs] profile=minimal`
 - `eval ok source=rf_probe.js out_len=1`
 - result `=> 2`
@@ -86,3 +125,5 @@ Expected success markers:
    as the fallback baseline.
 4. Evaluate a remote trampoline strategy that starts from a thread already
    returning from native code instead of arbitrary signal-path stops.
+5. Add a safe startup tracing recipe that avoids combining loader and
+   JNI-registration `WXSHADOW` hooks in the same early-start run.

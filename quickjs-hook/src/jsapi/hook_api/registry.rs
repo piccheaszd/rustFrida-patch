@@ -14,6 +14,7 @@ const HOOK_ERROR_MPROTECT_FAILED: i32 = -5;
 const HOOK_ERROR_NOT_FOUND: i32 = -6;
 const HOOK_ERROR_BUFFER_TOO_SMALL: i32 = -7;
 const HOOK_ERROR_WXSHADOW_FAILED: i32 = -8;
+const HOOK_ERROR_WXSHADOW_PAGE_BUSY: i32 = -9;
 
 /// Convert hook error code to error message
 pub(crate) fn hook_error_message(code: i32) -> &'static [u8] {
@@ -26,6 +27,9 @@ pub(crate) fn hook_error_message(code: i32) -> &'static [u8] {
         HOOK_ERROR_NOT_FOUND => b"hook not found at address\0",
         HOOK_ERROR_BUFFER_TOO_SMALL => b"buffer too small for jump instruction\0",
         HOOK_ERROR_WXSHADOW_FAILED => b"wxshadow prctl failed: kernel may not support shadow pages\0",
+        HOOK_ERROR_WXSHADOW_PAGE_BUSY => {
+            b"wxshadow same-page multi-hook is unsupported; use Hook.RECOMP/Hook.NORMAL or hook one address per page\0"
+        }
         _ => b"unknown hook error\0",
     }
 }
