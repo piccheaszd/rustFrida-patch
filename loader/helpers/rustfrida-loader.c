@@ -3,10 +3,10 @@
  *
  * Based on Frida's loader.c (frida-core/src/linux/helpers/loader.c).
  * Runs as position-independent code in the target process after bootstrap.
- * Entry point creates a worker thread via raw clone; the worker
- * receives agent SO fd + ctrl fd over the control socket, links the
- * agent with rustFrida's minimal ELF linker, and calls hello_entry(&AgentArgs) which blocks in the agent's
- * command loop.
+ * Entry point creates a worker thread via raw clone; the worker receives the
+ * agent SO as a control-socket stream by default (or a diagnostic fd fallback),
+ * links the agent with rustFrida's minimal ELF linker, and calls
+ * hello_entry(&AgentArgs) which blocks in the agent's command loop.
  */
 
 #include "inject-context.h"

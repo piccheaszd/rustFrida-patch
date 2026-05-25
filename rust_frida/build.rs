@@ -27,7 +27,11 @@ fn main() {
     let mut newest_loader_input = SystemTime::UNIX_EPOCH;
     watch_inputs(loader_build_script.as_path(), &mut newest_loader_input);
     watch_inputs(loader_helpers.as_path(), &mut newest_loader_input);
-    ensure_generated_blob(&loader_bootstrapper, newest_loader_input, "python3 loader/build_helpers.py");
+    ensure_generated_blob(
+        &loader_bootstrapper,
+        newest_loader_input,
+        "python3 loader/build_helpers.py",
+    );
     ensure_generated_blob(&loader_blob, newest_loader_input, "python3 loader/build_helpers.py");
 
     let mut newest_agent_input = SystemTime::UNIX_EPOCH;

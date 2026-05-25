@@ -188,6 +188,36 @@ fn env_value_enabled(value: &str) -> bool {
     value != "0" && !value.eq_ignore_ascii_case("false")
 }
 
+fn use_stream_agent_transfer() -> bool {
+    if let Ok(mode) = std::env::var("RF_AGENT_TRANSFER") {
+        let mode = mode.trim();
+        if mode.eq_ignore_ascii_case("memfd")
+            || mode.eq_ignore_ascii_case("fd")
+            || mode == "0"
+            || mode.eq_ignore_ascii_case("false")
+            || mode.eq_ignore_ascii_case("off")
+        {
+            return false;
+        }
+        if mode.eq_ignore_ascii_case("stream")
+            || mode.eq_ignore_ascii_case("socket")
+            || mode.eq_ignore_ascii_case("pipe")
+            || mode == "1"
+            || mode.eq_ignore_ascii_case("true")
+        {
+            return true;
+        }
+        log_warn!("未知 RF_AGENT_TRANSFER={}，默认使用 stream agent 传输", mode);
+        return true;
+    }
+
+    if let Ok(value) = std::env::var("RF_STREAM_AGENT") {
+        return env_value_enabled(&value);
+    }
+
+    !env_flag_enabled("RF_AGENT_MEMFD")
+}
+
 fn build_loader_agent_data(use_pthread_loader: bool) -> Result<Vec<u8>, String> {
     let mut tokens = Vec::new();
 
@@ -204,9 +234,11 @@ fn build_loader_agent_data(use_pthread_loader: bool) -> Result<Vec<u8>, String> 
         tokens.push("close-ctrl".to_string());
     }
 
-    if env_flag_enabled("RF_STREAM_AGENT") {
+    if use_stream_agent_transfer() {
         log_verbose!("agent SO transfer: stream over loader control socket");
         tokens.push("stream-agent".to_string());
+    } else {
+        log_verbose!("agent SO transfer: memfd over SCM_RIGHTS");
     }
 
     if env_flag_enabled("RF_HOLD_BEFORE_ENTRY") {
@@ -1135,9 +1167,9 @@ fn run_loader_handshake(ctrl_fd: RawFd, target_pid: i32, loader_ctx_addr: usize)
     let thread_id = i32::from_le_bytes(tid_buf);
     log_verbose!("Loader worker tid: {}", thread_id);
 
-    // 2. 发送 agent SO。默认仍走 SCM_RIGHTS memfd；RF_STREAM_AGENT=1 时直接经
-    //    loader 控制 socket 流式发送，避免目标进程临时出现 agent memfd fd。
-    if env_flag_enabled("RF_STREAM_AGENT") {
+    // 2. 发送 agent SO。默认经 loader 控制 socket 流式发送，避免目标进程临时出现
+    //    agent memfd fd；仅显式诊断/兼容开关才回退 SCM_RIGHTS memfd。
+    if use_stream_agent_transfer() {
         let size = (AGENT_SO.len() as u64).to_le_bytes();
         send_exact(ctrl_fd, &size)?;
         send_exact(ctrl_fd, AGENT_SO)?;

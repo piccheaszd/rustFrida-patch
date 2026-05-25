@@ -303,21 +303,24 @@ Additional hardening:
 - the loader control fd is closed by default before entering agent code
   (`RF_KEEP_LOADER_CTRL=1` keeps the old behavior, `RF_CLOSE_LOADER_CTRL`
   overrides explicitly);
-- `RF_STREAM_AGENT=1` sends the agent ELF over the loader control socket instead
+- the agent ELF is now sent over the loader control socket by default instead
   of passing an agent memfd with `SCM_RIGHTS`;
+- the old memfd transfer path is retained only for diagnostics and compatibility
+  via `RF_STREAM_AGENT=0`, `RF_AGENT_MEMFD=1`, or
+  `RF_AGENT_TRANSFER=memfd`;
 - the streamed agent path still reads into an anonymous buffer, maps anonymous
   LOAD pages, restores final segment protections, and keeps RELRO protection.
 
 Validation:
 
-- `RF_STREAM_AGENT=1 --spawn-early --quickjs-profile minimal` completed
+- default stream-agent `--spawn-early --quickjs-profile minimal` completed
   `link:recv-stream-size`, `link:recv-stream`, ELF validation, anonymous segment
   mapping, relocation, entry, and agent command-loop startup.
-- `RF_STREAM_AGENT=1 --spawn-late --quickjs-profile minimal` reached
+- default stream-agent `--spawn-late --quickjs-profile minimal` reached
   `Loader: agent 加载成功`, `Agent 已连接`, and agent command-loop startup, then
   shut down normally from host-side input EOF.
-- The old memfd path still exists as the default for compatibility and speed.
-  The stream path is currently the safer mode for hardened late attach.
+- The old memfd path was observed to still fail in hardened late attach at the
+  loader `link:read-file` window, so stream-agent is the default transfer mode.
 
 Remaining PID-attach-specific observations:
 
@@ -341,7 +344,7 @@ Remaining PID-attach-specific observations:
    returning from native code instead of arbitrary signal-path stops.
 5. Add a safe startup tracing recipe that avoids combining loader and
    JNI-registration `WXSHADOW` hooks in the same early-start run.
-6. Decide whether to make `RF_STREAM_AGENT=1` automatic for hardened
-   late/spawn-late profiles after compatibility testing on normal targets.
+6. Keep the explicit memfd fallback for regression tests, but do not use it for
+   hardened late/spawn-late profiles unless debugging loader transfer behavior.
 7. Continue PID attach hardening around stop-state selection and target restarts
    during host-side memory writes.
