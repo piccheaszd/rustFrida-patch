@@ -4,15 +4,19 @@ use libc::{c_int, c_void, iovec, pid_t, PTRACE_CONT, PTRACE_GETREGSET, PTRACE_SE
 use nix::errno::Errno;
 use nix::sys::ptrace;
 use nix::sys::signal::Signal;
-use nix::sys::wait::{waitpid, WaitStatus};
+use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
 use std::fs::File;
 use std::mem::size_of_val;
 use std::path::Path;
 use std::process;
+use std::time::{Duration, Instant};
 
 use crate::types::{UserFpRegs, UserRegs};
 use crate::{log_info, log_success, log_verbose, log_warn};
+
+const PTRACE_SEIZE_RAW: c_int = 0x4206;
+const PTRACE_INTERRUPT_RAW: c_int = 0x4207;
 
 /// 获取指定库的基址
 ///
@@ -92,22 +96,298 @@ fn thaw_cgroup_freezer(pid: i32) {
     }
 }
 
+fn ptrace_stop_confirmed(pid: i32) -> bool {
+    let status_path = format!("/proc/{}/status", pid);
+    let status = match std::fs::read_to_string(status_path) {
+        Ok(status) => status,
+        Err(_) => return false,
+    };
+    let mut stopped = false;
+    let mut traced_by_self = false;
+    let self_pid = process::id() as i32;
+
+    for line in status.lines() {
+        if let Some(state) = line.strip_prefix("State:") {
+            let state = state.trim_start();
+            stopped = state.starts_with('T') || state.starts_with('t');
+        } else if let Some(tracer) = line.strip_prefix("TracerPid:") {
+            traced_by_self = tracer.trim().parse::<i32>().ok() == Some(self_pid);
+        }
+    }
+
+    stopped && traced_by_self
+}
+
+fn ptrace_traced_by_self(pid: i32) -> bool {
+    let status_path = format!("/proc/{}/status", pid);
+    let status = match std::fs::read_to_string(status_path) {
+        Ok(status) => status,
+        Err(_) => return false,
+    };
+    let self_pid = process::id() as i32;
+
+    status.lines().any(|line| {
+        line.strip_prefix("TracerPid:")
+            .and_then(|tracer| tracer.trim().parse::<i32>().ok())
+            == Some(self_pid)
+    })
+}
+
+fn proc_tgid(tid: i32) -> Option<i32> {
+    let status_path = format!("/proc/{}/status", tid);
+    let status = std::fs::read_to_string(status_path).ok()?;
+
+    status.lines().find_map(|line| {
+        line.strip_prefix("Tgid:")
+            .and_then(|tgid| tgid.trim().parse::<i32>().ok())
+    })
+}
+
+fn signal_thread_group(tid: i32, signal: libc::c_int) {
+    let tgid = proc_tgid(tid).unwrap_or(tid);
+    unsafe {
+        libc::kill(tgid, signal);
+    }
+}
+
+fn ptrace_raw(request: c_int, pid: i32, data: usize) -> Result<(), Errno> {
+    let result = unsafe {
+        libc::ptrace(
+            request,
+            pid as pid_t,
+            std::ptr::null_mut::<c_void>(),
+            data as *mut c_void,
+        )
+    };
+    if result == -1 {
+        Err(Errno::last())
+    } else {
+        Ok(())
+    }
+}
+
+fn ptrace_status_summary(pid: i32) -> String {
+    let status_path = format!("/proc/{}/status", pid);
+    let status = match std::fs::read_to_string(status_path) {
+        Ok(status) => status,
+        Err(e) => return format!("status unavailable: {}", e),
+    };
+    let mut state = "<missing>".to_string();
+    let mut tracer = "<missing>".to_string();
+
+    for line in status.lines() {
+        if let Some(value) = line.strip_prefix("State:") {
+            state = value.trim().to_string();
+        } else if let Some(value) = line.strip_prefix("TracerPid:") {
+            tracer = value.trim().to_string();
+        }
+    }
+
+    format!("State={}, TracerPid={}", state, tracer)
+}
+
+fn read_task_text(tgid: i32, tid: i32, name: &str) -> String {
+    std::fs::read_to_string(format!("/proc/{}/task/{}/{}", tgid, tid, name))
+        .unwrap_or_default()
+        .trim()
+        .replace('\0', "\\0")
+}
+
+fn task_state_from_status(status: &str) -> String {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("State:").map(|value| value.trim().to_string()))
+        .unwrap_or_else(|| "<unknown>".to_string())
+}
+
+fn truncate_proc_field(value: &str, max_len: usize) -> String {
+    let mut out = String::new();
+    for ch in value.chars().take(max_len) {
+        out.push(ch);
+    }
+    if value.chars().count() > max_len {
+        out.push_str("...");
+    }
+    out
+}
+
+fn map_line_is_executable(line: &str) -> bool {
+    line.split_whitespace()
+        .nth(1)
+        .map(|perms| perms.len() >= 3 && perms.as_bytes()[2] == b'x')
+        .unwrap_or(false)
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ThreadStopSample {
+    pub(crate) tid: i32,
+    pub(crate) comm: String,
+    pub(crate) state_before: String,
+    pub(crate) wchan_before: String,
+    pub(crate) syscall_before: String,
+    pub(crate) stop_kind: String,
+    pub(crate) pc: u64,
+    pub(crate) lr: u64,
+    pub(crate) sp: u64,
+    pub(crate) pc_map: Option<String>,
+    pub(crate) lr_map: Option<String>,
+}
+
+impl ThreadStopSample {
+    pub(crate) fn pc_is_executable(&self) -> bool {
+        self.pc_map.as_deref().map(map_line_is_executable).unwrap_or(false)
+    }
+
+    pub(crate) fn short_summary(&self) -> String {
+        format!(
+            "tid={} comm={} state={} wchan={} stop={} pc=0x{:x} pc_exec={} lr=0x{:x} sp=0x{:x} lr_map={}",
+            self.tid,
+            self.comm,
+            self.state_before,
+            self.wchan_before,
+            self.stop_kind,
+            self.pc,
+            self.pc_is_executable(),
+            self.lr,
+            self.sp,
+            self.lr_map.as_deref().unwrap_or("<unknown>")
+        )
+    }
+}
+
+/// Stop a single thread with PTRACE_SEIZE/PTRACE_INTERRUPT, sample its user
+/// registers and procfs state, then detach immediately. This is diagnostic
+/// selection only; the real injection attach still happens later.
+pub(crate) fn sample_thread_stop_point(tgid: i32, tid: i32, timeout: Duration) -> Result<ThreadStopSample, String> {
+    let comm = read_task_text(tgid, tid, "comm");
+    let status = read_task_text(tgid, tid, "status");
+    let state_before = task_state_from_status(&status);
+    let wchan_before = read_task_text(tgid, tid, "wchan");
+    let syscall_before = truncate_proc_field(&read_task_text(tgid, tid, "syscall"), 120);
+    let target = Pid::from_raw(tid);
+
+    ptrace_raw(PTRACE_SEIZE_RAW, tid, 0).map_err(|e| format!("PTRACE_SEIZE tid={} 失败: {}", tid, e))?;
+
+    let sample_result = (|| {
+        ptrace_raw(PTRACE_INTERRUPT_RAW, tid, 0).map_err(|e| format!("PTRACE_INTERRUPT tid={} 失败: {}", tid, e))?;
+
+        let wait_flags = WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED | WaitPidFlag::__WALL;
+        let deadline = Instant::now() + timeout;
+        let stop_kind = loop {
+            match waitpid(target, Some(wait_flags)) {
+                Ok(WaitStatus::Stopped(_, sig)) => break format!("{:?}", sig),
+                Ok(WaitStatus::PtraceEvent(_, sig, event)) => break format!("{:?}/event{}", sig, event),
+                Ok(WaitStatus::PtraceSyscall(_)) => break "syscall-stop".to_string(),
+                Ok(WaitStatus::StillAlive) => {
+                    if Instant::now() >= deadline {
+                        return Err(format!("等待 tid={} PTRACE_INTERRUPT 停止超时", tid));
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(status) => return Err(format!("tid={} 采样停止状态异常: {:?}", tid, status)),
+                Err(e) => return Err(format!("waitpid tid={} 失败: {}", tid, e)),
+            }
+        };
+
+        let regs = get_registers(tid)?;
+        Ok(ThreadStopSample {
+            tid,
+            comm,
+            state_before,
+            wchan_before,
+            syscall_before,
+            stop_kind,
+            pc: regs.pc,
+            lr: regs.regs[30],
+            sp: regs.sp,
+            pc_map: find_map_line_for_addr(tgid, regs.pc),
+            lr_map: find_map_line_for_addr(tgid, regs.regs[30]),
+        })
+    })();
+
+    let _ = ptrace::detach(target, None);
+    sample_result
+}
+
 pub(crate) fn attach_to_process(pid: i32) -> Result<(), String> {
     let target_pid = Pid::from_raw(pid);
 
     // 解冻 cgroup freezer（Android 12+ 后台进程可能被冻结）
     thaw_cgroup_freezer(pid);
 
-    // 尝试附加到目标进程
-    match ptrace::attach(target_pid) {
-        Ok(_) => {
-            log_success!("成功附加到进程 {}，等待 SIGSTOP...", pid);
-            match waitpid(target_pid, None) {
-                Ok(WaitStatus::Stopped(_, _)) => {
-                    log_success!("进程已停止，可以操作寄存器");
-                    Ok(())
+    // 默认使用 PTRACE_ATTACH，它会形成适合 code-swap 的 signal-delivery stop。
+    // PTRACE_SEIZE + PTRACE_INTERRUPT 只保留为诊断模式：它可绕过部分 attach 停止问题，
+    // 但 stop 点不一定能在 PTRACE_CONT 后回到用户态执行替换代码。
+    let attach_mode = std::env::var("RF_ATTACH_MODE").unwrap_or_else(|_| "attach".to_string());
+    let attach_result = if attach_mode.eq_ignore_ascii_case("seize") {
+        match ptrace_raw(PTRACE_SEIZE_RAW, pid, 0) {
+            Ok(_) => {
+                log_verbose!("PTRACE_SEIZE 成功，发送 PTRACE_INTERRUPT");
+                match ptrace_raw(PTRACE_INTERRUPT_RAW, pid, 0) {
+                    Ok(_) => Ok("PTRACE_SEIZE"),
+                    Err(e) => {
+                        let _ = ptrace::detach(target_pid, Some(Signal::SIGCONT));
+                        Err(e)
+                    }
                 }
-                other => Err(format!("waitpid 状态异常: {:?}", other)),
+            }
+            Err(seize_errno) => Err(seize_errno),
+        }
+    } else {
+        ptrace::attach(target_pid).map(|_| "PTRACE_ATTACH")
+    };
+
+    match attach_result {
+        Ok(mode) => {
+            log_success!("成功附加到进程 {} ({})，等待停止...", pid, mode);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let explicit_stop_deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+            let mut sent_explicit_stop = false;
+            let wait_flags = WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED | WaitPidFlag::__WALL;
+            loop {
+                match waitpid(target_pid, Some(wait_flags)) {
+                    Ok(WaitStatus::Stopped(_, _)) | Ok(WaitStatus::PtraceEvent(_, _, _)) => {
+                        log_success!("进程已停止，可以操作寄存器");
+                        return Ok(());
+                    }
+                    Ok(WaitStatus::StillAlive) => {
+                        match waitpid(Pid::from_raw(-1), Some(wait_flags)) {
+                            Ok(WaitStatus::Stopped(stopped_pid, _))
+                            | Ok(WaitStatus::PtraceEvent(stopped_pid, _, _))
+                                if stopped_pid == target_pid =>
+                            {
+                                log_success!("进程已停止，可以操作寄存器");
+                                return Ok(());
+                            }
+                            Ok(WaitStatus::StillAlive) | Err(Errno::ECHILD) => {}
+                            Ok(status) => return Err(format!("waitpid 状态异常: {:?}", status)),
+                            Err(e) => return Err(format!("waitpid 失败: {}", e)),
+                        }
+
+                        if ptrace_stop_confirmed(pid) {
+                            log_warn!("waitpid 未返回停止事件，但 /proc 状态确认目标已由当前进程 ptrace 停止");
+                            return Ok(());
+                        }
+
+                        if !sent_explicit_stop
+                            && std::time::Instant::now() >= explicit_stop_deadline
+                            && ptrace_traced_by_self(pid)
+                        {
+                            log_warn!("ptrace 已建立 trace 关系但目标未停止，显式发送 SIGSTOP");
+                            signal_thread_group(pid, libc::SIGSTOP);
+                            sent_explicit_stop = true;
+                        }
+
+                        if std::time::Instant::now() >= deadline {
+                            let status_summary = ptrace_status_summary(pid);
+                            let _ = ptrace::detach(target_pid, Some(Signal::SIGCONT));
+                            signal_thread_group(pid, libc::SIGCONT);
+                            return Err(format!("等待进程 {} SIGSTOP 超时 ({})", pid, status_summary));
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    other => return Err(format!("waitpid 状态异常: {:?}", other)),
+                }
             }
         }
         Err(errno) => {
@@ -198,6 +478,20 @@ fn set_fp_registers(pid: i32, regs: &UserFpRegs) -> Result<(), String> {
     Ok(())
 }
 
+fn restore_registers(pid: i32, regs: &UserRegs, fp_regs: Option<&UserFpRegs>) -> Result<(), String> {
+    set_registers(pid, regs)?;
+    if let Some(fp) = fp_regs {
+        let _ = set_fp_registers(pid, fp);
+    }
+    Ok(())
+}
+
+fn restore_registers_best_effort(pid: i32, regs: &UserRegs, fp_regs: Option<&UserFpRegs>, context: &str) {
+    if let Err(e) = restore_registers(pid, regs, fp_regs) {
+        log_warn!("{}: 恢复寄存器失败: {}", context, e);
+    }
+}
+
 /// 调用目标进程的 libc 函数
 ///
 /// # 参数
@@ -241,7 +535,13 @@ pub(crate) fn call_target_function(
 
     // 验证寄存器是否正确设置
     {
-        let verify = get_registers(pid)?;
+        let verify = match get_registers(pid) {
+            Ok(verify) => verify,
+            Err(e) => {
+                restore_registers_best_effort(pid, &orig_regs, orig_fp_regs.as_ref(), "寄存器设置验证失败");
+                return Err(e);
+            }
+        };
         if verify.pc != new_regs.pc {
             log_warn!("PC 设置验证失败: 期望 0x{:x}, 实际 0x{:x}", new_regs.pc, verify.pc);
         }
@@ -267,17 +567,62 @@ pub(crate) fn call_target_function(
     // 导致 PTRACE_CONT 后进程立即被 SIGSTOP 再次停止。
     // 遇到 SIGSTOP 时吞掉信号并重新 CONT，最多重试 3 次。
     let max_sigstop_retries = 50; // 多线程进程可能产生大量信号
+    let wait_flags = WaitPidFlag::WUNTRACED | WaitPidFlag::__WALL;
+    let poll_flags = wait_flags | WaitPidFlag::WNOHANG;
+    let remote_call_timeout_ms = std::env::var("RF_REMOTE_CALL_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(15_000);
     for attempt in 0..=max_sigstop_retries {
         let result = unsafe { libc::ptrace(PTRACE_CONT as c_int, pid as pid_t, 0, 0) };
 
         if result == -1 {
+            restore_registers_best_effort(pid, &orig_regs, orig_fp_regs.as_ref(), "PTRACE_CONT 失败");
             return Err(format!("继续执行失败，错误码: {}", unsafe {
                 *libc::__errno()
             }));
         }
 
         // 等待进程停止（可能收到其他线程的信号，需要过滤）
-        match waitpid(target_pid, None).map_err(|e| format!("等待进程失败: {}", e))? {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(remote_call_timeout_ms);
+        let status = loop {
+            match waitpid(target_pid, Some(poll_flags)) {
+                Ok(WaitStatus::StillAlive) => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = ptrace_raw(PTRACE_INTERRUPT_RAW, pid, 0);
+                        signal_thread_group(pid, libc::SIGSTOP);
+                        let stop_deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+                        while std::time::Instant::now() < stop_deadline {
+                            match waitpid(target_pid, Some(poll_flags)) {
+                                Ok(WaitStatus::StillAlive) => {
+                                    std::thread::sleep(std::time::Duration::from_millis(10));
+                                }
+                                Ok(_) | Err(_) => break,
+                            }
+                        }
+
+                        let info = get_registers(pid)
+                            .map(|r| {
+                                format!(
+                                    "PC=0x{:x} LR=0x{:x} X0=0x{:x} X1=0x{:x}",
+                                    r.pc, r.regs[30], r.regs[0], r.regs[1]
+                                )
+                            })
+                            .unwrap_or_else(|e| format!("regs unavailable: {}", e));
+                        restore_registers_best_effort(pid, &orig_regs, orig_fp_regs.as_ref(), "远程调用超时");
+                        return Err(format!("远程调用超时 {}ms: {}", remote_call_timeout_ms, info));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Ok(status) => break status,
+                Err(e) => {
+                    restore_registers_best_effort(pid, &orig_regs, orig_fp_regs.as_ref(), "等待远程调用停止失败");
+                    return Err(format!("等待进程失败: {}", e));
+                }
+            }
+        };
+
+        match status {
             WaitStatus::Stopped(stopped_pid, Signal::SIGSEGV) if stopped_pid.as_raw() != pid => {
                 // 其他线程的 SIGSEGV，转发信号并继续等待
                 log_warn!("其他线程 {} 收到 SIGSEGV，转发并继续", stopped_pid);
@@ -299,10 +644,7 @@ pub(crate) fn call_target_function(
                     let return_value = regs.regs[0] as usize;
 
                     // 恢复原始寄存器状态（GP + FP/SIMD）
-                    set_registers(pid, &orig_regs)?;
-                    if let Some(ref fp) = orig_fp_regs {
-                        let _ = set_fp_registers(pid, fp);
-                    }
+                    restore_registers(pid, &orig_regs, orig_fp_regs.as_ref())?;
 
                     // 验证恢复后的寄存器
                     let verify = get_registers(pid)?;
@@ -326,6 +668,7 @@ pub(crate) fn call_target_function(
                         find_map_line_for_addr(pid, regs.pc).unwrap_or_else(|| "<unknown mapping>".to_string());
                     let lr_map =
                         find_map_line_for_addr(pid, regs.regs[30]).unwrap_or_else(|| "<unknown mapping>".to_string());
+                    restore_registers_best_effort(pid, &orig_regs, orig_fp_regs.as_ref(), "远程调用异常停止");
                     return Err(format!(
                         concat!(
                             "函数执行异常，",
@@ -358,6 +701,7 @@ pub(crate) fn call_target_function(
                     log_warn!("检测到 pending SIGSTOP (第{}次)，跳过并重试", attempt + 1);
                     continue;
                 } else {
+                    restore_registers_best_effort(pid, &orig_regs, orig_fp_regs.as_ref(), "SIGSTOP 重试耗尽");
                     return Err("多次 SIGSTOP 中断，无法执行目标函数".to_string());
                 }
             }
@@ -372,11 +716,16 @@ pub(crate) fn call_target_function(
                 } else {
                     "regs unavailable".into()
                 };
+                restore_registers_best_effort(pid, &orig_regs, orig_fp_regs.as_ref(), "远程调用收到异常信号");
                 return Err(format!("进程异常停止: {:?} {}", sig, info));
             }
-            status => return Err(format!("进程异常停止: {:?}", status)),
+            status => {
+                restore_registers_best_effort(pid, &orig_regs, orig_fp_regs.as_ref(), "远程调用收到异常 wait 状态");
+                return Err(format!("进程异常停止: {:?}", status));
+            }
         }
     }
+    restore_registers_best_effort(pid, &orig_regs, orig_fp_regs.as_ref(), "远程调用重试耗尽");
     Err("call_target_function: 超出重试次数".to_string())
 }
 

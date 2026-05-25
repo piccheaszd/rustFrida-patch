@@ -4,7 +4,10 @@
 //! using the quickjs-hook crate.
 
 use crate::vma_name::set_anon_vma_name_raw;
-use libc::{munmap, sysconf, MAP_FAILED, _SC_PAGESIZE};
+use libc::{
+    c_void, munmap, sysconf, SYS_mmap, MAP_ANONYMOUS, MAP_FAILED, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE,
+    _SC_PAGESIZE,
+};
 
 use quickjs_hook::{
     cleanup_engine, cleanup_wxshadow_patches, complete_script, cut_art_controller_routing_hooks,
@@ -70,23 +73,87 @@ struct ExecMemory {
 }
 
 impl ExecMemory {
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn raw_syscall6(nr: usize, a0: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> isize {
+        let ret: isize;
+        unsafe {
+            core::arch::asm!(
+                "svc #0",
+                inlateout("x0") a0 as isize => ret,
+                in("x1") a1,
+                in("x2") a2,
+                in("x3") a3,
+                in("x4") a4,
+                in("x5") a5,
+                in("x8") nr,
+                options(nostack),
+            );
+        }
+        ret
+    }
+
+    unsafe fn raw_mmap_rwx(alloc_size: usize) -> *mut c_void {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let ret = unsafe {
+                Self::raw_syscall6(
+                    SYS_mmap as usize,
+                    0,
+                    alloc_size,
+                    (PROT_READ | PROT_WRITE | PROT_EXEC) as usize,
+                    (MAP_PRIVATE | MAP_ANONYMOUS) as usize,
+                    usize::MAX,
+                    0,
+                )
+            };
+            if (-4095..0).contains(&ret) {
+                MAP_FAILED
+            } else {
+                ret as *mut c_void
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            libc::syscall(
+                SYS_mmap as libc::c_long,
+                std::ptr::null_mut::<c_void>(),
+                alloc_size,
+                PROT_READ | PROT_WRITE | PROT_EXEC,
+                MAP_PRIVATE | MAP_ANONYMOUS,
+                -1,
+                0,
+            ) as *mut c_void
+        }
+    }
+
     /// 调用 C 侧 hook_mmap_near 扫描 maps 空隙分配 nearby RWX 内存。
     /// hint=0 时退化为普通 mmap。
     fn new_near(size: usize, hint: usize) -> Option<Self> {
-        let page_size = unsafe { sysconf(_SC_PAGESIZE) as usize };
+        let minimal = quickjs_hook::api_profile_name() == "minimal";
+        let page_size = if minimal {
+            4096usize
+        } else {
+            unsafe { sysconf(_SC_PAGESIZE) as usize }
+        };
         let alloc_size = size.div_ceil(page_size) * page_size;
 
         extern "C" {
             fn hook_mmap_near(target: *mut std::ffi::c_void, alloc_size: usize) -> *mut std::ffi::c_void;
         }
 
-        let ptr = unsafe { hook_mmap_near(hint as *mut std::ffi::c_void, alloc_size) };
+        let ptr = if minimal && hint == 0 {
+            unsafe { Self::raw_mmap_rwx(alloc_size) }
+        } else {
+            unsafe { hook_mmap_near(hint as *mut std::ffi::c_void, alloc_size) }
+        };
 
         if std::ptr::eq(ptr, MAP_FAILED) {
             return None;
         }
 
-        let _ = set_anon_vma_name_raw(ptr as *mut u8, alloc_size, HOOK_EXEC_VMA_NAME);
+        if !minimal {
+            let _ = set_anon_vma_name_raw(ptr as *mut u8, alloc_size, HOOK_EXEC_VMA_NAME);
+        }
 
         Some(ExecMemory {
             ptr: ptr as *mut u8,
@@ -128,8 +195,13 @@ pub fn init_hook_runtime() -> Result<(), String> {
         return Ok(());
     }
 
-    // Allocate executable memory for hooks (64KB), near libart.so for ADRP range
-    let libart_hint = find_libart_base().unwrap_or(0);
+    // Minimal profile avoids /proc/self/maps during engine initialization; some
+    // hardened apps crash on that read path immediately after injection.
+    let libart_hint = if quickjs_hook::api_profile_name() == "minimal" {
+        0
+    } else {
+        find_libart_base().unwrap_or(0)
+    };
     let exec_mem = EXEC_MEM
         .get_or_init(|| ExecMemory::new_near(64 * 1024, libart_hint).expect("Failed to allocate executable memory"));
 

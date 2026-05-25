@@ -247,7 +247,13 @@ fn handle_socket_connection(stream: UnixStream, session: Arc<Session>) {
                 }
             },
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                if session.id == 0 {
+                if !session.connected.load(Ordering::Acquire) {
+                    if session.id == 0 {
+                        log_error!("Agent socket 在 HELLO 前关闭");
+                    } else {
+                        log_error!("[#{}] Agent socket 在 HELLO 前关闭", session.id);
+                    }
+                } else if session.id == 0 {
                     // legacy 模式静默断连
                 } else {
                     log_error!("[#{}] Agent 连接已断开", session.id);

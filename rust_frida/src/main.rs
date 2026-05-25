@@ -27,8 +27,17 @@ pub(crate) fn parse_rpc_bind(arg: &str) -> String {
     }
 }
 
+fn auto_load_delay() -> Duration {
+    std::env::var("RF_LOAD_DELAY_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_millis)
+        .unwrap_or_default()
+}
+
 use crate::logger::{DIM, RESET};
-use args::Args;
+use args::{Args, QuickJsProfile};
 use clap::Parser;
 #[cfg(feature = "qbdi")]
 use communication::send_qbdi_helper;
@@ -45,6 +54,7 @@ use rustyline::Editor;
 use session::{Session, SessionManager};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 use types::get_string_table_names;
 
 fn set_current_thread_name(name: &'static [u8]) {
@@ -298,6 +308,12 @@ fn main() {
     if args.verbose {
         let _ = send_command(sender, "__set_verbose__");
     }
+    if args.quickjs_profile != QuickJsProfile::Full {
+        let _ = send_command(
+            sender,
+            format!("__quickjs_profile__ {}", args.quickjs_profile.as_agent_value()),
+        );
+    }
 
     // ── RPC HTTP 服务器（如启用）──
     // legacy 模式只有一个 session (id=0)，用 SessionManager 包一层供 http_rpc 复用
@@ -350,8 +366,18 @@ fn main() {
     // is already running.
     if args.spawn.is_none() || !spawn_pre_resume {
         if let Some(script_path) = &args.load_script {
-            if let Err(e) = load_script_file(&session, script_path, false) {
-                log_error!("{}", e);
+            let delay = auto_load_delay();
+            if !delay.is_zero() {
+                log_info!("延迟加载脚本 {}ms (RF_LOAD_DELAY_MS)", delay.as_millis());
+                std::thread::sleep(delay);
+                if session.disconnected.load(Ordering::Acquire) {
+                    log_error!("延迟期间 agent 已断开，跳过脚本加载");
+                }
+            }
+            if !session.disconnected.load(Ordering::Acquire) {
+                if let Err(e) = load_script_file(&session, script_path, false) {
+                    log_error!("{}", e);
+                }
             }
         }
     }

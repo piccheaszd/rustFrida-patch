@@ -572,8 +572,7 @@ void* hook_mmap_near_range(void* target, size_t alloc_size, int64_t max_range) {
                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     }
 
-    long page_size_l = sysconf(_SC_PAGESIZE);
-    size_t page_size = page_size_l > 0 ? (size_t)page_size_l : 4096u;
+    size_t page_size = 4096u;
 
     uintptr_t target_addr = (uintptr_t)target;
 
@@ -952,8 +951,7 @@ void* hook_alloc_near_range(size_t size, void* target, int64_t max_range) {
     }
 
     /* Phase 2: 分级创建 pool — 64KB → 16KB → 单页 */
-    long page_size_l = sysconf(_SC_PAGESIZE);
-    size_t page_size = page_size_l > 0 ? (size_t)page_size_l : 4096u;
+    size_t page_size = 4096u;
     /* 本次请求 size 的 page 对齐下界，低于这个值的 pool size 不用尝试 */
     size_t min_pool = (size + page_size - 1) & ~(page_size - 1);
 

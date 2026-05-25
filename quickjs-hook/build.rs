@@ -1,6 +1,95 @@
 use std::env;
 use std::path::PathBuf;
 
+fn replace_required(source: &mut String, label: &str, from: &str, to: &str) {
+    if !source.contains(from) {
+        panic!("required QuickJS patch pattern not found: {label}");
+    }
+    *source = source.replace(from, to);
+}
+
+fn patched_quickjs_source(source: &str) -> String {
+    let mut patched = source.to_string();
+
+    replace_required(
+        &mut patched,
+        "accessor helper",
+        "#ifdef CONFIG_ATOMICS\n\
+static pthread_mutex_t js_class_id_mutex = PTHREAD_MUTEX_INITIALIZER;\n\
+#endif\n",
+        "#ifdef CONFIG_ATOMICS\n\
+static pthread_mutex_t js_class_id_mutex = PTHREAD_MUTEX_INITIALIZER;\n\
+#endif\n\
+\n\
+static void rustfrida_qjs_accessor_name(char *buf, size_t buf_size, const char *prefix, const char *name)\n\
+{\n\
+    size_t pos = 0;\n\
+\n\
+    if (!buf || buf_size == 0)\n\
+        return;\n\
+    while (prefix && *prefix && pos + 1 < buf_size)\n\
+        buf[pos++] = *prefix++;\n\
+    if (pos + 1 < buf_size)\n\
+        buf[pos++] = ' ';\n\
+    while (name && *name && pos + 1 < buf_size)\n\
+        buf[pos++] = *name++;\n\
+    buf[pos] = '\\0';\n\
+}\n",
+    );
+
+    replace_required(
+        &mut patched,
+        "JS_NewClassID lock",
+        r#"#ifdef CONFIG_ATOMICS
+    pthread_mutex_lock(&js_class_id_mutex);
+#endif
+"#,
+        "",
+    );
+    replace_required(
+        &mut patched,
+        "JS_NewClassID allocator",
+        r#"        class_id = js_class_id_alloc++;"#,
+        r#"#ifdef CONFIG_ATOMICS
+        class_id = __atomic_fetch_add(&js_class_id_alloc, 1, __ATOMIC_SEQ_CST);
+#else
+        class_id = js_class_id_alloc++;
+#endif"#,
+    );
+    replace_required(
+        &mut patched,
+        "JS_NewClassID unlock",
+        r#"#ifdef CONFIG_ATOMICS
+    pthread_mutex_unlock(&js_class_id_mutex);
+#endif
+"#,
+        "",
+    );
+
+    replace_required(
+        &mut patched,
+        "getter name snprintf",
+        "                snprintf(buf, sizeof(buf), \"get %s\", e->name);",
+        "                rustfrida_qjs_accessor_name(buf, sizeof(buf), \"get\", e->name);",
+    );
+    replace_required(
+        &mut patched,
+        "setter name snprintf",
+        "                snprintf(buf, sizeof(buf), \"set %s\", e->name);",
+        "                rustfrida_qjs_accessor_name(buf, sizeof(buf), \"set\", e->name);",
+    );
+    replace_required(
+        &mut patched,
+        "Math.random gettimeofday seed",
+        r#"    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    ctx->random_state = ((int64_t)tv.tv_sec * 1000000) + tv.tv_usec;"#,
+        "    ctx->random_state = ((uintptr_t)ctx >> 4) ^ 0x9e3779b97f4a7c15ULL;",
+    );
+
+    patched
+}
+
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -93,9 +182,13 @@ fn main() {
             .unwrap_or_else(|| "unknown".to_owned());
         let has_libbf = quickjs_src.join("libbf.c").exists();
 
+        let quickjs_patched_c = out_path.join("quickjs_patched.c");
+        let quickjs_source = std::fs::read_to_string(&quickjs_c).expect("read quickjs.c");
+        std::fs::write(&quickjs_patched_c, patched_quickjs_source(&quickjs_source)).expect("write patched quickjs.c");
+
         let mut build = cc::Build::new();
         build
-            .file(&quickjs_c)
+            .file(&quickjs_patched_c)
             .file(quickjs_src.join("dtoa.c"))
             .file(quickjs_src.join("libregexp.c"))
             .file(quickjs_src.join("libunicode.c"))

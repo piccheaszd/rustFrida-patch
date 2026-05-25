@@ -201,8 +201,10 @@ int hook_engine_init(void* exec_mem, size_t size) {
     g_engine.hooks = NULL;
     g_engine.free_list = NULL;
     g_engine.redirects = NULL;
-    g_engine.exec_mem_page_size = (size_t)sysconf(_SC_PAGESIZE);
-    pthread_mutex_init(&g_engine.lock, NULL);
+    g_engine.exec_mem_page_size = 4096u;
+    /* g_engine is static zero-initialized; bionic's default mutex initializer is
+     * also all-zero. Avoid calling pthread_mutex_init() from injected startup
+     * because hardened apps may crash inside target libc initialization paths. */
     g_engine.initialized = 1;
 
     return 0;
@@ -300,5 +302,4 @@ void hook_engine_cleanup(void) {
     g_engine.initialized = 0;
 
     pthread_mutex_unlock(&g_engine.lock);
-    pthread_mutex_destroy(&g_engine.lock);
 }

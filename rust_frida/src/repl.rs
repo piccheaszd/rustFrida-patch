@@ -55,11 +55,11 @@ pub(crate) fn try_loadjs_on_main_thread_if_java(session: &Session, line: &str) -
     };
     let (filename, script) = parse_loadjs_payload_for_host(rest);
 
-    if script_uses_java_api(script) {
-        log_info!("检测到 Java loadjs，切到目标主线程执行");
-    } else {
-        log_info!("loadjs 切到目标主线程执行");
+    if !script_uses_java_api(script) {
+        return Ok(false);
     }
+
+    log_info!("检测到 Java loadjs，切到目标主线程执行");
     crate::remote_agent::eval_js_on_main_thread(session, script, filename, true)
         .map_err(|e| format!("主线程执行 loadjs 失败: {}", e))?;
     Ok(true)
@@ -522,15 +522,18 @@ fn load_script_file_with_mode(
 
     preconfigure_java_stealth_if_declared(session, &script)?;
 
-    if script_uses_java_api(&script) {
-        log_info!("检测到 Java 脚本，切到目标主线程执行");
-    } else {
-        log_info!("脚本切到目标主线程执行");
-    }
+    let uses_java = script_uses_java_api(&script);
     let filename = script_filename(script_path);
     session.eval_state.clear();
-    crate::remote_agent::eval_js_on_main_thread(session, &script, &filename, true)
-        .map_err(|e| format!("主线程加载脚本失败: {}", e))?;
+    if uses_java {
+        log_info!("检测到 Java 脚本，切到目标主线程执行");
+        crate::remote_agent::eval_js_on_main_thread(session, &script, &filename, true)
+            .map_err(|e| format!("主线程加载脚本失败: {}", e))?;
+    } else {
+        log_info!("非 Java 脚本在 agent worker 初始化并执行");
+        send_command(sender, format!("loadjs_init [{}]\n{}", filename, script))
+            .map_err(|e| format!("发送 loadjs_init 失败: {}", e))?;
+    }
     print_eval_result(session, if stop_worker_after_load { 10 } else { 30 });
     Ok(PreResumeLoad::Loaded)
 }

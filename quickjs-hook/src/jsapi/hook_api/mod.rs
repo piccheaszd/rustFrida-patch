@@ -67,6 +67,10 @@ pub fn register_hook_api(ctx: &JSContext) {
 
     global.free(ctx.as_ptr());
 
+    if crate::is_minimal_api_profile() {
+        return;
+    }
+
     // Load NativeFunction JS wrapper (Frida-compatible API)
     let boot = include_str!("native_boot.js");
     match ctx.eval(boot, "<native_boot>") {

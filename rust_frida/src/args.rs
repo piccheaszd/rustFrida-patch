@@ -1,11 +1,28 @@
 #![cfg(all(target_os = "android", target_arch = "aarch64"))]
 
-use clap::{ArgGroup, Parser};
+use clap::{ArgGroup, Parser, ValueEnum};
 
 fn parse_pid(s: &str) -> std::result::Result<i32, String> {
     match s.parse::<i32>() {
         Ok(n) if n > 0 => Ok(n),
         _ => Err("PID 必须是正整数".to_string()),
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum QuickJsProfile {
+    /// Full Frida-compatible API surface.
+    Full,
+    /// Minimal API surface for hardened apps that crash during optional bootstraps.
+    Minimal,
+}
+
+impl QuickJsProfile {
+    pub(crate) fn as_agent_value(self) -> &'static str {
+        match self {
+            QuickJsProfile::Full => "full",
+            QuickJsProfile::Minimal => "minimal",
+        }
     }
 }
 
@@ -96,6 +113,10 @@ pub(crate) struct Args {
     /// 加载并执行JavaScript脚本文件
     #[arg(short = 'l', long = "load-script", value_name = "FILE")]
     pub(crate) load_script: Option<String>,
+
+    /// QuickJS API profile: full keeps all APIs; minimal skips optional JS bootstraps/Module/Java
+    #[arg(long = "quickjs-profile", value_enum, default_value_t = QuickJsProfile::Full)]
+    pub(crate) quickjs_profile: QuickJsProfile,
 
     /// 显示详细注入信息（地址、偏移等）
     #[arg(short = 'v', long = "verbose")]

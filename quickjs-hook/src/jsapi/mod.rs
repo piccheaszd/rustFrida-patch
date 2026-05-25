@@ -27,13 +27,17 @@ use crate::context::JSContext;
 
 /// Register all JavaScript APIs
 pub fn register_all_apis(ctx: &JSContext) {
+    let minimal = crate::is_minimal_api_profile();
+
     register_console(ctx);
     register_file_api(ctx);
     register_ptr(ctx);
     register_hook_api(ctx);
     register_jni_api(ctx);
     register_memory_api(ctx);
-    register_module_api(ctx);
-    register_lazy_java_api(ctx);
+    if !minimal {
+        register_module_api(ctx);
+        register_lazy_java_api(ctx);
+    }
     register_rpc(ctx);
 }

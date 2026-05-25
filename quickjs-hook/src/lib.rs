@@ -61,11 +61,41 @@ pub use jsapi::memory::cleanup_wxshadow_patches;
 pub use runtime::JSRuntime;
 pub use value::JSValue;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 static QBDI_OUTPUT_DIR: OnceLock<String> = OnceLock::new();
 static QBDI_HELPER_BLOB: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+static API_PROFILE: AtomicU8 = AtomicU8::new(API_PROFILE_FULL);
+
+const API_PROFILE_FULL: u8 = 0;
+const API_PROFILE_MINIMAL: u8 = 1;
+
+pub fn set_api_profile(profile: &str) -> Result<&'static str, String> {
+    match profile.trim().to_ascii_lowercase().as_str() {
+        "" | "full" => {
+            API_PROFILE.store(API_PROFILE_FULL, Ordering::Release);
+            Ok("full")
+        }
+        "minimal" | "safe" | "hardened" => {
+            API_PROFILE.store(API_PROFILE_MINIMAL, Ordering::Release);
+            Ok("minimal")
+        }
+        other => Err(format!("unsupported QuickJS profile: {}", other)),
+    }
+}
+
+pub fn api_profile_name() -> &'static str {
+    if is_minimal_api_profile() {
+        "minimal"
+    } else {
+        "full"
+    }
+}
+
+pub(crate) fn is_minimal_api_profile() -> bool {
+    API_PROFILE.load(Ordering::Acquire) == API_PROFILE_MINIMAL
+}
 
 pub fn set_qbdi_output_dir(output_dir: impl Into<String>) {
     let _ = QBDI_OUTPUT_DIR.set(output_dir.into());

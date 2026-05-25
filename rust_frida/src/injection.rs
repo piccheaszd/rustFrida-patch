@@ -7,9 +7,12 @@ use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::Pid;
 use std::mem::size_of;
 use std::os::unix::io::RawFd;
+use std::time::Duration;
 
 use crate::proc_mem::ProcMem;
-use crate::process::{attach_to_process, call_target_function, parse_proc_maps};
+use crate::process::{
+    attach_to_process, call_target_function, parse_proc_maps, sample_thread_stop_point, ThreadStopSample,
+};
 use crate::types::{bootstrap_status, message_type, FridaBootstrapContext, FridaLibcApi, RustFridaLoaderContext};
 use crate::{log_error, log_info, log_success, log_verbose, log_warn};
 
@@ -325,7 +328,178 @@ fn find_executable_region(pid: i32, min_size: usize) -> Result<usize, String> {
     Err("未找到可用的 r-xp 区域".into())
 }
 
+fn read_task_text(pid: i32, tid: i32, name: &str) -> String {
+    std::fs::read_to_string(format!("/proc/{}/task/{}/{}", pid, tid, name))
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+fn thread_state(status: &str) -> char {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("State:"))
+        .and_then(|state| state.trim().chars().next())
+        .unwrap_or('?')
+}
+
+fn kernel_wait_reason(value: &str) -> Option<&'static str> {
+    const WAIT_PATTERNS: &[(&str, &str)] = &[
+        ("get_signal", "signal-path"),
+        ("do_signal_stop", "signal-stop"),
+        ("futex", "futex-wait"),
+        ("ep_poll", "epoll-wait"),
+        ("epoll", "epoll-wait"),
+        ("poll_schedule", "poll-wait"),
+        ("binder", "binder-wait"),
+        ("pipe_read", "pipe-read"),
+        ("unix_stream_read", "socket-read"),
+        ("wait_woken", "kernel-wait"),
+        ("io_schedule", "io-wait"),
+        ("schedule_timeout", "timeout-wait"),
+        ("hrtimer_nanosleep", "nanosleep"),
+    ];
+
+    WAIT_PATTERNS
+        .iter()
+        .find_map(|(needle, reason)| value.contains(needle).then_some(*reason))
+}
+
+fn score_probe_presample(pid: i32, tid: i32, comm: &str, state: char, wchan: &str) -> i32 {
+    let mut score = 0;
+    if tid == pid {
+        score += 80;
+    }
+    match state {
+        'R' => score += 300,
+        'S' => score += 20,
+        'D' => score -= 500,
+        'T' | 't' => score -= 250,
+        _ => {}
+    }
+    if let Some(reason) = kernel_wait_reason(wchan) {
+        score -= if reason == "signal-path" { 1_500 } else { 350 };
+    }
+    if is_risky_injection_thread(comm) {
+        score -= 10_000;
+    }
+    score
+}
+
+fn score_thread_sample(pid: i32, sample: &ThreadStopSample) -> i32 {
+    let mut score = 0;
+    if sample.tid == pid {
+        score += 80;
+    }
+    if sample.pc_is_executable() {
+        score += 500;
+    } else {
+        score -= 600;
+    }
+    if sample.syscall_before == "running" {
+        score += 250;
+    } else if !sample.syscall_before.is_empty() {
+        score -= 80;
+    }
+    if let Some(reason) = kernel_wait_reason(&sample.wchan_before) {
+        score -= match reason {
+            "signal-path" | "signal-stop" => 2_000,
+            "futex-wait" | "epoll-wait" | "binder-wait" => 500,
+            _ => 300,
+        };
+    }
+    if is_risky_injection_thread(&sample.comm) {
+        score -= 10_000;
+    }
+    score
+}
+
+fn choose_probe_injection_thread(pid: i32) -> Option<i32> {
+    let task_dir = format!("/proc/{}/task", pid);
+    let entries = std::fs::read_dir(task_dir).ok()?;
+    let limit = std::env::var("RF_THREAD_PROBE_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(24);
+    let timeout = std::env::var("RF_THREAD_PROBE_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_millis(250));
+
+    let mut presample = Vec::new();
+    for entry in entries.flatten() {
+        let tid = match entry.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) {
+            Some(tid) => tid,
+            None => continue,
+        };
+        let status = read_task_text(pid, tid, "status");
+        let comm = read_task_text(pid, tid, "comm");
+        let wchan = read_task_text(pid, tid, "wchan");
+        let score = score_probe_presample(pid, tid, &comm, thread_state(&status), &wchan);
+        presample.push((score, tid, comm, wchan));
+    }
+
+    presample.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
+    let mut best: Option<(i32, ThreadStopSample)> = None;
+    for (rank, (pre_score, tid, comm, wchan)) in presample.into_iter().take(limit).enumerate() {
+        log_verbose!(
+            "thread probe pre #{}: tid={} score={} comm={} wchan={}",
+            rank + 1,
+            tid,
+            pre_score,
+            comm,
+            wchan
+        );
+        match sample_thread_stop_point(pid, tid, timeout) {
+            Ok(sample) => {
+                let score = score_thread_sample(pid, &sample);
+                let wait_note = kernel_wait_reason(&sample.wchan_before).unwrap_or("ok");
+                log_verbose!(
+                    "thread probe sample score={} wait={} syscall={} {}",
+                    score,
+                    wait_note,
+                    sample.syscall_before,
+                    sample.short_summary()
+                );
+                if best.as_ref().map(|(best_score, _)| score > *best_score).unwrap_or(true) {
+                    best = Some((score, sample));
+                }
+            }
+            Err(e) => {
+                log_verbose!("thread probe sample failed tid={}: {}", tid, e);
+            }
+        }
+    }
+
+    best.map(|(score, sample)| {
+        log_verbose!("thread probe selected score={} {}", score, sample.short_summary());
+        sample.tid
+    })
+}
+
 fn choose_injection_thread(pid: i32) -> i32 {
+    if let Ok(value) = std::env::var("RF_INJECT_THREAD") {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("main") || value.eq_ignore_ascii_case("pid") {
+            log_verbose!("注入线程候选: forced main tid={}", pid);
+            return pid;
+        }
+        if value.eq_ignore_ascii_case("probe") || value.eq_ignore_ascii_case("auto") {
+            if let Some(tid) = choose_probe_injection_thread(pid) {
+                return tid;
+            }
+            log_warn!("thread probe 未找到可用候选，回退到默认线程选择");
+        }
+        if let Ok(tid) = value.parse::<i32>() {
+            log_verbose!("注入线程候选: forced tid={}", tid);
+            return tid;
+        }
+    }
+
     let task_dir = format!("/proc/{}/task", pid);
     let mut best_tid = pid;
     let mut best_score = i32::MIN;
@@ -464,14 +638,14 @@ impl StopWorldSession {
                         changed = true;
                     }
                     Ok(status) => {
-                        let _ = ptrace::detach(target, None);
+                        let _ = ptrace::detach(target, Some(nix::sys::signal::Signal::SIGCONT));
                         return Err(format!("暂停线程 {} 状态异常: {:?}", tid, status));
                     }
                     Err(Errno::ECHILD) | Err(Errno::ESRCH) => {
-                        let _ = ptrace::detach(target, None);
+                        let _ = ptrace::detach(target, Some(nix::sys::signal::Signal::SIGCONT));
                     }
                     Err(e) => {
-                        let _ = ptrace::detach(target, None);
+                        let _ = ptrace::detach(target, Some(nix::sys::signal::Signal::SIGCONT));
                         return Err(format!("等待线程 {} 停止失败: {}", tid, e));
                     }
                 }
@@ -491,7 +665,7 @@ impl StopWorldSession {
             return;
         }
         for &tid in self.tids.iter().rev() {
-            let _ = ptrace::detach(Pid::from_raw(tid), None);
+            let _ = ptrace::detach(Pid::from_raw(tid), Some(nix::sys::signal::Signal::SIGCONT));
         }
         self.active = false;
     }
@@ -810,7 +984,7 @@ fn run_loader_handshake(ctrl_fd: RawFd, target_pid: i32, loader_ctx_addr: usize)
     // 2. 发送 agent SO fd (创建 memfd → 写入 AGENT_SO → sendmsg)
     //    关键: 必须设置 SELinux label 为 frida_memfd (带 mlstrustedobject 属性)，
     //    否则 untrusted_app 因 MLS 分类不匹配无法通过 SCM_RIGHTS 接收 tmpfs fd。
-    let agent_memfd = unsafe { libc::memfd_create(c"wwb_so".as_ptr(), 0) };
+    let agent_memfd = unsafe { libc::memfd_create(c"jit-cache".as_ptr(), 0) };
     if agent_memfd < 0 {
         return Err(format!("memfd_create 失败: {}", std::io::Error::last_os_error()));
     }
@@ -980,7 +1154,11 @@ fn inject_via_bootstrapper_once(
     // 附加到选中的目标线程
     attach_to_process(trace_tid)?;
     let mut stop_world = StopWorldSession::new(trace_tid);
-    stop_world.attach_siblings(pid, trace_tid)?;
+    if std::env::var("RF_STOP_WORLD").map(|v| v != "0").unwrap_or(false) {
+        stop_world.attach_siblings(pid, trace_tid)?;
+    } else {
+        log_verbose!("stop-the-world: disabled (set RF_STOP_WORLD=1 to enable)");
+    }
 
     let mem = ProcMem::open(pid as u32)?;
 
@@ -1196,6 +1374,9 @@ fn inject_via_bootstrapper_once(
 
     // === ptrace 分离 ===
     stop_world.detach_all();
+    unsafe {
+        libc::kill(pid, libc::SIGCONT);
+    }
     log_success!("已分离目标进程");
 
     // === Host 端 loader IPC 握手 ===

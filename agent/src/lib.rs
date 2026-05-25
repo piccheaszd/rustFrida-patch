@@ -139,12 +139,33 @@ pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
     // install_crash_handlers();
 
     // 从 AgentArgs 读取 ctrl_fd 和 StringTable 指针
-    let (ctrl_fd, table) = unsafe {
+    let (ctrl_fd, table_addr) = unsafe {
         let args = &*(args_ptr as *const AgentArgs);
-        (args.ctrl_fd, &*(args.table as *const StringTable))
+        (args.ctrl_fd, args.table)
     };
 
+    // 先完成 agent <-> host 的 HELLO，后续 StringTable/cmdline 初始化若出错可被 host 观测到。
+    let sock = unsafe { UnixStream::from_raw_fd(ctrl_fd) };
+    let write_half = match sock.try_clone() {
+        Ok(stream) => stream,
+        Err(_) => return null_mut(),
+    };
+    register_stream_fd(&write_half);
+    if GLOBAL_STREAM.set(std::sync::Mutex::new(write_half)).is_err() {
+        return null_mut();
+    }
+    // 启动异步日志 writer 线程：write_stream() 只 push channel，此线程通过 GLOBAL_STREAM 写 socket
+    start_log_writer();
+    send_hello();
+    log_msg_sync(format!(
+        "agent-entry: hello sent ctrl_fd={} table=0x{:x}\n",
+        ctrl_fd, table_addr
+    ));
+    raw_thread::sleep_ms(100);
+    flush_cached_logs();
+
     unsafe {
+        let table = &*(table_addr as *const StringTable);
         // 读取 output_path 并保存到全局变量
         if let Some(output) = table.get_output_path() {
             if output != "novalue" {
@@ -162,15 +183,6 @@ pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
 
     // 不设置线程名，保持继承的进程名，避免被安全 SDK 通过 /proc/self/task/*/comm 检测
 
-    // 使用 ctrl_fd（socketpair 的 agent 端），已通过 socketpair 连接到 host
-    let sock = unsafe { UnixStream::from_raw_fd(ctrl_fd) };
-    let write_half = sock.try_clone().expect("stream clone failed");
-    register_stream_fd(&write_half);
-    GLOBAL_STREAM.set(std::sync::Mutex::new(write_half)).unwrap();
-    // 启动异步日志 writer 线程：write_stream() 只 push channel，此线程通过 GLOBAL_STREAM 写 socket
-    start_log_writer();
-    send_hello();
-    raw_thread::sleep_ms(100);
     flush_cached_logs();
 
     let reader = sock;
@@ -480,6 +492,14 @@ fn process_cmd(command: &str) {
         #[cfg(feature = "quickjs")]
         Some("__set_verbose__") => {
             quickjs_hook::set_verbose(true);
+        }
+        #[cfg(feature = "quickjs")]
+        Some("__quickjs_profile__") => {
+            let profile = command.split_whitespace().nth(1).unwrap_or("full");
+            match quickjs_hook::set_api_profile(profile) {
+                Ok(active) => log_msg(format!("[quickjs] profile={}\n", active)),
+                Err(e) => log_msg(format!("[quickjs] profile error: {}\n", e)),
+            }
         }
         #[cfg(feature = "quickjs")]
         Some("javastealth") => {
