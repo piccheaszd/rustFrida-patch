@@ -84,6 +84,9 @@ limits:
   giving hardened startup paths time to settle before running user JavaScript.
 - `rust_frida/build.rs` now fails if the embedded `libagent.so` is older than
   `agent` or `quickjs-hook` inputs, preventing stale embedded-agent tests.
+- `rust_frida/build.rs` also fails if the embedded loader blobs are older than
+  `loader/helpers` or `loader/build_helpers.py`, preventing stale loader
+  protocol tests.
 - `--quickjs-profile minimal` now exposes only the small diagnostic surface.
   The generic alias `--quickjs-profile hardened` maps to the same profile.
 - QuickJS exposes the Frida-compatible `NativePointer` global alias in addition
@@ -285,6 +288,47 @@ Important late/PID attach relevance:
   Next fixes should either hide these artifacts or move late attach so these
   checks do not observe framework-owned fds/threads.
 
+## 2026-05-25 Control FD and Stream Transfer Fixes
+
+The previous fd/VMA fixes removed file-backed LOAD mappings and visible VMA
+names, but late attach still exposed one short-lived agent memfd fd during the
+loader transfer window. The loader then copied from that fd into an anonymous
+buffer, so the mapping was clean but `/proc/self/fd` could still see the
+transfer fd before it was closed.
+
+Additional hardening:
+
+- agent communication now uses one target-side control fd instead of duplicating
+  it for reader/writer split;
+- the loader control fd is closed by default before entering agent code
+  (`RF_KEEP_LOADER_CTRL=1` keeps the old behavior, `RF_CLOSE_LOADER_CTRL`
+  overrides explicitly);
+- `RF_STREAM_AGENT=1` sends the agent ELF over the loader control socket instead
+  of passing an agent memfd with `SCM_RIGHTS`;
+- the streamed agent path still reads into an anonymous buffer, maps anonymous
+  LOAD pages, restores final segment protections, and keeps RELRO protection.
+
+Validation:
+
+- `RF_STREAM_AGENT=1 --spawn-early --quickjs-profile minimal` completed
+  `link:recv-stream-size`, `link:recv-stream`, ELF validation, anonymous segment
+  mapping, relocation, entry, and agent command-loop startup.
+- `RF_STREAM_AGENT=1 --spawn-late --quickjs-profile minimal` reached
+  `Loader: agent 加载成功`, `Agent 已连接`, and agent command-loop startup, then
+  shut down normally from host-side input EOF.
+- The old memfd path still exists as the default for compatibility and speed.
+  The stream path is currently the safer mode for hardened late attach.
+
+Remaining PID-attach-specific observations:
+
+- Attaching to a fully running process can still fail before loader execution if
+  all sampled threads are in `get_signal` and the selected thread never reaches
+  the expected SIGSTOP wait state.
+- After bringing the process foreground, PID attach can pass thread probing and
+  bootstrapper phase 1/2, but one run saw the target restart during the host
+  resolver-table write before loader execution. This is separate from the agent
+  transfer fd issue proven by the successful `--spawn-late` stream run.
+
 ## Remaining Work
 
 1. Improve automatic thread probing so it can find a usable user-mode transition
@@ -297,4 +341,7 @@ Important late/PID attach relevance:
    returning from native code instead of arbitrary signal-path stops.
 5. Add a safe startup tracing recipe that avoids combining loader and
    JNI-registration `WXSHADOW` hooks in the same early-start run.
-6. Add a mitigation experiment for high-fd socket hiding during late/PID attach.
+6. Decide whether to make `RF_STREAM_AGENT=1` automatic for hardened
+   late/spawn-late profiles after compatibility testing on normal targets.
+7. Continue PID attach hardening around stop-state selection and target restarts
+   during host-side memory writes.

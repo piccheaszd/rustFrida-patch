@@ -4,8 +4,7 @@
 //! 避免为日志保留后台线程影响自定义 linker 卸载。
 //! 控制消息 (HELLO/COMPLETE/EVAL_OK/EVAL_ERR) 仍走同步路径（低频且需要保序）。
 
-use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
+use std::io::Read;
 use std::os::unix::net::UnixStream;
 use std::sync::{Mutex, OnceLock};
 
@@ -21,9 +20,11 @@ const FRAME_KIND_RPC_OK: u8 = 0x85;
 const FRAME_KIND_RPC_ERR: u8 = 0x86;
 const FRAME_KIND_BYE: u8 = 0x87;
 
-/// Write-half of the agent↔host socket, protected by Mutex to serialize messages.
-/// 控制消息 (HELLO/COMPLETE/EVAL_OK/EVAL_ERR) 直接走此 stream。
-pub static GLOBAL_STREAM: OnceLock<Mutex<UnixStream>> = OnceLock::new();
+/// Agent↔host socket fd, protected by Mutex to serialize write frames.
+///
+/// Keep a single fd in the target process: duplicating the socket creates an
+/// extra `/proc/self/fd/<n>` entry that hardened loaders can enumerate.
+pub static GLOBAL_STREAM: OnceLock<Mutex<i32>> = OnceLock::new();
 pub static GLOBAL_STREAM_FD: OnceLock<i32> = OnceLock::new();
 
 #[inline(always)]
@@ -38,10 +39,6 @@ unsafe fn raw_write_syscall(fd: i32, buf: *const u8, len: usize) -> isize {
         options(nostack)
     );
     ret
-}
-
-fn write_frame(stream: &mut UnixStream, kind: u8, payload: &[u8]) -> std::io::Result<()> {
-    write_frame_raw_fd(stream.as_raw_fd(), kind, payload)
 }
 
 fn write_all_raw_fd(fd: i32, mut data: &[u8]) -> std::io::Result<()> {
@@ -98,18 +95,19 @@ pub(crate) fn start_log_writer() {}
 /// 非阻塞写日志：控制消息持锁或 socket 短时不可写时直接丢弃日志。
 pub(crate) fn write_stream(data: &[u8]) {
     if let Some(m) = GLOBAL_STREAM.get() {
-        let mut stream = match m.try_lock() {
+        let fd = match m.try_lock() {
             Ok(s) => s,
             Err(std::sync::TryLockError::WouldBlock) => return,
             Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
         };
-        let _ = write_frame(&mut stream, FRAME_KIND_LOG, data);
+        let _ = write_frame_raw_fd(*fd, FRAME_KIND_LOG, data);
     }
 }
 
 pub(crate) fn write_stream_sync(data: &[u8]) {
     if let Some(m) = GLOBAL_STREAM.get() {
-        let _ = write_frame(&mut m.lock().unwrap_or_else(|e| e.into_inner()), FRAME_KIND_LOG, data);
+        let fd = m.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = write_frame_raw_fd(*fd, FRAME_KIND_LOG, data);
     }
 }
 
@@ -135,57 +133,43 @@ pub(crate) fn write_stream_raw(data: &[u8]) {
 
 pub(crate) fn send_complete(text: &str) {
     if let Some(m) = GLOBAL_STREAM.get() {
-        let _ = write_frame(
-            &mut m.lock().unwrap_or_else(|e| e.into_inner()),
-            FRAME_KIND_COMPLETE,
-            text.as_bytes(),
-        );
+        let fd = m.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = write_frame_raw_fd(*fd, FRAME_KIND_COMPLETE, text.as_bytes());
     }
 }
 
 pub(crate) fn send_eval_ok(text: &str) {
     if let Some(m) = GLOBAL_STREAM.get() {
-        let _ = write_frame(
-            &mut m.lock().unwrap_or_else(|e| e.into_inner()),
-            FRAME_KIND_EVAL_OK,
-            text.as_bytes(),
-        );
+        let fd = m.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = write_frame_raw_fd(*fd, FRAME_KIND_EVAL_OK, text.as_bytes());
     }
 }
 
 pub(crate) fn send_eval_err(text: &str) {
     if let Some(m) = GLOBAL_STREAM.get() {
-        let _ = write_frame(
-            &mut m.lock().unwrap_or_else(|e| e.into_inner()),
-            FRAME_KIND_EVAL_ERR,
-            text.as_bytes(),
-        );
+        let fd = m.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = write_frame_raw_fd(*fd, FRAME_KIND_EVAL_ERR, text.as_bytes());
     }
 }
 
 pub(crate) fn send_rpc_ok(text: &str) {
     if let Some(m) = GLOBAL_STREAM.get() {
-        let _ = write_frame(
-            &mut m.lock().unwrap_or_else(|e| e.into_inner()),
-            FRAME_KIND_RPC_OK,
-            text.as_bytes(),
-        );
+        let fd = m.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = write_frame_raw_fd(*fd, FRAME_KIND_RPC_OK, text.as_bytes());
     }
 }
 
 pub(crate) fn send_rpc_err(text: &str) {
     if let Some(m) = GLOBAL_STREAM.get() {
-        let _ = write_frame(
-            &mut m.lock().unwrap_or_else(|e| e.into_inner()),
-            FRAME_KIND_RPC_ERR,
-            text.as_bytes(),
-        );
+        let fd = m.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = write_frame_raw_fd(*fd, FRAME_KIND_RPC_ERR, text.as_bytes());
     }
 }
 
 pub(crate) fn send_bye() {
     if let Some(m) = GLOBAL_STREAM.get() {
-        let _ = write_frame(&mut m.lock().unwrap_or_else(|e| e.into_inner()), FRAME_KIND_BYE, &[]);
+        let fd = m.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = write_frame_raw_fd(*fd, FRAME_KIND_BYE, &[]);
     }
 }
 
@@ -225,17 +209,16 @@ pub(crate) fn log_msg_sync(msg: String) {
 /// 关闭 socket 写端。用 SHUT_WR 保留已排队的 LOG/BYE frame，避免 host 读到 reset。
 pub(crate) fn shutdown_stream() {
     if let Some(m) = GLOBAL_STREAM.get() {
-        let mut stream = m.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = stream.flush();
-        let fd = stream.as_raw_fd();
+        let fd = *m.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             libc::shutdown(fd, libc::SHUT_WR);
         }
     }
 }
 
-pub(crate) fn register_stream_fd(stream: &UnixStream) {
-    let _ = GLOBAL_STREAM_FD.set(stream.as_raw_fd());
+pub(crate) fn register_stream_fd(fd: i32) -> bool {
+    let _ = GLOBAL_STREAM_FD.set(fd);
+    GLOBAL_STREAM.set(Mutex::new(fd)).is_ok()
 }
 
 /// 刷新缓存的日志，在socket连接后调用

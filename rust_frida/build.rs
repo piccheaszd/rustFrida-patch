@@ -20,6 +20,16 @@ fn main() {
     println!("cargo::rerun-if-changed=../loader/build/bootstrapper.bin");
     println!("cargo::rerun-if-changed=../loader/build/rustfrida-loader.bin");
 
+    let loader_build_script = workspace_root.join("loader").join("build_helpers.py");
+    let loader_helpers = workspace_root.join("loader").join("helpers");
+    let loader_bootstrapper = workspace_root.join("loader").join("build").join("bootstrapper.bin");
+    let loader_blob = workspace_root.join("loader").join("build").join("rustfrida-loader.bin");
+    let mut newest_loader_input = SystemTime::UNIX_EPOCH;
+    watch_inputs(loader_build_script.as_path(), &mut newest_loader_input);
+    watch_inputs(loader_helpers.as_path(), &mut newest_loader_input);
+    ensure_generated_blob(&loader_bootstrapper, newest_loader_input, "python3 loader/build_helpers.py");
+    ensure_generated_blob(&loader_blob, newest_loader_input, "python3 loader/build_helpers.py");
+
     let mut newest_agent_input = SystemTime::UNIX_EPOCH;
     watch_inputs(
         workspace_root.join("agent").join("Cargo.toml").as_path(),
@@ -73,6 +83,27 @@ fn main() {
         );
         println!("cargo:rustc-env=QBDI_HELPER_SO_PATH={}", helper_path);
         println!("cargo:rerun-if-changed={}", helper_path);
+    }
+}
+
+fn ensure_generated_blob(blob: &Path, newest_input: SystemTime, command: &str) {
+    match std::fs::metadata(blob).and_then(|meta| meta.modified()) {
+        Ok(blob_mtime) if blob_mtime >= newest_input => {}
+        Ok(_) => {
+            panic!(
+                "embedded loader blob is stale: run `{}` before building rust_frida ({})",
+                command,
+                blob.display()
+            );
+        }
+        Err(e) => {
+            panic!(
+                "missing embedded loader blob {}: {}. Run `{}` first",
+                blob.display(),
+                e,
+                command
+            );
+        }
     }
 }
 

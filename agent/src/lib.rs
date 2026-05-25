@@ -34,15 +34,12 @@ mod stalker;
 use crate::communication::{
     flush_cached_logs, is_cmd_frame, is_qbdi_helper_frame, log_msg, log_msg_sync, register_stream_fd, send_bye,
     send_complete, send_eval_err, send_eval_ok, send_hello_raw_fd, send_rpc_err, send_rpc_ok, shutdown_log_writer,
-    shutdown_stream, start_log_writer, write_log_raw_fd, write_stream, GLOBAL_STREAM,
+    shutdown_stream, start_log_writer, write_log_raw_fd, write_stream,
 };
 use crate::crash_handler::install_panic_hook;
 use libc::{kill, pid_t, SIGSTOP};
 use std::alloc::{GlobalAlloc, Layout};
 use std::ffi::c_void;
-use std::os::fd::AsRawFd;
-use std::os::unix::io::FromRawFd;
-use std::os::unix::net::UnixStream;
 use std::process;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -177,31 +174,6 @@ unsafe fn raw_read_syscall(fd: i32, buf: *mut u8, len: usize) -> isize {
     ret
 }
 
-#[inline(always)]
-unsafe fn raw_fcntl_syscall(fd: i32, cmd: usize, arg: usize) -> isize {
-    let ret: isize;
-    core::arch::asm!(
-        "svc #0",
-        inlateout("x0") fd as isize => ret,
-        in("x1") cmd,
-        in("x2") arg,
-        in("x8") 25usize,
-        options(nostack)
-    );
-    ret
-}
-
-#[inline(always)]
-fn raw_dup_fd_cloexec(fd: i32) -> Option<i32> {
-    const F_DUPFD_CLOEXEC: usize = 1030;
-    let ret = unsafe { raw_fcntl_syscall(fd, F_DUPFD_CLOEXEC, 0) };
-    if ret < 0 {
-        None
-    } else {
-        Some(ret as i32)
-    }
-}
-
 #[no_mangle]
 pub extern "C" fn rustfrida_probe_entry(args_ptr: *mut c_void) -> *mut c_void {
     if args_ptr.is_null() {
@@ -330,32 +302,12 @@ pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
     // Keep native crash handlers disabled for this target.
     // install_crash_handlers();
 
-    trace_entry_raw(ctrl_fd, b"[agent-trace] 04 before-from-raw-fd\n");
-    let sock = unsafe { UnixStream::from_raw_fd(ctrl_fd) };
-    trace_entry_raw(ctrl_fd, b"[agent-trace] 05 after-from-raw-fd\n");
-    trace_entry_raw(ctrl_fd, b"[agent-trace] 06 before-raw-dup\n");
-    let write_fd = match raw_dup_fd_cloexec(ctrl_fd) {
-        Some(fd) => {
-            trace_entry_raw(ctrl_fd, b"[agent-trace] 07 after-raw-dup\n");
-            fd
-        }
-        None => {
-            trace_entry_raw(ctrl_fd, b"[agent-trace] 07 raw-dup-failed\n");
-            return null_mut();
-        }
-    };
-    trace_entry_raw(ctrl_fd, b"[agent-trace] 07b before-write-stream-wrap\n");
-    let write_half = unsafe { UnixStream::from_raw_fd(write_fd) };
-    trace_entry_raw(ctrl_fd, b"[agent-trace] 07c after-write-stream-wrap\n");
-    trace_entry_raw(ctrl_fd, b"[agent-trace] 08 before-register-fd\n");
-    register_stream_fd(&write_half);
-    trace_entry_raw(ctrl_fd, b"[agent-trace] 09 after-register-fd\n");
-    trace_entry_raw(ctrl_fd, b"[agent-trace] 10 before-global-stream-set\n");
-    if GLOBAL_STREAM.set(std::sync::Mutex::new(write_half)).is_err() {
+    trace_entry_raw(ctrl_fd, b"[agent-trace] 04 before-register-fd\n");
+    if !register_stream_fd(ctrl_fd) {
         let _ = write_log_raw_fd(ctrl_fd, b"[agent] agent-entry: global stream already initialized\n");
         return null_mut();
     }
-    trace_entry_raw(ctrl_fd, b"[agent-trace] 11 after-global-stream-set\n");
+    trace_entry_raw(ctrl_fd, b"[agent-trace] 05 after-register-fd\n");
     // 启动异步日志 writer 线程：write_stream() 只 push channel，此线程通过 GLOBAL_STREAM 写 socket
     trace_entry_raw(ctrl_fd, b"[agent-trace] 12 before-start-log-writer\n");
     start_log_writer();
@@ -405,8 +357,7 @@ pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
     flush_cached_logs();
     trace_entry_raw(ctrl_fd, b"[agent-trace] 30 before-command-loop\n");
 
-    let reader = sock;
-    let reader_fd_for_raw = reader.as_raw_fd();
+    let reader_fd_for_raw = ctrl_fd;
     loop {
         trace_entry_raw(ctrl_fd, b"[agent-trace] 31 command-loop-read\n");
         let mut header = [0u8; 5];
@@ -467,13 +418,11 @@ pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
     shutdown_log_writer();
     send_bye();
     // 关闭 socket，host 收到 EOF 自然退出
-    let reader_fd = reader.as_raw_fd();
     shutdown_stream();
     unsafe {
-        libc::shutdown(reader_fd, libc::SHUT_RD);
-        libc::close(reader_fd);
+        libc::shutdown(ctrl_fd, libc::SHUT_RD);
+        libc::close(ctrl_fd);
     }
-    std::mem::forget(reader);
 
     null_mut()
 }

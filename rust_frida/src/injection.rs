@@ -184,6 +184,10 @@ fn env_flag_enabled(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn env_value_enabled(value: &str) -> bool {
+    value != "0" && !value.eq_ignore_ascii_case("false")
+}
+
 fn build_loader_agent_data(use_pthread_loader: bool) -> Result<Vec<u8>, String> {
     let mut tokens = Vec::new();
 
@@ -191,9 +195,18 @@ fn build_loader_agent_data(use_pthread_loader: bool) -> Result<Vec<u8>, String> 
         tokens.push("pthread".to_string());
     }
 
-    if env_flag_enabled("RF_CLOSE_LOADER_CTRL") {
+    let close_loader_ctrl = match std::env::var("RF_CLOSE_LOADER_CTRL") {
+        Ok(value) => env_value_enabled(&value),
+        Err(_) => !env_flag_enabled("RF_KEEP_LOADER_CTRL"),
+    };
+    if close_loader_ctrl {
         log_verbose!("loader ctrl fd: 进入 agent 前关闭");
         tokens.push("close-ctrl".to_string());
+    }
+
+    if env_flag_enabled("RF_STREAM_AGENT") {
+        log_verbose!("agent SO transfer: stream over loader control socket");
+        tokens.push("stream-agent".to_string());
     }
 
     if env_flag_enabled("RF_HOLD_BEFORE_ENTRY") {
@@ -1122,47 +1135,55 @@ fn run_loader_handshake(ctrl_fd: RawFd, target_pid: i32, loader_ctx_addr: usize)
     let thread_id = i32::from_le_bytes(tid_buf);
     log_verbose!("Loader worker tid: {}", thread_id);
 
-    // 2. 发送 agent SO fd (创建 memfd → 写入 AGENT_SO → sendmsg)
-    //    关键: 必须设置 SELinux label 为 frida_memfd (带 mlstrustedobject 属性)，
-    //    否则 untrusted_app 因 MLS 分类不匹配无法通过 SCM_RIGHTS 接收 tmpfs fd。
-    let agent_memfd = unsafe { libc::memfd_create(c"jit-cache".as_ptr(), 0) };
-    if agent_memfd < 0 {
-        return Err(format!("memfd_create 失败: {}", std::io::Error::last_os_error()));
-    }
-    // relabel memfd：匹配目标进程的 MLS categories，绕过 MLS/MCS 检查
-    relabel_fd_for_injection(agent_memfd, target_pid);
-    let mut written = 0usize;
-    while written < AGENT_SO.len() {
-        let n = unsafe {
-            libc::write(
-                agent_memfd,
-                AGENT_SO[written..].as_ptr() as *const c_void,
-                AGENT_SO.len() - written,
-            )
-        };
-        if n <= 0 {
-            unsafe { close(agent_memfd) };
-            return Err("写入 agent SO 到 memfd 失败".to_string());
+    // 2. 发送 agent SO。默认仍走 SCM_RIGHTS memfd；RF_STREAM_AGENT=1 时直接经
+    //    loader 控制 socket 流式发送，避免目标进程临时出现 agent memfd fd。
+    if env_flag_enabled("RF_STREAM_AGENT") {
+        let size = (AGENT_SO.len() as u64).to_le_bytes();
+        send_exact(ctrl_fd, &size)?;
+        send_exact(ctrl_fd, AGENT_SO)?;
+        log_verbose!("agent SO 已通过控制 socket 流式发送 ({} bytes)", AGENT_SO.len());
+    } else {
+        // 关键: 必须设置 SELinux label 为 frida_memfd (带 mlstrustedobject 属性)，
+        // 否则 untrusted_app 因 MLS 分类不匹配无法通过 SCM_RIGHTS 接收 tmpfs fd。
+        let agent_memfd = unsafe { libc::memfd_create(c"jit-cache".as_ptr(), 0) };
+        if agent_memfd < 0 {
+            return Err(format!("memfd_create 失败: {}", std::io::Error::last_os_error()));
         }
-        written += n as usize;
-    }
-    let padded_len = match padded_agent_memfd_len() {
-        Ok(len) => len,
-        Err(e) => {
+        // relabel memfd：匹配目标进程的 MLS categories，绕过 MLS/MCS 检查
+        relabel_fd_for_injection(agent_memfd, target_pid);
+        let mut written = 0usize;
+        while written < AGENT_SO.len() {
+            let n = unsafe {
+                libc::write(
+                    agent_memfd,
+                    AGENT_SO[written..].as_ptr() as *const c_void,
+                    AGENT_SO.len() - written,
+                )
+            };
+            if n <= 0 {
+                unsafe { close(agent_memfd) };
+                return Err("写入 agent SO 到 memfd 失败".to_string());
+            }
+            written += n as usize;
+        }
+        let padded_len = match padded_agent_memfd_len() {
+            Ok(len) => len,
+            Err(e) => {
+                unsafe { close(agent_memfd) };
+                return Err(e);
+            }
+        };
+        if padded_len > AGENT_SO.len() && unsafe { libc::ftruncate(agent_memfd, padded_len as libc::off_t) } != 0 {
+            unsafe { close(agent_memfd) };
+            return Err(format!("扩展 agent SO memfd 失败: {}", std::io::Error::last_os_error()));
+        }
+        if let Err(e) = send_fd(ctrl_fd, agent_memfd) {
             unsafe { close(agent_memfd) };
             return Err(e);
         }
-    };
-    if padded_len > AGENT_SO.len() && unsafe { libc::ftruncate(agent_memfd, padded_len as libc::off_t) } != 0 {
         unsafe { close(agent_memfd) };
-        return Err(format!("扩展 agent SO memfd 失败: {}", std::io::Error::last_os_error()));
+        log_verbose!("agent SO fd 已发送 ({} bytes, padded {})", AGENT_SO.len(), padded_len);
     }
-    if let Err(e) = send_fd(ctrl_fd, agent_memfd) {
-        unsafe { close(agent_memfd) };
-        return Err(e);
-    }
-    unsafe { close(agent_memfd) };
-    log_verbose!("agent SO fd 已发送 ({} bytes, padded {})", AGENT_SO.len(), padded_len);
 
     // 3. 创建 REPL socketpair 并发送一端给 loader
     //    注意：loader 先接收 agent_ctrlfd，然后才发送 READY

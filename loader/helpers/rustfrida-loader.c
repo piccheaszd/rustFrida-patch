@@ -278,7 +278,7 @@ static void frida_enable_close_on_exec (int fd, const FridaLibcApi * libc);
 
 static bool rustfrida_link_agent (int fd, int diagfd, const FridaLibcApi * libc, RustFridaLinkedModule * module,
     const ElfW(Addr) * resolver_module_bases, size_t resolver_module_count, const char * agent_vma_name,
-    bool catch_link_signals);
+    bool catch_link_signals, bool stream_agent);
 static void * rustfrida_find_export (RustFridaLinkedModule * module, const char * symbol);
 static void rustfrida_close_module (RustFridaLinkedModule * module, const FridaLibcApi * libc);
 static void rustfrida_unmap_module (RustFridaLinkedModule * module, const FridaLibcApi * libc);
@@ -1940,7 +1940,7 @@ rustfrida_call_fini_functions (RustFridaLinkedModule * module)
 static bool
 rustfrida_link_agent (int fd, int diagfd, const FridaLibcApi * libc, RustFridaLinkedModule * module,
     const ElfW(Addr) * resolver_module_bases, size_t resolver_module_count, const char * agent_vma_name,
-    bool catch_link_signals)
+    bool catch_link_signals, bool stream_agent)
 {
   size_t page_size = 4096;
   ssize_t file_size;
@@ -1960,51 +1960,83 @@ rustfrida_link_agent (int fd, int diagfd, const FridaLibcApi * libc, RustFridaLi
   ElfW(Rela) * jmprel = NULL;
   size_t pltrelsz = 0;
   ElfW(Dyn) * dyn;
-  bool fd_open = true;
+  bool fd_open = fd != -1;
 
   frida_send_debug (diagfd, "link:begin", libc);
   frida_memset (module, 0, sizeof (*module));
   frida_send_log (diagfd, "link: start", libc);
 
-  frida_send_debug (diagfd, "link:lseek", libc);
-  file_size = frida_syscall_3 (__NR_lseek, fd, 0, SEEK_END);
-  if (file_size <= 0)
+  if (stream_agent)
   {
-    rustfrida_set_error (module, libc, "lseek agent fd failed");
-    goto fail;
-  }
-  if (frida_syscall_3 (__NR_lseek, fd, 0, SEEK_SET) != 0)
-  {
-    rustfrida_set_error (module, libc, "rewind agent fd failed");
-    goto fail;
-  }
+    uint64_t stream_size = 0;
 
-  frida_send_debug (diagfd, "link:mmap-buffer", libc);
-  file_map = frida_raw_mmap (NULL, file_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (file_map == MAP_FAILED)
-  {
-    rustfrida_set_error (module, libc, "mmap agent buffer failed");
-    goto fail;
-  }
-
-  frida_send_debug (diagfd, "link:read-file", libc);
-  {
-    size_t offset = 0;
-
-    while (offset < (size_t) file_size)
+    frida_send_debug (diagfd, "link:recv-stream-size", libc);
+    if (!frida_receive_chunk (diagfd, &stream_size, sizeof (stream_size), libc) ||
+        stream_size == 0 || stream_size > (uint64_t) (512 * 1024 * 1024))
     {
-      ssize_t n = frida_syscall_3 (__NR_read, fd, (size_t) ((uint8_t *) file_map + offset),
-          (size_t) file_size - offset);
-      if (n <= 0)
-      {
-        rustfrida_set_error (module, libc, "read agent fd failed");
-        goto fail;
-      }
-      offset += n;
+      rustfrida_set_error (module, libc, "invalid streamed agent size");
+      goto fail;
     }
+    file_size = (ssize_t) stream_size;
+
+    frida_send_debug (diagfd, "link:mmap-buffer", libc);
+    file_map = frida_raw_mmap (NULL, file_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (file_map == MAP_FAILED)
+    {
+      rustfrida_set_error (module, libc, "mmap agent buffer failed");
+      goto fail;
+    }
+
+    frida_send_debug (diagfd, "link:recv-stream", libc);
+    if (!frida_receive_chunk (diagfd, file_map, (size_t) file_size, libc))
+    {
+      rustfrida_set_error (module, libc, "read streamed agent failed");
+      goto fail;
+    }
+    frida_send_debug (diagfd, "link:recv-stream-ok", libc);
   }
-  frida_raw_close (fd);
-  fd_open = false;
+  else
+  {
+    frida_send_debug (diagfd, "link:lseek", libc);
+    file_size = frida_syscall_3 (__NR_lseek, fd, 0, SEEK_END);
+    if (file_size <= 0)
+    {
+      rustfrida_set_error (module, libc, "lseek agent fd failed");
+      goto fail;
+    }
+    if (frida_syscall_3 (__NR_lseek, fd, 0, SEEK_SET) != 0)
+    {
+      rustfrida_set_error (module, libc, "rewind agent fd failed");
+      goto fail;
+    }
+
+    frida_send_debug (diagfd, "link:mmap-buffer", libc);
+    file_map = frida_raw_mmap (NULL, file_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (file_map == MAP_FAILED)
+    {
+      rustfrida_set_error (module, libc, "mmap agent buffer failed");
+      goto fail;
+    }
+
+    frida_send_debug (diagfd, "link:read-file", libc);
+    {
+      size_t offset = 0;
+
+      while (offset < (size_t) file_size)
+      {
+        ssize_t n = frida_syscall_3 (__NR_read, fd, (size_t) ((uint8_t *) file_map + offset),
+            (size_t) file_size - offset);
+        if (n <= 0)
+        {
+          rustfrida_set_error (module, libc, "read agent fd failed");
+          goto fail;
+        }
+        offset += n;
+      }
+    }
+    frida_raw_close (fd);
+    fd_open = false;
+  }
 
   frida_send_debug (diagfd, "link:validate-elf", libc);
   file_ehdr = (const ElfW(Ehdr) *) file_map;
@@ -2511,6 +2543,7 @@ frida_main (void * user_data)
   bool close_loader_ctrl;
   bool hold_before_entry;
   bool catch_entry_signals;
+  bool stream_agent;
   const char * agent_vma_name;
 
   frida_memset (&agent_module, 0, sizeof (agent_module));
@@ -2522,6 +2555,7 @@ frida_main (void * user_data)
   close_loader_ctrl = frida_agent_data_has_token (ctx->agent_data, "close-ctrl");
   hold_before_entry = frida_agent_data_has_token (ctx->agent_data, "hold-entry");
   catch_entry_signals = frida_agent_data_has_token (ctx->agent_data, "catch-signals");
+  stream_agent = frida_agent_data_has_token (ctx->agent_data, "stream-agent");
   agent_vma_name = frida_agent_data_get_last_value (ctx->agent_data, "vma");
 
   /* Close the peer end of the control socketpair */
@@ -2556,23 +2590,34 @@ frida_main (void * user_data)
     char recv_diag[32];
 
     frida_send_debug (ctrlfd, "loader:connected", libc);
-    frida_send_debug (ctrlfd, "loader:waiting-agent-fd", libc);
-    agent_codefd = frida_receive_fd_diag (ctrlfd, libc, recv_diag);
-    if (agent_codefd == -1)
+    if (stream_agent)
     {
-      frida_send_error (ctrlfd, FRIDA_MESSAGE_ERROR_DLOPEN,
-          recv_diag /* contains diag msg */, libc);
-      goto beach;
-    }
-    frida_send_debug (ctrlfd, "loader:got-agent-fd", libc);
-
-    frida_send_debug (ctrlfd, "loader:link-agent-begin", libc);
-    {
-      int owned_agent_fd = agent_codefd;
-      agent_codefd = -1;
-      if (!rustfrida_link_agent (owned_agent_fd, ctrlfd, libc, &agent_module,
-        ctx->resolver_module_bases, ctx->resolver_module_count, agent_vma_name, catch_entry_signals))
+      frida_send_debug (ctrlfd, "loader:waiting-agent-stream", libc);
+      frida_send_debug (ctrlfd, "loader:link-agent-begin", libc);
+      if (!rustfrida_link_agent (-1, ctrlfd, libc, &agent_module,
+        ctx->resolver_module_bases, ctx->resolver_module_count, agent_vma_name, catch_entry_signals, true))
         goto dlopen_failed;
+    }
+    else
+    {
+      frida_send_debug (ctrlfd, "loader:waiting-agent-fd", libc);
+      agent_codefd = frida_receive_fd_diag (ctrlfd, libc, recv_diag);
+      if (agent_codefd == -1)
+      {
+        frida_send_error (ctrlfd, FRIDA_MESSAGE_ERROR_DLOPEN,
+            recv_diag /* contains diag msg */, libc);
+        goto beach;
+      }
+      frida_send_debug (ctrlfd, "loader:got-agent-fd", libc);
+
+      frida_send_debug (ctrlfd, "loader:link-agent-begin", libc);
+      {
+        int owned_agent_fd = agent_codefd;
+        agent_codefd = -1;
+        if (!rustfrida_link_agent (owned_agent_fd, ctrlfd, libc, &agent_module,
+          ctx->resolver_module_bases, ctx->resolver_module_count, agent_vma_name, catch_entry_signals, false))
+          goto dlopen_failed;
+      }
     }
     frida_send_debug (ctrlfd, "loader:link-agent-ok", libc);
     frida_send_log (ctrlfd, "worker: agent linked", libc);
