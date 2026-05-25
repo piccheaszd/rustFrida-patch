@@ -222,6 +222,69 @@ Validation after these fixes:
   `WXSHADOW` patch, captures JNI registration output, resumes the child, and
   shuts down through the managed cleanup path.
 
+## 2026-05-25 Early Trace for Late Detection Points
+
+Added `tools/late_detection_trace.js` as a reusable `--spawn-early` trace
+harness for late/PID attach failure analysis. It installs `WXSHADOW` hooks for
+`readlink`, `readlinkat`, `openat`, `fopen`, `ptrace`, `kill`, `shutdown`,
+`abort`, `exit`, and loader calls, while using a normal hook for `prctl` to
+avoid same-page conflicts. It also records `readlink` targets and resolves LR
+values to module-relative offsets.
+
+Generic validation command:
+
+```sh
+RF_REMOTE_CALL_TIMEOUT_MS=7000 \
+RF_INJECT_THREAD=probe \
+RF_THREAD_PROBE_LIMIT=16 \
+RF_THREAD_PROBE_TIMEOUT_MS=150 \
+RF_AGENT_VMA_NAME=agent \
+/data/local/tmp/rf_test --spawn <package> --spawn-early --verbose \
+  --connect-timeout 25 --quickjs-profile full \
+  -l /data/local/tmp/late_detection_trace.js
+```
+
+Second validation run:
+
+- `--spawn-early` loaded the trace harness, resumed the child, then shut down
+  cleanly through managed cleanup.
+- Captured event volume: `readlink` 116 enters, `readlinkat` 115 enters,
+  `openat` 30 enters, `fopen` 27 enters, and `prctl` 39 enters.
+- No target-side `kill`, `tgkill`, `abort`, `exit`, or `_exit` call was observed
+  in the trace window.
+- The loader-library base for that run was `0x77c2e20000`; the absolute base is
+  ASLR-dependent, so use the offsets below for correlation.
+
+Stable loader-library probe offsets from the trace:
+
+- `+0x48e6c`: `fopen("/proc/<pid>/cmdline")`
+- `+0x53cd0`: `fopen()` on runtime ELF paths such as ART/libc
+- `+0x55e98`: `fopen("/proc/self/maps")`
+- `+0x646a4`: `fopen("/proc/<pid>/status")`
+- `+0x67c6c`: close after thread-status scan
+- `+0x67d84`: `openat("/proc/self/task/<tid>/status")`
+- `+0x682e4`: full `/proc/self/fd/<n>` `readlink` sweep
+- `+0x6a0f4`: later `fopen("/proc/self/maps")`
+- `+0x767c8`: early repeated `fopen("/proc/self/maps")`
+- `+0x8c984`: `PR_SET_DUMPABLE(1)`
+- `+0x8c99c`: targeted `/proc/self/fd/<n>` `readlink`
+- `+0x8ca0c`: `PR_GET_DUMPABLE`
+- `+0x8f308`: later `fopen("/proc/<pid>/cmdline")`
+
+Important late/PID attach relevance:
+
+- The `+0x682e4` fd sweep reached the injected control socket descriptors; in
+  this run the loader had reported control fds `[74, 75]`, and the trace later
+  showed `/proc/self/fd/74` and `/proc/self/fd/75` resolving to socket inodes.
+- The same sweep also saw other high fds, including an app fd directory and an
+  ashmem mapping. This confirms that fd/VMA hiding must cover high-numbered
+  descriptors, not only the memfd used for agent delivery.
+- The trace does not prove the final termination branch yet. It proves the
+  observable inputs that can distinguish early from late/PID attach: procfs fd
+  enumeration, thread-status enumeration, maps reads, and dumpable toggling.
+  Next fixes should either hide these artifacts or move late attach so these
+  checks do not observe framework-owned fds/threads.
+
 ## Remaining Work
 
 1. Improve automatic thread probing so it can find a usable user-mode transition
@@ -234,6 +297,4 @@ Validation after these fixes:
    returning from native code instead of arbitrary signal-path stops.
 5. Add a safe startup tracing recipe that avoids combining loader and
    JNI-registration `WXSHADOW` hooks in the same early-start run.
-6. Convert proc-trace LR values into module-relative offsets so the observed
-   `prctl`, `readlink`, and procfs probes can be mapped directly back to the
-   hardened loader library.
+6. Add a mitigation experiment for high-fd socket hiding during late/PID attach.
