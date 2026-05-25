@@ -332,6 +332,66 @@ Remaining PID-attach-specific observations:
   resolver-table write before loader execution. This is separate from the agent
   transfer fd issue proven by the successful `--spawn-late` stream run.
 
+## 2026-05-25 Early Guard and PID Revalidation
+
+An early guard harness (`tools/early_pid_guard.js`) was used to validate
+whether PID attach failures are caused by the injection/QuickJS path itself or
+by late-visible detection surfaces. The harness is loaded with `--spawn-early`,
+installs procfs and anti-debug hooks before the app-specific startup checks run,
+then keeps the early agent alive while a second `--pid` attach is performed
+against the same process.
+
+The guard intentionally uses a narrow policy:
+
+- log `/proc/self/maps`, `/proc/<pid>/status`,
+  `/proc/<pid>/cmdline`, and `/proc/self/task/<tid>/status` access;
+- log `/proc/self/fd/<n>` `readlink` and `readlinkat` targets;
+- mask only fd targets containing framework/agent-related strings to
+  `/dev/null`;
+- mask `PR_GET_DUMPABLE` to `0`;
+- mask `PTRACE_TRACEME` to success;
+- install `prctl` with the normal backend because it is used by the hook
+  backend itself;
+- delay return-value changes until all hooks are installed, avoiding
+  interference with the agent's own module resolution while the script loads.
+
+Standalone PID observations:
+
+- A PID attach using the memfd transfer path can reach the agent command loop.
+- `jseval 1+1` before `jsinit` is correctly rejected with
+  "engine not initialized", proving the command path is alive.
+- `jsinit` in a standalone late/PID attach disconnects during initialization,
+  and the target exits with `ApplicationExitInfo` reason `SIGNALED`, status
+  `11`. No fresh tombstone is produced, which is consistent with target-side
+  signal/self-protection handling rather than a normal crashdump path.
+- Moving the PID attach earlier in startup did not avoid the `jsinit`
+  disconnect, so the failure is not just a fixed elapsed-time window.
+
+Early-guard plus PID result:
+
+- The early guard loaded successfully, resumed the child, and kept logging the
+  same procfs surfaces after startup: maps reads, status reads, task-status
+  enumeration, fd sweeps, and dumpable checks.
+- A second `--pid` attach to that same guarded process completed `jsinit`.
+- `jseval 1+1` returned `=> 2`.
+- The original process remained alive at both one second and five seconds after
+  the second agent shut down.
+
+This proves that the PID/QuickJS execution path is functionally usable when the
+detected surfaces are already covered. The remaining PID failure is therefore
+not a generic QuickJS API failure. It is caused by late-visible artifacts such
+as procfs fd enumeration, thread-status enumeration, maps reads, dumpable state,
+or a combination of those observations.
+
+The next durable fix should not depend on a preloaded JavaScript guard. The
+validated guard should be converted into one of these lower-level mechanisms:
+
+- loader pre-entry native filtering for the minimum required libc/syscall
+  surfaces;
+- kernel-side procfs hiding for fd links, task status, maps, and dumpable state;
+- or an earlier attach path that installs equivalent coverage before the
+  loader library reaches its procfs scanning loop.
+
 ## Remaining Work
 
 1. Improve automatic thread probing so it can find a usable user-mode transition
@@ -346,5 +406,7 @@ Remaining PID-attach-specific observations:
    JNI-registration `WXSHADOW` hooks in the same early-start run.
 6. Keep the explicit memfd fallback for regression tests, but do not use it for
    hardened late/spawn-late profiles unless debugging loader transfer behavior.
-7. Continue PID attach hardening around stop-state selection and target restarts
+7. Convert the early guard result into loader-level or kernel-level hiding so
+   PID attach does not require a prior `--spawn-early` JavaScript session.
+8. Continue PID attach hardening around stop-state selection and target restarts
    during host-side memory writes.

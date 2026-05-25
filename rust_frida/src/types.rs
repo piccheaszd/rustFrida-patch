@@ -88,7 +88,7 @@ impl Default for FridaBootstrapContext {
     }
 }
 
-/// FridaLibcApi — bootstrapper 解析出的 18 个 libc/linker 函数指针
+/// FridaLibcApi — bootstrapper 解析出的 libc/linker 函数指针
 /// 对应 inject-context.h 中的 struct _FridaLibcApi
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]

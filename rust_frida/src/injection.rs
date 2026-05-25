@@ -11,7 +11,8 @@ use std::time::Duration;
 
 use crate::proc_mem::ProcMem;
 use crate::process::{
-    attach_to_process, call_target_function, parse_proc_maps, sample_thread_stop_point, ThreadStopSample,
+    attach_to_process, call_target_function_with_return_trap, parse_proc_maps, sample_thread_stop_point,
+    ThreadStopSample,
 };
 use crate::types::{bootstrap_status, message_type, FridaBootstrapContext, FridaLibcApi, RustFridaLoaderContext};
 use crate::{log_error, log_info, log_success, log_verbose, log_warn};
@@ -70,6 +71,51 @@ fn mem_read_value<T: Default>(mem: &ProcMem, addr: usize) -> Result<T, String> {
     let bytes = unsafe { std::slice::from_raw_parts_mut(&mut value as *mut T as *mut u8, size_of::<T>()) };
     mem.pread_exact(bytes, addr as u64)?;
     Ok(value)
+}
+
+const MPROTECT_SYSCALL_STUB: &[u8] = &[
+    0x48, 0x1c, 0x80, 0xd2, // mov x8, #226 (__NR_mprotect)
+    0x01, 0x00, 0x00, 0xd4, // svc #0
+    0xc0, 0x03, 0x5f, 0xd6, // ret
+];
+const BRK_RETURN_TRAP: &[u8] = &[
+    0x00, 0x00, 0x20, 0xd4, // brk #0
+];
+
+fn call_target_function_brk(
+    mem: &ProcMem,
+    tid: i32,
+    func_addr: usize,
+    args: &[usize],
+    return_trap_addr: usize,
+) -> Result<usize, String> {
+    mem.pwrite_all(BRK_RETURN_TRAP, return_trap_addr as u64)?;
+    call_target_function_with_return_trap(tid, func_addr, args, return_trap_addr)
+}
+
+fn remote_mprotect_syscall(
+    mem: &ProcMem,
+    tid: i32,
+    swap_addr: usize,
+    original_code: &[u8],
+    return_trap_addr: usize,
+    addr: usize,
+    len: usize,
+    prot: i32,
+) -> Result<(), String> {
+    mem.pwrite_all(MPROTECT_SYSCALL_STUB, swap_addr as u64)?;
+    let result = call_target_function_with_return_trap(tid, swap_addr, &[addr, len, prot as usize], return_trap_addr);
+    let restore_result = mem.pwrite_all(original_code, swap_addr as u64);
+    restore_result?;
+
+    let ret = result?;
+    if ret != 0 {
+        return Err(format!(
+            "remote mprotect syscall(0x{:x}, {}, 0x{:x}) returned {}",
+            addr, len, prot, ret
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -239,6 +285,13 @@ fn build_loader_agent_data(use_pthread_loader: bool) -> Result<Vec<u8>, String> 
         tokens.push("stream-agent".to_string());
     } else {
         log_verbose!("agent SO transfer: memfd over SCM_RIGHTS");
+    }
+
+    if env_flag_enabled("RF_LOADER_DEBUG") {
+        log_verbose!("loader debug trace: enabled");
+        tokens.push("loader-debug".to_string());
+    } else {
+        log_verbose!("loader debug trace: disabled (set RF_LOADER_DEBUG=1 for full loader IPC trace)");
     }
 
     if env_flag_enabled("RF_HOLD_BEFORE_ENTRY") {
@@ -484,7 +537,7 @@ fn kernel_wait_reason(value: &str) -> Option<&'static str> {
 fn score_probe_presample(pid: i32, tid: i32, comm: &str, state: char, wchan: &str) -> i32 {
     let mut score = 0;
     if tid == pid {
-        score += 80;
+        score -= 2_000;
     }
     match state {
         'R' => score += 300,
@@ -504,8 +557,13 @@ fn score_probe_presample(pid: i32, tid: i32, comm: &str, state: char, wchan: &st
 
 fn score_thread_sample(pid: i32, sample: &ThreadStopSample) -> i32 {
     let mut score = 0;
+    let pc_map = sample.pc_map.as_deref().unwrap_or("");
+    let lr_map = sample.lr_map.as_deref().unwrap_or("");
+    let in_app_code = pc_map.contains("/data/app/") || lr_map.contains("/data/app/");
+    let in_libc = pc_map.contains("/libc.so") || lr_map.contains("/libc.so");
+
     if sample.tid == pid {
-        score += 80;
+        score -= 2_000;
     }
     if sample.pc_is_executable() {
         score += 500;
@@ -513,9 +571,16 @@ fn score_thread_sample(pid: i32, sample: &ThreadStopSample) -> i32 {
         score -= 600;
     }
     if sample.syscall_before == "running" {
-        score += 250;
+        if in_app_code {
+            score -= 350;
+        } else {
+            score += 120;
+        }
     } else if !sample.syscall_before.is_empty() {
         score -= 80;
+    }
+    if sample.wchan_before == "__arm64_sys_nanosleep" && in_libc {
+        score += 180;
     }
     if let Some(reason) = kernel_wait_reason(&sample.wchan_before) {
         score -= match reason {
@@ -531,13 +596,29 @@ fn score_thread_sample(pid: i32, sample: &ThreadStopSample) -> i32 {
 }
 
 fn choose_probe_injection_thread(pid: i32) -> Option<i32> {
-    let task_dir = format!("/proc/{}/task", pid);
-    let entries = std::fs::read_dir(task_dir).ok()?;
     let limit = std::env::var("RF_THREAD_PROBE_LIMIT")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(24);
+    let min_score = std::env::var("RF_THREAD_PROBE_MIN_SCORE")
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        .unwrap_or(1);
+    let rounds = std::env::var("RF_THREAD_PROBE_ROUNDS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(3);
+    let round_delay = std::env::var("RF_THREAD_PROBE_ROUND_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_millis(80));
+    let allow_main = std::env::var("RF_THREAD_PROBE_ALLOW_MAIN")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     let timeout = std::env::var("RF_THREAD_PROBE_TIMEOUT_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -545,74 +626,124 @@ fn choose_probe_injection_thread(pid: i32) -> Option<i32> {
         .map(Duration::from_millis)
         .unwrap_or_else(|| Duration::from_millis(250));
 
-    let mut presample = Vec::new();
-    for entry in entries.flatten() {
-        let tid = match entry.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) {
-            Some(tid) => tid,
-            None => continue,
-        };
-        let status = read_task_text(pid, tid, "status");
-        let comm = read_task_text(pid, tid, "comm");
-        let wchan = read_task_text(pid, tid, "wchan");
-        let score = score_probe_presample(pid, tid, &comm, thread_state(&status), &wchan);
-        presample.push((score, tid, comm, wchan));
-    }
+    let task_dir = format!("/proc/{}/task", pid);
+    let mut best_rejected: Option<(i32, ThreadStopSample)> = None;
 
-    presample.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    for round in 0..rounds {
+        let entries = std::fs::read_dir(&task_dir).ok()?;
+        let mut presample = Vec::new();
+        for entry in entries.flatten() {
+            let tid = match entry.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) {
+                Some(tid) => tid,
+                None => continue,
+            };
+            if tid == pid && !allow_main {
+                continue;
+            }
+            let status = read_task_text(pid, tid, "status");
+            let comm = read_task_text(pid, tid, "comm");
+            let wchan = read_task_text(pid, tid, "wchan");
+            let score = score_probe_presample(pid, tid, &comm, thread_state(&status), &wchan);
+            presample.push((score, tid, comm, wchan));
+        }
 
-    let mut best: Option<(i32, ThreadStopSample)> = None;
-    for (rank, (pre_score, tid, comm, wchan)) in presample.into_iter().take(limit).enumerate() {
-        log_verbose!(
-            "thread probe pre #{}: tid={} score={} comm={} wchan={}",
-            rank + 1,
-            tid,
-            pre_score,
-            comm,
-            wchan
-        );
-        match sample_thread_stop_point(pid, tid, timeout) {
-            Ok(sample) => {
-                let score = score_thread_sample(pid, &sample);
-                let wait_note = kernel_wait_reason(&sample.wchan_before).unwrap_or("ok");
-                log_verbose!(
-                    "thread probe sample score={} wait={} syscall={} {}",
-                    score,
-                    wait_note,
-                    sample.syscall_before,
-                    sample.short_summary()
-                );
-                if best.as_ref().map(|(best_score, _)| score > *best_score).unwrap_or(true) {
-                    best = Some((score, sample));
+        presample.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
+        let mut best: Option<(i32, ThreadStopSample)> = None;
+        for (rank, (pre_score, tid, comm, wchan)) in presample.into_iter().take(limit).enumerate() {
+            log_verbose!(
+                "thread probe round {}/{} pre #{}: tid={} score={} comm={} wchan={}",
+                round + 1,
+                rounds,
+                rank + 1,
+                tid,
+                pre_score,
+                comm,
+                wchan
+            );
+            match sample_thread_stop_point(pid, tid, timeout) {
+                Ok(sample) => {
+                    let score = score_thread_sample(pid, &sample);
+                    let wait_note = kernel_wait_reason(&sample.wchan_before).unwrap_or("ok");
+                    log_verbose!(
+                        "thread probe sample score={} wait={} syscall={} {}",
+                        score,
+                        wait_note,
+                        sample.syscall_before,
+                        sample.short_summary()
+                    );
+                    if best.as_ref().map(|(best_score, _)| score > *best_score).unwrap_or(true) {
+                        best = Some((score, sample));
+                    }
+                }
+                Err(e) => {
+                    log_verbose!("thread probe sample failed tid={}: {}", tid, e);
                 }
             }
-            Err(e) => {
-                log_verbose!("thread probe sample failed tid={}: {}", tid, e);
+        }
+
+        if let Some((score, sample)) = best {
+            if score >= min_score {
+                log_verbose!("thread probe selected score={} {}", score, sample.short_summary());
+                return Some(sample.tid);
             }
+            log_warn!(
+                "thread probe round {}/{} rejected best score={} below min_score={} {}",
+                round + 1,
+                rounds,
+                score,
+                min_score,
+                sample.short_summary()
+            );
+            if best_rejected
+                .as_ref()
+                .map(|(best_score, _)| score > *best_score)
+                .unwrap_or(true)
+            {
+                best_rejected = Some((score, sample));
+            }
+        } else {
+            log_warn!("thread probe round {}/{} 未采样到可用线程", round + 1, rounds);
+        }
+
+        if round + 1 != rounds {
+            std::thread::sleep(round_delay);
         }
     }
 
-    best.map(|(score, sample)| {
-        log_verbose!("thread probe selected score={} {}", score, sample.short_summary());
-        sample.tid
-    })
+    if let Some((score, sample)) = best_rejected {
+        log_warn!(
+            "thread probe 未找到满足 min_score={} 的候选；最佳被拒绝 score={} {}",
+            min_score,
+            score,
+            sample.short_summary()
+        );
+    }
+    None
 }
 
-fn choose_injection_thread(pid: i32) -> i32 {
+fn choose_injection_thread(pid: i32) -> Result<i32, String> {
     if let Ok(value) = std::env::var("RF_INJECT_THREAD") {
         let value = value.trim();
         if value.eq_ignore_ascii_case("main") || value.eq_ignore_ascii_case("pid") {
             log_verbose!("注入线程候选: forced main tid={}", pid);
-            return pid;
+            return Ok(pid);
         }
-        if value.eq_ignore_ascii_case("probe") || value.eq_ignore_ascii_case("auto") {
+        if value.eq_ignore_ascii_case("probe") {
             if let Some(tid) = choose_probe_injection_thread(pid) {
-                return tid;
+                return Ok(tid);
+            }
+            return Err("thread probe 未找到满足阈值的可用候选，拒绝回退到不安全线程".to_string());
+        }
+        if value.eq_ignore_ascii_case("auto") {
+            if let Some(tid) = choose_probe_injection_thread(pid) {
+                return Ok(tid);
             }
             log_warn!("thread probe 未找到可用候选，回退到默认线程选择");
         }
         if let Ok(tid) = value.parse::<i32>() {
             log_verbose!("注入线程候选: forced tid={}", tid);
-            return tid;
+            return Ok(tid);
         }
     }
 
@@ -622,7 +753,7 @@ fn choose_injection_thread(pid: i32) -> i32 {
 
     let entries = match std::fs::read_dir(task_dir) {
         Ok(entries) => entries,
-        Err(_) => return pid,
+        Err(_) => return Ok(pid),
     };
 
     for entry in entries.flatten() {
@@ -678,7 +809,7 @@ fn choose_injection_thread(pid: i32) -> i32 {
         log_verbose!("注入线程候选: tid={} comm={} wchan={}", best_tid, comm, wchan);
     }
 
-    best_tid
+    Ok(best_tid)
 }
 
 fn is_risky_injection_thread(comm: &str) -> bool {
@@ -1111,12 +1242,12 @@ fn drain_loader_messages_for(ctrl_fd: RawFd, duration: std::time::Duration) {
             break;
         }
 
-        let fatal = pfd.revents & (libc::POLLERR | libc::POLLNVAL | libc::POLLHUP);
-        if fatal != 0 {
-            log_warn!("延迟 detach: loader 控制通道关闭 revents=0x{:x}", pfd.revents);
-            break;
-        }
         if pfd.revents & libc::POLLIN == 0 {
+            let fatal = pfd.revents & (libc::POLLERR | libc::POLLNVAL | libc::POLLHUP);
+            if fatal != 0 {
+                log_warn!("延迟 detach: loader 控制通道关闭 revents=0x{:x}", pfd.revents);
+                break;
+            }
             continue;
         }
 
@@ -1171,8 +1302,16 @@ fn run_loader_handshake(ctrl_fd: RawFd, target_pid: i32, loader_ctx_addr: usize)
     //    agent memfd fd；仅显式诊断/兼容开关才回退 SCM_RIGHTS memfd。
     if use_stream_agent_transfer() {
         let size = (AGENT_SO.len() as u64).to_le_bytes();
-        send_exact(ctrl_fd, &size)?;
-        send_exact(ctrl_fd, AGENT_SO)?;
+        if let Err(e) = send_exact(ctrl_fd, &size) {
+            log_warn!("agent stream size 发送失败，读取 loader 诊断: {}", e);
+            drain_loader_messages_for(ctrl_fd, std::time::Duration::from_millis(750));
+            return Err(e);
+        }
+        if let Err(e) = send_exact(ctrl_fd, AGENT_SO) {
+            log_warn!("agent stream 发送失败，读取 loader 诊断: {}", e);
+            drain_loader_messages_for(ctrl_fd, std::time::Duration::from_millis(750));
+            return Err(e);
+        }
         log_verbose!("agent SO 已通过控制 socket 流式发送 ({} bytes)", AGENT_SO.len());
     } else {
         // 关键: 必须设置 SELinux label 为 frida_memfd (带 mlstrustedobject 属性)，
@@ -1340,7 +1479,7 @@ fn inject_via_bootstrapper_once(
 ) -> Result<InjectionResult, String> {
     log_info!("正在附加到进程 PID: {} (Frida-style bootstrapper)", pid);
 
-    let trace_tid = choose_injection_thread(pid);
+    let trace_tid = choose_injection_thread(pid)?;
     if trace_tid != pid {
         log_verbose!("选择工作线程执行注入: tid={}", trace_tid);
     }
@@ -1363,18 +1502,20 @@ fn inject_via_bootstrapper_once(
         return Err(format!("非法 page size: {}", page_size));
     }
     let page_size = page_size as usize;
-    let code_size = BOOTSTRAPPER.len().max(FRIDA_LOADER.len());
+    let code_size = BOOTSTRAPPER.len().max(FRIDA_LOADER.len()) + BRK_RETURN_TRAP.len();
     let code_pages = code_size.div_ceil(page_size) * page_size;
     let data_size = 4 * page_size;
     let total_alloc = code_pages + data_size;
 
     // === Code-swap: 临时覆盖目标进程可执行区域运行 bootstrapper ===
     // 1. 找到目标进程的一个 r-xp 区域（linker64 最安全，所有进程都有）
-    let swap_addr = find_executable_region(pid, BOOTSTRAPPER.len())?;
-    log_verbose!("code-swap 区域: 0x{:x} ({} bytes)", swap_addr, BOOTSTRAPPER.len());
+    let code_swap_size = BOOTSTRAPPER.len() + BRK_RETURN_TRAP.len();
+    let swap_addr = find_executable_region(pid, code_swap_size)?;
+    let swap_return_trap_addr = swap_addr + BOOTSTRAPPER.len();
+    log_verbose!("code-swap 区域: 0x{:x} ({} bytes)", swap_addr, code_swap_size);
 
     // 2. 保存原始代码
-    let mut original_code = vec![0u8; BOOTSTRAPPER.len()];
+    let mut original_code = vec![0u8; code_swap_size];
     mem.pread_exact(&mut original_code, swap_addr as u64)?;
 
     // 3. 写入 bootstrapper
@@ -1398,11 +1539,12 @@ fn inject_via_bootstrapper_once(
 
     // 6. 调用 bootstrapper Phase 1（raw mmap syscall 分配内存）
     log_verbose!("bootstrapper Phase 1: mmap 分配...");
-    let status = call_target_function(trace_tid, swap_addr, &[stack_ctx_addr], None).map_err(|e| {
-        // 恢复原始代码后再报错
-        let _ = mem.pwrite_all(&original_code, swap_addr as u64);
-        format!("bootstrapper Phase 1 失败: {}", e)
-    })?;
+    let status = call_target_function_brk(&mem, trace_tid, swap_addr, &[stack_ctx_addr], swap_return_trap_addr)
+        .map_err(|e| {
+            // 恢复原始代码后再报错
+            let _ = mem.pwrite_all(&original_code, swap_addr as u64);
+            format!("bootstrapper Phase 1 失败: {}", e)
+        })?;
 
     if status != bootstrap_status::ALLOCATION_SUCCESS {
         let _ = mem.pwrite_all(&original_code, swap_addr as u64);
@@ -1412,7 +1554,11 @@ fn inject_via_bootstrapper_once(
     // 读回 allocation_base
     let phase1_result: FridaBootstrapContext = mem_read_value(&mem, stack_ctx_addr)?;
     let alloc_base = phase1_result.allocation_base as usize;
-    log_verbose!("bootstrapper 分配 RWX 区域: 0x{:x} ({} bytes)", alloc_base, total_alloc);
+    log_verbose!(
+        "bootstrapper 分配临时 RWX 区域: 0x{:x} ({} bytes)",
+        alloc_base,
+        total_alloc
+    );
 
     // 7. 恢复 code-swap 区域的原始代码
     mem.pwrite_all(&original_code, swap_addr as u64)?;
@@ -1423,6 +1569,9 @@ fn inject_via_bootstrapper_once(
     log_verbose!("bootstrapper 写入完成 ({} bytes)", BOOTSTRAPPER.len());
 
     let data_base = alloc_base + code_pages;
+    let alloc_return_trap_addr = alloc_base + code_pages - BRK_RETURN_TRAP.len();
+    mem.pwrite_all(BRK_RETURN_TRAP, alloc_return_trap_addr as u64)?;
+    log_verbose!("remote call return trap: 0x{:x} (BRK/SIGTRAP)", alloc_return_trap_addr);
     let libc_api_addr = data_base;
     let ctx_addr = libc_api_addr + size_of::<FridaLibcApi>();
 
@@ -1438,7 +1587,7 @@ fn inject_via_bootstrapper_once(
     mem_write_value(&mem, ctx_addr, &bootstrap_ctx)?;
 
     log_verbose!("调用 bootstrapper Phase 2...");
-    let status = call_target_function(trace_tid, alloc_base, &[ctx_addr], None)
+    let status = call_target_function_with_return_trap(trace_tid, alloc_base, &[ctx_addr], alloc_return_trap_addr)
         .map_err(|e| format!("bootstrapper Phase 2 失败: {}", e))?;
 
     match status {
@@ -1551,12 +1700,41 @@ fn inject_via_bootstrapper_once(
     // 写入 LibcApi（给 loader 用）
     mem_write_value(&mem, loader_libc_addr, &libc_api)?;
 
+    remote_mprotect_syscall(
+        &mem,
+        trace_tid,
+        swap_addr,
+        &original_code,
+        alloc_return_trap_addr,
+        alloc_base,
+        code_pages,
+        libc::PROT_READ | libc::PROT_EXEC,
+    )?;
+    remote_mprotect_syscall(
+        &mem,
+        trace_tid,
+        swap_addr,
+        &original_code,
+        alloc_return_trap_addr,
+        data_base,
+        data_size,
+        libc::PROT_READ | libc::PROT_WRITE,
+    )?;
+    log_verbose!(
+        "bootstrapper/loader 权限收敛: code=0x{:x}-0x{:x} RX, data=0x{:x}-0x{:x} RW",
+        alloc_base,
+        alloc_base + code_pages,
+        data_base,
+        data_base + data_size
+    );
+
     // 调用 loader（执行 raw clone 后立即返回）
     log_verbose!("调用 loader...");
-    let _ = call_target_function(trace_tid, alloc_base, &[loader_ctx_addr], None).map_err(|e| {
-        unsafe { close(host_ctrl_fd) };
-        format!("loader 执行失败: {}", e)
-    })?;
+    let _ = call_target_function_with_return_trap(trace_tid, alloc_base, &[loader_ctx_addr], alloc_return_trap_addr)
+        .map_err(|e| {
+            unsafe { close(host_ctrl_fd) };
+            format!("loader 执行失败: {}", e)
+        })?;
 
     // === 分离前验证寄存器状态 ===
     {

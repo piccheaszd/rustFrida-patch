@@ -254,6 +254,8 @@ typedef struct {
   char error[160];
 } RustFridaLinkedModule;
 
+static bool rustfrida_loader_debug_enabled = false;
+
 /* ========== Forward declarations ========== */
 
 static void * frida_main (void * user_data);
@@ -2556,6 +2558,7 @@ frida_main (void * user_data)
   hold_before_entry = frida_agent_data_has_token (ctx->agent_data, "hold-entry");
   catch_entry_signals = frida_agent_data_has_token (ctx->agent_data, "catch-signals");
   stream_agent = frida_agent_data_has_token (ctx->agent_data, "stream-agent");
+  rustfrida_loader_debug_enabled = frida_agent_data_has_token (ctx->agent_data, "loader-debug");
   agent_vma_name = frida_agent_data_get_last_value (ctx->agent_data, "vma");
 
   /* Close the peer end of the control socketpair */
@@ -2845,6 +2848,9 @@ frida_send_debug (int sockfd, const char * message, const FridaLibcApi * libc)
 {
   uint16_t length;
   FridaMessageType type = FRIDA_MESSAGE_DEBUG;
+
+  if (!rustfrida_loader_debug_enabled)
+    return true;
 
   if (sockfd == -1 || message == NULL)
     return false;

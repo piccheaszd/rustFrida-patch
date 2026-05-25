@@ -508,6 +508,29 @@ pub(crate) fn call_target_function(
     args: &[usize],
     debug: Option<bool>,
 ) -> Result<usize, String> {
+    call_target_function_impl(pid, func_addr, args, debug, None)
+}
+
+/// 调用目标函数，并用调用方提供的可执行 trap 地址作为返回哨兵。
+///
+/// 目标函数返回后会跳到 `return_trap_addr`。调用方应在该地址放置 `brk`
+/// 等会产生 SIGTRAP 的指令，避免使用无效 LR 制造 SIGSEGV。
+pub(crate) fn call_target_function_with_return_trap(
+    pid: i32,
+    func_addr: usize,
+    args: &[usize],
+    return_trap_addr: usize,
+) -> Result<usize, String> {
+    call_target_function_impl(pid, func_addr, args, None, Some(return_trap_addr))
+}
+
+fn call_target_function_impl(
+    pid: i32,
+    func_addr: usize,
+    args: &[usize],
+    debug: Option<bool>,
+    return_trap_addr: Option<usize>,
+) -> Result<usize, String> {
     // 获取当前寄存器状态（GP + FP/SIMD）
     let orig_regs = get_registers(pid)?;
     let orig_fp_regs = get_fp_registers(pid).ok(); // FP 保存失败不阻塞
@@ -524,8 +547,10 @@ pub(crate) fn call_target_function(
         }
     }
 
-    // 设置返回地址为 0x340
-    new_regs.regs[30] = 0x340; // X30 是链接寄存器 (LR)
+    // 设置返回地址。默认保留历史行为（无效地址触发 SIGSEGV）；敏感路径可提供
+    // 可执行 BRK trap，避免制造 native crash 形态的 SIGSEGV。
+    let expected_return_trap = return_trap_addr.map(|addr| addr as u64);
+    new_regs.regs[30] = expected_return_trap.unwrap_or(0x340); // X30 是链接寄存器 (LR)
 
     // 设置 PC 指向函数地址
     new_regs.pc = func_addr as u64;
@@ -623,6 +648,22 @@ pub(crate) fn call_target_function(
         };
 
         match status {
+            WaitStatus::Stopped(_, Signal::SIGTRAP) if expected_return_trap.is_some() => {
+                let regs = get_registers(pid)?;
+                let trap = expected_return_trap.unwrap();
+                if regs.pc == trap || regs.pc == trap + 4 {
+                    let return_value = regs.regs[0] as usize;
+                    restore_registers(pid, &orig_regs, orig_fp_regs.as_ref())?;
+                    return Ok(return_value);
+                }
+
+                let pc_map = find_map_line_for_addr(pid, regs.pc).unwrap_or_else(|| "<unknown mapping>".to_string());
+                restore_registers_best_effort(pid, &orig_regs, orig_fp_regs.as_ref(), "远程调用异常 SIGTRAP");
+                return Err(format!(
+                    "函数执行异常 SIGTRAP，PC=0x{:x} [{}], expected trap=0x{:x}, LR=0x{:x}, X0=0x{:x}",
+                    regs.pc, pc_map, trap, regs.regs[30], regs.regs[0]
+                ));
+            }
             WaitStatus::Stopped(stopped_pid, Signal::SIGSEGV) if stopped_pid.as_raw() != pid => {
                 // 其他线程的 SIGSEGV，转发信号并继续等待
                 log_warn!("其他线程 {} 收到 SIGSEGV，转发并继续", stopped_pid);
