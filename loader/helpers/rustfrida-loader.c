@@ -63,9 +63,6 @@
 #ifndef __NR_sendto
 # define __NR_sendto 206
 #endif
-#ifndef __NR_readlinkat
-# define __NR_readlinkat 78
-#endif
 #ifndef AT_FDCWD
 # define AT_FDCWD -100
 #endif
@@ -89,15 +86,6 @@
 #endif
 #ifndef STT_GNU_IFUNC
 # define STT_GNU_IFUNC 10
-#endif
-#ifndef PR_SET_VMA
-# define PR_SET_VMA 0x53564d41
-#endif
-#ifndef PR_SET_VMA_ANON_NAME
-# define PR_SET_VMA_ANON_NAME 0
-#endif
-#ifndef PR_SET_NAME
-# define PR_SET_NAME 15
 #endif
 #ifndef CLONE_VM
 # define CLONE_VM 0x00000100
@@ -245,9 +233,8 @@ static bool rustfrida_build_symbol_resolver (RustFridaLinkedModule * module, int
 static int rustfrida_dl_iterate_add_module (struct dl_phdr_info * info, size_t size, void * user_data);
 static void rustfrida_set_error (RustFridaLinkedModule * module, const FridaLibcApi * libc, const char * message);
 static void rustfrida_set_symbol_error (RustFridaLinkedModule * module, const FridaLibcApi * libc, const char * prefix, const char * name);
+static bool rustfrida_protect_load_segments (RustFridaLinkedModule * module, const FridaLibcApi * libc);
 static bool rustfrida_try_resolve_local_symbol (const char * name, ElfW(Addr) * value);
-static void rustfrida_get_fd_vma_name (int fd, char * name, size_t name_size, const FridaLibcApi * libc);
-static void rustfrida_set_vma_name (ElfW(Addr) address, size_t size, const char * name);
 
 static void frida_main_raw (void * user_data);
 static void * frida_raw_mmap (void * addr, size_t length, int prot, int flags, int fd, off_t offset);
@@ -1060,6 +1047,35 @@ rustfrida_protect_relro (RustFridaLinkedModule * module, const FridaLibcApi * li
   return true;
 }
 
+static bool
+rustfrida_protect_load_segments (RustFridaLinkedModule * module, const FridaLibcApi * libc)
+{
+  ElfW(Half) i;
+
+  for (i = 0; i != module->phdr_count; i++)
+  {
+    const ElfW(Phdr) * phdr = &module->phdrs[i];
+    ElfW(Addr) start;
+    ElfW(Addr) end;
+    int prot;
+
+    if (phdr->p_type != PT_LOAD || phdr->p_memsz == 0)
+      continue;
+
+    start = rustfrida_align_down (module->base + phdr->p_vaddr, 4096);
+    end = rustfrida_align_up (module->base + phdr->p_vaddr + phdr->p_memsz, 4096);
+    prot = rustfrida_phdr_prot (phdr);
+
+    if (frida_syscall_3 (__NR_mprotect, start, end - start, prot) != 0)
+    {
+      rustfrida_set_error (module, libc, "mprotect LOAD segment failed");
+      return false;
+    }
+  }
+
+  return true;
+}
+
 static void
 rustfrida_call_init_functions (RustFridaLinkedModule * module)
 {
@@ -1148,56 +1164,6 @@ rustfrida_call_fini_functions (RustFridaLinkedModule * module)
     fini_func ();
 }
 
-static void
-rustfrida_get_fd_vma_name (int fd, char * name, size_t name_size, const FridaLibcApi * libc)
-{
-  char path[32];
-  char target[128];
-  ssize_t n;
-  const char * start = target;
-  const char * cursor;
-  size_t copied = 0;
-
-  if (name_size == 0)
-    return;
-
-  name[0] = '\0';
-
-  if (libc->sprintf == NULL)
-    return;
-
-  libc->sprintf (path, "/proc/self/fd/%d", fd);
-  n = frida_syscall_4 (__NR_readlinkat, AT_FDCWD, (size_t) path, (size_t) target, sizeof (target) - 1);
-  if (n <= 0)
-    return;
-
-  target[n] = '\0';
-
-  for (cursor = target; *cursor != '\0'; cursor++)
-  {
-    if (cursor[0] == 'm' && cursor[1] == 'e' && cursor[2] == 'm' &&
-        cursor[3] == 'f' && cursor[4] == 'd' && cursor[5] == ':')
-    {
-      start = cursor + 6;
-      break;
-    }
-  }
-
-  for (cursor = start; *cursor != '\0' && *cursor != ' ' && copied + 1 < name_size; cursor++)
-    name[copied++] = *cursor;
-
-  name[copied] = '\0';
-}
-
-static void
-rustfrida_set_vma_name (ElfW(Addr) address, size_t size, const char * name)
-{
-  if (address == 0 || size == 0 || name == NULL || name[0] == '\0')
-    return;
-
-  frida_syscall_5 (__NR_prctl, PR_SET_VMA, PR_SET_VMA_ANON_NAME, address, size, (size_t) name);
-}
-
 static bool
 rustfrida_link_agent (int fd, int diagfd, const FridaLibcApi * libc, RustFridaLinkedModule * module,
     const ElfW(Addr) * resolver_module_bases, size_t resolver_module_count)
@@ -1220,12 +1186,10 @@ rustfrida_link_agent (int fd, int diagfd, const FridaLibcApi * libc, RustFridaLi
   ElfW(Rela) * jmprel = NULL;
   size_t pltrelsz = 0;
   ElfW(Dyn) * dyn;
-  char agent_vma_name[80];
+  bool fd_open = true;
 
   frida_send_debug (diagfd, "link:begin", libc);
   frida_memset (module, 0, sizeof (*module));
-  frida_send_debug (diagfd, "link:fd-vma-name", libc);
-  rustfrida_get_fd_vma_name (fd, agent_vma_name, sizeof (agent_vma_name), libc);
   frida_send_log (diagfd, "link: start", libc);
 
   frida_send_debug (diagfd, "link:lseek", libc);
@@ -1233,16 +1197,40 @@ rustfrida_link_agent (int fd, int diagfd, const FridaLibcApi * libc, RustFridaLi
   if (file_size <= 0)
   {
     rustfrida_set_error (module, libc, "lseek agent fd failed");
-    return false;
+    goto fail;
+  }
+  if (frida_syscall_3 (__NR_lseek, fd, 0, SEEK_SET) != 0)
+  {
+    rustfrida_set_error (module, libc, "rewind agent fd failed");
+    goto fail;
   }
 
-  frida_send_debug (diagfd, "link:mmap-file", libc);
-  file_map = frida_raw_mmap (NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+  frida_send_debug (diagfd, "link:mmap-buffer", libc);
+  file_map = frida_raw_mmap (NULL, file_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (file_map == MAP_FAILED)
   {
-    rustfrida_set_error (module, libc, "mmap agent fd failed");
-    return false;
+    rustfrida_set_error (module, libc, "mmap agent buffer failed");
+    goto fail;
   }
+
+  frida_send_debug (diagfd, "link:read-file", libc);
+  {
+    size_t offset = 0;
+
+    while (offset < (size_t) file_size)
+    {
+      ssize_t n = frida_syscall_3 (__NR_read, fd, (size_t) ((uint8_t *) file_map + offset),
+          (size_t) file_size - offset);
+      if (n <= 0)
+      {
+        rustfrida_set_error (module, libc, "read agent fd failed");
+        goto fail;
+      }
+      offset += n;
+    }
+  }
+  frida_raw_close (fd);
+  fd_open = false;
 
   frida_send_debug (diagfd, "link:validate-elf", libc);
   file_ehdr = (const ElfW(Ehdr) *) file_map;
@@ -1293,8 +1281,6 @@ rustfrida_link_agent (int fd, int diagfd, const FridaLibcApi * libc, RustFridaLi
   }
 
   load_bias = (ElfW(Addr)) reservation - load_start;
-  frida_send_debug (diagfd, "link:set-vma-name", libc);
-  rustfrida_set_vma_name ((ElfW(Addr)) reservation, load_size, agent_vma_name);
 
   frida_send_debug (diagfd, "link:map-segments", libc);
   for (i = 0; i != file_ehdr->e_phnum; i++)
@@ -1304,8 +1290,6 @@ rustfrida_link_agent (int fd, int diagfd, const FridaLibcApi * libc, RustFridaLi
     ElfW(Addr) seg_end;
     ElfW(Addr) map_size;
     ElfW(Addr) target;
-    ElfW(Off) file_page_start;
-    int prot;
 
     if (phdr->p_type == PT_DYNAMIC)
       module->dynamic = (ElfW(Dyn) *) (load_bias + phdr->p_vaddr);
@@ -1323,35 +1307,21 @@ rustfrida_link_agent (int fd, int diagfd, const FridaLibcApi * libc, RustFridaLi
     seg_end = rustfrida_align_up (phdr->p_vaddr + phdr->p_memsz, page_size);
     map_size = seg_end - seg_start;
     target = load_bias + seg_start;
-    file_page_start = rustfrida_align_down (phdr->p_offset, page_size);
-    prot = rustfrida_phdr_prot (phdr);
 
-    if ((uint64_t) file_page_start + map_size > (uint64_t) file_size)
+    frida_send_debug (diagfd, "link:prepare-segment", libc);
+    if (frida_syscall_3 (__NR_mprotect, target, map_size, PROT_READ | PROT_WRITE) != 0)
     {
-      rustfrida_set_error (module, libc, "agent padded segment out of range");
+      rustfrida_set_error (module, libc, "prepare agent segment failed");
       goto fail;
     }
 
-    /*
-     * The host pads the memfd so the file covers each LOAD segment's full
-     * p_memsz. Mapping the complete segment from that fd avoids separate
-     * anonymous BSS VMAs, which hardened apps may flag as synthetic ELF tails.
-     */
-    {
-      frida_send_debug (diagfd, "link:map-segment-file", libc);
-      void * mapped = frida_raw_mmap ((void *) target, map_size, prot,
-          MAP_PRIVATE | MAP_FIXED, fd, file_page_start);
-      if (mapped == MAP_FAILED)
-      {
-        rustfrida_set_error (module, libc, "map agent segment failed");
-        goto fail;
-      }
-    }
+    if (phdr->p_filesz != 0)
+      frida_memcpy ((void *) (load_bias + phdr->p_vaddr), (const uint8_t *) file_map + phdr->p_offset, phdr->p_filesz);
 
     if (phdr->p_memsz > phdr->p_filesz)
     {
       ElfW(Addr) bss_start = load_bias + phdr->p_vaddr + phdr->p_filesz;
-      ElfW(Addr) bss_end = load_bias + rustfrida_align_up (phdr->p_vaddr + phdr->p_filesz, page_size);
+      ElfW(Addr) bss_end = load_bias + phdr->p_vaddr + phdr->p_memsz;
       ElfW(Addr) limit = load_bias + seg_end;
 
       if (bss_end > limit)
@@ -1370,7 +1340,7 @@ rustfrida_link_agent (int fd, int diagfd, const FridaLibcApi * libc, RustFridaLi
   module->phdrs = (const ElfW(Phdr) *) (load_bias + file_ehdr->e_phoff);
   module->phdr_count = file_ehdr->e_phnum;
 
-  frida_send_debug (diagfd, "link:unmap-file", libc);
+  frida_send_debug (diagfd, "link:unmap-buffer", libc);
   frida_raw_munmap (file_map, file_size);
   file_map = MAP_FAILED;
 
@@ -1431,6 +1401,11 @@ rustfrida_link_agent (int fd, int diagfd, const FridaLibcApi * libc, RustFridaLi
     goto fail;
   frida_send_log (diagfd, "link: plt rela applied", libc);
 
+  frida_send_debug (diagfd, "link:protect-load", libc);
+  if (!rustfrida_protect_load_segments (module, libc))
+    goto fail;
+  frida_send_log (diagfd, "link: load segments protected", libc);
+
   frida_send_debug (diagfd, "link:protect-relro", libc);
   if (!rustfrida_protect_relro (module, libc))
     goto fail;
@@ -1443,6 +1418,8 @@ rustfrida_link_agent (int fd, int diagfd, const FridaLibcApi * libc, RustFridaLi
   return true;
 
 fail:
+  if (fd_open)
+    frida_raw_close (fd);
   if (file_map != MAP_FAILED)
     frida_raw_munmap (file_map, file_size);
   if (reservation != MAP_FAILED)
@@ -1515,8 +1492,6 @@ frida_main (void * user_data)
   FridaUnloadPolicy unload_policy;
   int ctrlfd_for_peer, ctrlfd, agent_codefd, agent_ctrlfd;
 
-  frida_syscall_5 (__NR_prctl, PR_SET_NAME, (size_t) "wwb-loader", 0, 0, 0);
-
   frida_memset (&agent_module, 0, sizeof (agent_module));
   thread_id = frida_gettid ();
   unload_policy = FRIDA_UNLOAD_POLICY_IMMEDIATE;
@@ -1567,14 +1542,15 @@ frida_main (void * user_data)
     frida_send_debug (ctrlfd, "loader:got-agent-fd", libc);
 
     frida_send_debug (ctrlfd, "loader:link-agent-begin", libc);
-    if (!rustfrida_link_agent (agent_codefd, ctrlfd, libc, &agent_module,
+    {
+      int owned_agent_fd = agent_codefd;
+      agent_codefd = -1;
+      if (!rustfrida_link_agent (owned_agent_fd, ctrlfd, libc, &agent_module,
         ctx->resolver_module_bases, ctx->resolver_module_count))
-      goto dlopen_failed;
+        goto dlopen_failed;
+    }
     frida_send_debug (ctrlfd, "loader:link-agent-ok", libc);
     frida_send_log (ctrlfd, "worker: agent linked", libc);
-
-    frida_raw_close (agent_codefd);
-    agent_codefd = -1;
 
     frida_send_debug (ctrlfd, "loader:find-entry", libc);
     ctx->agent_entrypoint_impl = rustfrida_find_export (&agent_module, ctx->agent_entrypoint);

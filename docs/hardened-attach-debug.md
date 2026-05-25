@@ -105,6 +105,49 @@ A loader-only `android_dlopen_ext` `WXSHADOW` trace completed 41 enter/leave
 pairs in the startup window after the same-page guard rejected the second
 same-page dlopen hook with a clear JavaScript error.
 
+An early proc-surface trace harness was added for low-noise startup tracing:
+
+```sh
+RF_REMOTE_CALL_TIMEOUT_MS=30000 \
+RF_INJECT_THREAD=probe \
+RF_THREAD_PROBE_LIMIT=16 \
+RF_THREAD_PROBE_TIMEOUT_MS=150 \
+/data/local/tmp/rf_test --spawn <package> --spawn-early \
+  --verbose --connect-timeout 25 \
+  --quickjs-profile full -l /data/local/tmp/early_trace_proc.js
+```
+
+The minimal proc trace successfully installed `WXSHADOW` hooks for `prctl`,
+`readlink`, `openat`, `fopen`, `ptrace`, `abort`, and `exit`, then resumed the
+child and shut down cleanly with no new crash report. It confirmed the startup
+probe sequence previously inferred from static analysis:
+
+- repeated `/proc/self/cmdline` reads during very early runtime setup;
+- repeated `/proc/self/fd/<n>` `readlink` probes;
+- repeated `/proc/self/maps` reads;
+- `PR_GET_DUMPABLE` followed by `PR_SET_DUMPABLE(1)`, then another
+  `/proc/self/fd/<n>` `readlink`;
+- `/proc/<pid>/cmdline`, `/proc/<pid>/status`, and
+  `/proc/self/task/<tid>/status` scans across process threads.
+
+The proc trace also confirmed a harness limitation: JS-level global `syscall`
+hooks are too broad for this target during startup. A broad `syscall` hook
+triggered on runtime worker threads and produced a trace-harness crash before
+the target-specific startup checks could be observed. The reusable full harness
+therefore keeps syscall tracing disabled by default; use exported libc calls or
+a native/CModule filter for syscall-level tracing.
+
+The captured LR values line up with the static loader-library call sites. In
+the validated run, the loader library was mapped at a page-aligned base and the
+observed return addresses mapped back to these offsets:
+
+- `PR_SET_DUMPABLE(1)`: return offset `+0x8c984`, call site `+0x8c980`;
+- `readlink("/proc/self/fd/<n>")`: return offset `+0x8c99c`, call site
+  `+0x8c998`;
+- `PR_GET_DUMPABLE`: return offset `+0x8ca0c`, call site `+0x8ca08`;
+- `openat("/proc/self/task/<tid>/status")`: return offset `+0x67d84`, call
+  site `+0x67d80`.
+
 Expected success markers:
 
 - `Loader: agent 加载成功`
@@ -114,6 +157,39 @@ Expected success markers:
 - `[quickjs] profile=minimal`
 - `eval ok source=rf_probe.js out_len=1`
 - result `=> 2`
+
+## 2026-05-25 Loader/Attach Fixes
+
+The loader-side fd/VMA exposure found by the proc trace has been reduced:
+
+- removed the bootstrapper `PR_SET_VMA_ANON_NAME` label for the temporary loader
+  allocation;
+- removed the loader worker `PR_SET_NAME` label so `/proc/self/task/*/status`
+  does not expose a framework-specific thread name;
+- removed the loader's `/proc/self/fd/<agent-fd>` `readlink` step and the
+  derived VMA naming path;
+- changed agent ELF loading from file-backed memfd `PT_LOAD` mappings to an
+  anonymous staging buffer plus anonymous LOAD pages, then restored final segment
+  protections after relocation;
+- kept RELRO protection after final LOAD protection to preserve read-only
+  relocation behavior.
+
+The policy patcher now also supports `$self` as a source type and grants the
+current injector domain process-signal permissions toward app domains. This is
+needed for late/PID attach because `PTRACE_ATTACH` depends on a stop signal being
+deliverable to the selected thread.
+
+Validation after the change:
+
+- `--spawn-early` with `/data/local/tmp/test.js` and `Hook.WXSHADOW` still reaches
+  `Agent 已连接`, evaluates the script, applies the WXSHADOW patch, resumes the
+  child, and shuts down without a new tombstone.
+- PID attach can now pass the former stop-wait failure on a fresh process and
+  complete bootstrapper phase 1/2.
+- `--spawn-late` can now pass attach, bootstrapper phase 1/2, and loader write.
+  The remaining observed failure is target process exit during or immediately
+  after loader execution, without a new tombstone. This points to late/PID
+  anti-debug handling rather than the prior fd/VMA linker crash.
 
 ## Remaining Work
 
@@ -127,3 +203,6 @@ Expected success markers:
    returning from native code instead of arbitrary signal-path stops.
 5. Add a safe startup tracing recipe that avoids combining loader and
    JNI-registration `WXSHADOW` hooks in the same early-start run.
+6. Convert proc-trace LR values into module-relative offsets so the observed
+   `prctl`, `readlink`, and procfs probes can be mapped directly back to the
+   hardened loader library.

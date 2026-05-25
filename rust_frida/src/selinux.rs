@@ -32,6 +32,12 @@ const POLICYDB_VERSION_CONSTRAINT_NAMES: u32 = 29;
 /// 注意：frida_file/frida_memfd 相关规则需要创建自定义类型，纯二进制修补无法实现，已省略
 const RULES: &[(&str, &str, &str, &[&str])] = &[
     ("domain", "domain", "process", &["execmem"]),
+    (
+        "$self",
+        "domain",
+        "process",
+        &["?ptrace", "?signal", "?sigchld", "?sigkill", "?sigstop", "?sigcont"],
+    ),
     ("domain", "shell_data_file", "dir", &["search"]),
     // 放行 shell_data_file / tmpfs / frida_memfd 的文件操作
     // frida_memfd: Frida 创建的自定义类型（如策略中存在），用于 memfd SCM_RIGHTS 传递
@@ -657,8 +663,9 @@ fn add_rules(info: &mut PolicyInfo, self_type: &str) -> Result<usize, String> {
 
     for &(source, target, class, permissions) in RULES {
         // `?` 前缀: 类型可选，不存在时静默跳过
-        let (source_optional, source_name) = strip_optional(source);
+        let (source_optional, source_raw) = strip_optional(source);
         let (target_optional, target_raw) = strip_optional(target);
+        let source_name = if source_raw == "$self" { self_type } else { source_raw };
         let target_name = if target_raw == "$self" { self_type } else { target_raw };
 
         let source_id = match info.types.get(source_name) {
