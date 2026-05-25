@@ -93,30 +93,85 @@ impl Session {
     /// 等待 agent 连接，返回是否成功
     pub(crate) fn wait_connected(&self, timeout_secs: u64) -> bool {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        crate::log_verbose!(
+            "[#{}] wait_connected: start connected={} disconnected={} failed={}",
+            self.id,
+            self.connected.load(Ordering::Acquire),
+            self.disconnected.load(Ordering::Acquire),
+            self.failed.load(Ordering::Acquire)
+        );
         while !self.connected.load(Ordering::Acquire) {
             if self.failed.load(Ordering::Acquire) || self.disconnected.load(Ordering::Acquire) {
+                crate::log_verbose!(
+                    "[#{}] wait_connected: failed early connected={} disconnected={} failed={}",
+                    self.id,
+                    self.connected.load(Ordering::Acquire),
+                    self.disconnected.load(Ordering::Acquire),
+                    self.failed.load(Ordering::Acquire)
+                );
                 return false;
             }
             if std::time::Instant::now() >= deadline {
+                crate::log_verbose!(
+                    "[#{}] wait_connected: timeout connected={} disconnected={} failed={}",
+                    self.id,
+                    self.connected.load(Ordering::Acquire),
+                    self.disconnected.load(Ordering::Acquire),
+                    self.failed.load(Ordering::Acquire)
+                );
                 return false;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
+        crate::log_verbose!(
+            "[#{}] wait_connected: observed connected disconnected={} failed={}",
+            self.id,
+            self.disconnected.load(Ordering::Acquire),
+            self.failed.load(Ordering::Acquire)
+        );
         !self.disconnected.load(Ordering::Acquire)
     }
 
     /// 带信号检查的等待（用于 spawn 模式）
     pub(crate) fn wait_connected_with_signal(&self, timeout_secs: u64, signal_check: impl Fn() -> bool) -> bool {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        crate::log_verbose!(
+            "[#{}] wait_connected_with_signal: start connected={} disconnected={} failed={}",
+            self.id,
+            self.connected.load(Ordering::Acquire),
+            self.disconnected.load(Ordering::Acquire),
+            self.failed.load(Ordering::Acquire)
+        );
         while !self.connected.load(Ordering::Acquire) {
             if self.failed.load(Ordering::Acquire) || self.disconnected.load(Ordering::Acquire) || signal_check() {
+                crate::log_verbose!(
+                    "[#{}] wait_connected_with_signal: failed early connected={} disconnected={} failed={} signal={}",
+                    self.id,
+                    self.connected.load(Ordering::Acquire),
+                    self.disconnected.load(Ordering::Acquire),
+                    self.failed.load(Ordering::Acquire),
+                    signal_check()
+                );
                 return false;
             }
             if std::time::Instant::now() >= deadline {
+                crate::log_verbose!(
+                    "[#{}] wait_connected_with_signal: timeout connected={} disconnected={} failed={}",
+                    self.id,
+                    self.connected.load(Ordering::Acquire),
+                    self.disconnected.load(Ordering::Acquire),
+                    self.failed.load(Ordering::Acquire)
+                );
                 return false;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
+        crate::log_verbose!(
+            "[#{}] wait_connected_with_signal: observed connected disconnected={} failed={}",
+            self.id,
+            self.disconnected.load(Ordering::Acquire),
+            self.failed.load(Ordering::Acquire)
+        );
         !self.disconnected.load(Ordering::Acquire)
     }
 

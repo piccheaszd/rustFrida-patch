@@ -282,7 +282,11 @@ fn main() {
         }
 
         if !connected {
-            log_error!("等待 agent 连接超时 ({}s)，请检查:", args.connect_timeout);
+            if session.connected.load(Ordering::Acquire) && session.disconnected.load(Ordering::Acquire) {
+                log_error!("agent 连接后立即断开，请检查:");
+            } else {
+                log_error!("等待 agent 连接超时 ({}s)，请检查:", args.connect_timeout);
+            }
             if let Some(pid) = target_pid {
                 if std::path::Path::new(&format!("/proc/{}/status", pid)).exists() {
                     log_warn!("  目标进程 {} 仍在运行（agent 可能崩溃或未加载）", pid);

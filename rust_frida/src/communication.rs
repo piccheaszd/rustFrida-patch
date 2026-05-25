@@ -12,7 +12,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::session::Session;
-use crate::{log_agent, log_error, log_success};
+use crate::{log_agent, log_error, log_success, log_verbose};
 
 const FRAME_KIND_CMD: u8 = 1;
 #[cfg(feature = "qbdi")]
@@ -149,6 +149,7 @@ fn handle_socket_connection(stream: UnixStream, session: Arc<Session>) {
                     } else {
                         log_success!("[#{}] Agent 已连接", session.id);
                     }
+                    log_verbose!("[#{}] hello: cloning stream", session.id);
                     let stream_clone = match reader.try_clone() {
                         Ok(s) => s,
                         Err(e) => {
@@ -156,20 +157,28 @@ fn handle_socket_connection(stream: UnixStream, session: Arc<Session>) {
                             return;
                         }
                     };
+                    log_verbose!("[#{}] hello: stream cloned", session.id);
+                    let (sd, rx) = channel();
+                    match session.sender.set(sd) {
+                        Ok(_) => {}
+                        Err(_) => {
+                            log_error!("[#{}] sender already set!", session.id);
+                            return;
+                        }
+                    }
+                    log_verbose!("[#{}] hello: sender registered", session.id);
+                    session.connected.store(true, Ordering::Release);
+                    log_verbose!(
+                        "[#{}] hello: connected=true disconnected={} failed={}",
+                        session.id,
+                        session.disconnected.load(Ordering::Acquire),
+                        session.failed.load(Ordering::Acquire)
+                    );
                     let session2 = session.clone();
                     thread::Builder::new()
                         .name("wwb-socktx".into())
                         .spawn(move || {
                             let mut stream_clone = stream_clone;
-                            let (sd, rx) = channel();
-                            match session2.sender.set(sd) {
-                                Ok(_) => {}
-                                Err(_) => {
-                                    log_error!("[#{}] sender already set!", session2.id);
-                                    return;
-                                }
-                            }
-                            session2.connected.store(true, Ordering::Release);
                             while let Ok(msg) = rx.recv() {
                                 let (kind, payload) = match msg {
                                     HostToAgentMessage::Command(cmd) => (FRAME_KIND_CMD, cmd.into_bytes()),
@@ -254,7 +263,7 @@ fn handle_socket_connection(stream: UnixStream, session: Arc<Session>) {
                         log_error!("[#{}] Agent socket 在 HELLO 前关闭", session.id);
                     }
                 } else if session.id == 0 {
-                    // legacy 模式静默断连
+                    log_verbose!("[#{}] socket EOF after HELLO", session.id);
                 } else {
                     log_error!("[#{}] Agent 连接已断开", session.id);
                 }

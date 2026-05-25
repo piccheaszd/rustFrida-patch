@@ -178,6 +178,77 @@ fn read_target_mls_range(pid: i32) -> Option<String> {
     Some(mls.to_string())
 }
 
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+        .unwrap_or(false)
+}
+
+fn build_loader_agent_data(use_pthread_loader: bool) -> Result<Vec<u8>, String> {
+    let mut tokens = Vec::new();
+
+    if use_pthread_loader {
+        tokens.push("pthread".to_string());
+    }
+
+    if env_flag_enabled("RF_CLOSE_LOADER_CTRL") {
+        log_verbose!("loader ctrl fd: 进入 agent 前关闭");
+        tokens.push("close-ctrl".to_string());
+    }
+
+    if env_flag_enabled("RF_HOLD_BEFORE_ENTRY") {
+        log_verbose!("loader trace: 进入 agent 前保持 3s");
+        tokens.push("hold-entry".to_string());
+    }
+
+    if env_flag_enabled("RF_CATCH_ENTRY_SIGNALS") {
+        log_verbose!("loader trace: 捕获 entry 窗口 native signal");
+        tokens.push("catch-signals".to_string());
+    }
+
+    if let Ok(name) = std::env::var("RF_AGENT_VMA_NAME") {
+        if !name.is_empty() {
+            if name.len() > 63 {
+                return Err("RF_AGENT_VMA_NAME 最多 63 字节".to_string());
+            }
+            if !name.bytes().all(|b| (0x21..=0x7e).contains(&b) && b != b';') {
+                return Err("RF_AGENT_VMA_NAME 仅允许非空白 ASCII，且不能包含分号".to_string());
+            }
+            log_verbose!("agent VMA name: {}", name);
+            tokens.push(format!("vma={}", name));
+        }
+    }
+
+    let mut data = if tokens.is_empty() {
+        Vec::new()
+    } else {
+        tokens.join(";").into_bytes()
+    };
+    data.push(0);
+    Ok(data)
+}
+
+fn build_agent_entrypoint() -> Result<Vec<u8>, String> {
+    let name = std::env::var("RF_AGENT_ENTRYPOINT").unwrap_or_else(|_| "hello_entry".to_string());
+
+    if name.is_empty() {
+        return Err("RF_AGENT_ENTRYPOINT 不能为空".to_string());
+    }
+    if name.len() > 127 {
+        return Err("RF_AGENT_ENTRYPOINT 最多 127 字节".to_string());
+    }
+    if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return Err("RF_AGENT_ENTRYPOINT 仅允许 ASCII 字母、数字和下划线".to_string());
+    }
+    if name != "hello_entry" {
+        log_verbose!("agent entrypoint override: {}", name);
+    }
+
+    let mut bytes = name.into_bytes();
+    bytes.push(0);
+    Ok(bytes)
+}
+
 /// 根据 UID 查找 /data/data/ 目录下对应的应用数据目录
 fn find_data_dir_by_uid(uid: u32) -> Option<String> {
     use std::fs;
@@ -967,6 +1038,76 @@ fn recv_loader_string(ctrl_fd: RawFd) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&msg_buf).into_owned())
 }
 
+fn drain_loader_messages_for(ctrl_fd: RawFd, duration: std::time::Duration) {
+    let deadline = std::time::Instant::now() + duration;
+
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+
+        let remaining_ms = deadline.duration_since(now).as_millis().min(i32::MAX as u128) as i32;
+        let mut pfd = libc::pollfd {
+            fd: ctrl_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let n = unsafe { libc::poll(&mut pfd, 1, remaining_ms) };
+        if n == 0 {
+            break;
+        }
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            log_warn!("延迟 detach: poll loader 控制通道失败: {}", err);
+            break;
+        }
+
+        let fatal = pfd.revents & (libc::POLLERR | libc::POLLNVAL | libc::POLLHUP);
+        if fatal != 0 {
+            log_warn!("延迟 detach: loader 控制通道关闭 revents=0x{:x}", pfd.revents);
+            break;
+        }
+        if pfd.revents & libc::POLLIN == 0 {
+            continue;
+        }
+
+        let mut msg_type = [0u8; 1];
+        if let Err(e) = recv_exact(ctrl_fd, &mut msg_type) {
+            log_warn!("延迟 detach: 读取 loader 消息类型失败: {}", e);
+            break;
+        }
+
+        match msg_type[0] {
+            t if t == message_type::DEBUG || t == message_type::LOG => match recv_loader_string(ctrl_fd) {
+                Ok(msg) => log_verbose!("Loader debug: {}", msg),
+                Err(e) => {
+                    log_warn!("延迟 detach: 读取 loader debug 失败: {}", e);
+                    break;
+                }
+            },
+            t if t == message_type::ERROR_DLOPEN || t == message_type::ERROR_DLSYM => {
+                match recv_loader_string(ctrl_fd) {
+                    Ok(msg) => log_warn!("延迟 detach: loader 错误: {}", msg),
+                    Err(e) => log_warn!("延迟 detach: 读取 loader 错误失败: {}", e),
+                }
+                break;
+            }
+            t if t == message_type::BYE => {
+                log_warn!("延迟 detach: loader 在 entry 前退出");
+                break;
+            }
+            t => {
+                log_warn!("延迟 detach: loader 控制通道收到未知消息 {}", t);
+                break;
+            }
+        }
+    }
+}
+
 /// Host 端执行 loader IPC 握手协议
 /// 返回 REPL 用的 host_fd
 fn run_loader_handshake(ctrl_fd: RawFd, target_pid: i32, loader_ctx_addr: usize) -> Result<InjectionResult, String> {
@@ -1272,7 +1413,14 @@ fn inject_via_bootstrapper_once(
     log_verbose!("rtld_flavor: {}", bootstrap_ctx.rtld_flavor);
     log_verbose!("ctrlfds: [{}, {}]", bootstrap_ctx.ctrlfds[0], bootstrap_ctx.ctrlfds[1]);
     log_verbose!("agent linker: 自解析 ELF/重定位/外部符号，不调用 dlopen/dlsym");
-    log_verbose!("loader thread: raw clone，不调用 pthread_create");
+    let use_pthread_loader = std::env::var("RF_LOADER_THREAD")
+        .map(|value| value.eq_ignore_ascii_case("pthread"))
+        .unwrap_or(false);
+    if use_pthread_loader {
+        log_verbose!("loader thread: 请求 pthread_create 模式");
+    } else {
+        log_verbose!("loader thread: raw clone，不调用 pthread_create");
+    }
 
     // 提取 ctrlfds[0] 到 host
     let host_ctrl_fd = extract_fd_from_target(pid, bootstrap_ctx.ctrlfds[0])?;
@@ -1318,15 +1466,15 @@ fn inject_via_bootstrapper_once(
 
     // 写入字符串字面量
     let str_base = loader_libc_addr + size_of::<FridaLibcApi>();
-    let entrypoint_str = b"hello_entry\0";
+    let entrypoint_str = build_agent_entrypoint()?;
     let current_thread_eval_str = b"rustfrida_loadjs_current_thread\0";
-    let data_str = b"\0";
+    let data_str = build_loader_agent_data(use_pthread_loader)?;
     let fallback_str = format!("\x00rustfrida-{}\0", pid); // abstract socket: \0 prefix
-    mem.pwrite_all(entrypoint_str, str_base as u64)?;
+    mem.pwrite_all(&entrypoint_str, str_base as u64)?;
     let current_thread_eval_str_addr = str_base + entrypoint_str.len();
     mem.pwrite_all(current_thread_eval_str, current_thread_eval_str_addr as u64)?;
     let data_str_addr = current_thread_eval_str_addr + current_thread_eval_str.len();
-    mem.pwrite_all(data_str, data_str_addr as u64)?;
+    mem.pwrite_all(&data_str, data_str_addr as u64)?;
     let fallback_str_addr = data_str_addr + data_str.len();
     mem.pwrite_all(fallback_str.as_bytes(), fallback_str_addr as u64)?;
 
@@ -1372,17 +1520,54 @@ fn inject_via_bootstrapper_once(
         }
     }
 
-    // === ptrace 分离 ===
-    stop_world.detach_all();
-    unsafe {
-        libc::kill(pid, libc::SIGCONT);
+    let detach_after_handshake = std::env::var("RF_DETACH_AFTER_HANDSHAKE")
+        .map(|v| v != "0")
+        .unwrap_or(false);
+
+    if !detach_after_handshake {
+        // === ptrace 分离 ===
+        stop_world.detach_all();
+        unsafe {
+            libc::kill(pid, libc::SIGCONT);
+        }
+        log_success!("已分离目标进程");
+    } else {
+        log_verbose!("延迟 detach: 保持旧线程停止直到 loader READY/ACK 完成");
     }
-    log_success!("已分离目标进程");
 
     // === Host 端 loader IPC 握手 ===
-    let result = run_loader_handshake(host_ctrl_fd, pid, loader_ctx_addr).inspect_err(|_| {
-        unsafe { close(host_ctrl_fd) };
-    })?;
+    let result = match run_loader_handshake(host_ctrl_fd, pid, loader_ctx_addr) {
+        Ok(result) => result,
+        Err(e) => {
+            unsafe { close(host_ctrl_fd) };
+            if detach_after_handshake {
+                stop_world.detach_all();
+                unsafe {
+                    libc::kill(pid, libc::SIGCONT);
+                }
+            }
+            return Err(e);
+        }
+    };
+
+    if detach_after_handshake {
+        let delay_ms = std::env::var("RF_DETACH_AFTER_HANDSHAKE_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        if delay_ms != 0 {
+            log_verbose!(
+                "延迟 detach: 等待 agent 首帧 {}ms，并继续读取 loader 控制日志",
+                delay_ms
+            );
+            drain_loader_messages_for(host_ctrl_fd, std::time::Duration::from_millis(delay_ms));
+        }
+        stop_world.detach_all();
+        unsafe {
+            libc::kill(pid, libc::SIGCONT);
+        }
+        log_success!("已分离目标进程");
+    }
 
     Ok(result)
 }

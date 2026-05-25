@@ -38,6 +38,7 @@ use crate::communication::{
 };
 use crate::crash_handler::install_panic_hook;
 use libc::{kill, pid_t, SIGSTOP};
+use std::alloc::{GlobalAlloc, Layout};
 use std::ffi::c_void;
 use std::os::fd::AsRawFd;
 use std::os::unix::io::FromRawFd;
@@ -47,8 +48,171 @@ use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
+struct RawMmapAllocator;
+
+#[global_allocator]
+static GLOBAL_ALLOCATOR: RawMmapAllocator = RawMmapAllocator;
+
+#[inline(always)]
+unsafe fn raw_syscall6(nr: usize, a0: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> isize {
+    let ret: isize;
+    core::arch::asm!(
+        "svc #0",
+        inlateout("x0") a0 as isize => ret,
+        in("x1") a1,
+        in("x2") a2,
+        in("x3") a3,
+        in("x4") a4,
+        in("x5") a5,
+        in("x8") nr,
+        options(nostack)
+    );
+    ret
+}
+
+unsafe impl GlobalAlloc for RawMmapAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        const SYS_MMAP: usize = 222;
+        const PROT_READ: usize = 1;
+        const PROT_WRITE: usize = 2;
+        const MAP_PRIVATE: usize = 2;
+        const MAP_ANONYMOUS: usize = 0x20;
+        const PAGE_SIZE: usize = 4096;
+
+        let header_size = 2 * core::mem::size_of::<usize>();
+        let align = layout.align().max(core::mem::align_of::<usize>());
+        let size = layout.size().max(1);
+        let Some(requested) = size.checked_add(align).and_then(|v| v.checked_add(header_size)) else {
+            return core::ptr::null_mut();
+        };
+        let Some(total) = requested.checked_add(PAGE_SIZE - 1).map(|v| v & !(PAGE_SIZE - 1)) else {
+            return core::ptr::null_mut();
+        };
+
+        let base = raw_syscall6(
+            SYS_MMAP,
+            0,
+            total,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+            usize::MAX,
+            0,
+        );
+        if base < 0 {
+            return core::ptr::null_mut();
+        }
+
+        let start = base as usize + header_size;
+        let aligned = (start + align - 1) & !(align - 1);
+        let header = (aligned - header_size) as *mut usize;
+        *header = base as usize;
+        *header.add(1) = total;
+        aligned as *mut u8
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+        const SYS_MUNMAP: usize = 215;
+
+        if ptr.is_null() {
+            return;
+        }
+
+        let header = (ptr as usize - 2 * core::mem::size_of::<usize>()) as *const usize;
+        let base = *header;
+        let total = *header.add(1);
+        let _ = raw_syscall6(SYS_MUNMAP, base, total, 0, 0, 0, 0);
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let Some(new_layout) = Layout::from_size_align(new_size, layout.align()).ok() else {
+            return core::ptr::null_mut();
+        };
+        let new_ptr = self.alloc(new_layout);
+        if !new_ptr.is_null() {
+            core::ptr::copy_nonoverlapping(ptr, new_ptr, layout.size().min(new_size));
+            self.dealloc(ptr, layout);
+        }
+        new_ptr
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let ptr = self.alloc(layout);
+        if !ptr.is_null() {
+            core::ptr::write_bytes(ptr, 0, layout.size());
+        }
+        ptr
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn rust_get_hide_result() -> *const c_void {
+    null_mut()
+}
+
+#[inline(always)]
+unsafe fn raw_write_syscall(fd: i32, buf: *const u8, len: usize) -> isize {
+    let ret: isize;
+    core::arch::asm!(
+        "svc #0",
+        inlateout("x0") fd as isize => ret,
+        in("x1") buf,
+        in("x2") len,
+        in("x8") 64usize,
+        options(nostack)
+    );
+    ret
+}
+
+#[inline(always)]
+unsafe fn raw_read_syscall(fd: i32, buf: *mut u8, len: usize) -> isize {
+    let ret: isize;
+    core::arch::asm!(
+        "svc #0",
+        inlateout("x0") fd as isize => ret,
+        in("x1") buf,
+        in("x2") len,
+        in("x8") 63usize,
+        options(nostack)
+    );
+    ret
+}
+
+#[inline(always)]
+unsafe fn raw_fcntl_syscall(fd: i32, cmd: usize, arg: usize) -> isize {
+    let ret: isize;
+    core::arch::asm!(
+        "svc #0",
+        inlateout("x0") fd as isize => ret,
+        in("x1") cmd,
+        in("x2") arg,
+        in("x8") 25usize,
+        options(nostack)
+    );
+    ret
+}
+
+#[inline(always)]
+fn raw_dup_fd_cloexec(fd: i32) -> Option<i32> {
+    const F_DUPFD_CLOEXEC: usize = 1030;
+    let ret = unsafe { raw_fcntl_syscall(fd, F_DUPFD_CLOEXEC, 0) };
+    if ret < 0 {
+        None
+    } else {
+        Some(ret as i32)
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rustfrida_probe_entry(args_ptr: *mut c_void) -> *mut c_void {
+    if args_ptr.is_null() {
+        return null_mut();
+    }
+
+    let ctrl_fd = unsafe { (*(args_ptr as *const AgentArgs)).ctrl_fd };
+    let frame = [0x80u8, 0, 0, 0, 0];
+    unsafe {
+        raw_write_syscall(ctrl_fd, frame.as_ptr(), frame.len());
+    }
     null_mut()
 }
 
@@ -109,15 +273,31 @@ static SHOULD_EXIT: AtomicBool = AtomicBool::new(false);
 static SHOULD_DETACH: AtomicBool = AtomicBool::new(false);
 pub static OUTPUT_PATH: OnceLock<String> = OnceLock::new();
 
+#[inline(always)]
+fn trace_entry_raw(fd: i32, msg: &'static [u8]) {
+    let _ = write_log_raw_fd(fd, msg);
+}
+
 fn read_exact_raw_fd(fd: i32, buf: &mut [u8]) -> std::io::Result<()> {
+    const EINTR: i32 = 4;
+    const EAGAIN: i32 = 11;
+
     let mut done = 0usize;
     while done < buf.len() {
-        let n = unsafe { libc::read(fd, buf[done..].as_mut_ptr() as *mut libc::c_void, buf.len() - done) };
+        let n = unsafe { raw_read_syscall(fd, buf[done..].as_mut_ptr(), buf.len() - done) };
         if n == 0 {
             return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "socket eof"));
         }
         if n < 0 {
-            return Err(std::io::Error::last_os_error());
+            let errno = (-n) as i32;
+            if errno == EINTR {
+                continue;
+            }
+            if errno == EAGAIN {
+                raw_thread::sleep_ms(10);
+                continue;
+            }
+            return Err(std::io::Error::from_raw_os_error(errno));
         }
         done += n as usize;
     }
@@ -134,10 +314,6 @@ pub struct AgentArgs {
 
 #[no_mangle]
 pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
-    install_panic_hook();
-    // Keep native crash handlers disabled for this target.
-    // install_crash_handlers();
-
     // 从 AgentArgs 读取 ctrl_fd 和 StringTable 指针
     let (ctrl_fd, table_addr) = unsafe {
         let args = &*(args_ptr as *const AgentArgs);
@@ -146,64 +322,93 @@ pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
 
     // Send HELLO before any Rust stream setup so entry-stage failures are visible to the host.
     let _ = send_hello_raw_fd(ctrl_fd);
-    let _ = write_log_raw_fd(
-        ctrl_fd,
-        format!(
-            "[agent] agent-entry: raw hello sent ctrl_fd={} table=0x{:x}\n",
-            ctrl_fd, table_addr
-        )
-        .as_bytes(),
-    );
+    trace_entry_raw(ctrl_fd, b"[agent-trace] 01 after-hello\n");
 
+    trace_entry_raw(ctrl_fd, b"[agent-trace] 02 before-panic-hook\n");
+    install_panic_hook();
+    trace_entry_raw(ctrl_fd, b"[agent-trace] 03 after-panic-hook\n");
+    // Keep native crash handlers disabled for this target.
+    // install_crash_handlers();
+
+    trace_entry_raw(ctrl_fd, b"[agent-trace] 04 before-from-raw-fd\n");
     let sock = unsafe { UnixStream::from_raw_fd(ctrl_fd) };
-    let write_half = match sock.try_clone() {
-        Ok(stream) => stream,
-        Err(e) => {
-            let _ = write_log_raw_fd(
-                ctrl_fd,
-                format!("[agent] agent-entry: stream clone failed: {}\n", e).as_bytes(),
-            );
+    trace_entry_raw(ctrl_fd, b"[agent-trace] 05 after-from-raw-fd\n");
+    trace_entry_raw(ctrl_fd, b"[agent-trace] 06 before-raw-dup\n");
+    let write_fd = match raw_dup_fd_cloexec(ctrl_fd) {
+        Some(fd) => {
+            trace_entry_raw(ctrl_fd, b"[agent-trace] 07 after-raw-dup\n");
+            fd
+        }
+        None => {
+            trace_entry_raw(ctrl_fd, b"[agent-trace] 07 raw-dup-failed\n");
             return null_mut();
         }
     };
+    trace_entry_raw(ctrl_fd, b"[agent-trace] 07b before-write-stream-wrap\n");
+    let write_half = unsafe { UnixStream::from_raw_fd(write_fd) };
+    trace_entry_raw(ctrl_fd, b"[agent-trace] 07c after-write-stream-wrap\n");
+    trace_entry_raw(ctrl_fd, b"[agent-trace] 08 before-register-fd\n");
     register_stream_fd(&write_half);
+    trace_entry_raw(ctrl_fd, b"[agent-trace] 09 after-register-fd\n");
+    trace_entry_raw(ctrl_fd, b"[agent-trace] 10 before-global-stream-set\n");
     if GLOBAL_STREAM.set(std::sync::Mutex::new(write_half)).is_err() {
         let _ = write_log_raw_fd(ctrl_fd, b"[agent] agent-entry: global stream already initialized\n");
         return null_mut();
     }
+    trace_entry_raw(ctrl_fd, b"[agent-trace] 11 after-global-stream-set\n");
     // 启动异步日志 writer 线程：write_stream() 只 push channel，此线程通过 GLOBAL_STREAM 写 socket
+    trace_entry_raw(ctrl_fd, b"[agent-trace] 12 before-start-log-writer\n");
     start_log_writer();
+    trace_entry_raw(ctrl_fd, b"[agent-trace] 13 after-start-log-writer\n");
+    trace_entry_raw(ctrl_fd, b"[agent-trace] 14 before-stream-ready-log\n");
     log_msg_sync(format!(
         "agent-entry: stream ready ctrl_fd={} table=0x{:x}\n",
         ctrl_fd, table_addr
     ));
+    trace_entry_raw(ctrl_fd, b"[agent-trace] 15 after-stream-ready-log\n");
+    trace_entry_raw(ctrl_fd, b"[agent-trace] 16 before-sleep\n");
     raw_thread::sleep_ms(100);
+    trace_entry_raw(ctrl_fd, b"[agent-trace] 17 after-sleep\n");
+    trace_entry_raw(ctrl_fd, b"[agent-trace] 18 before-flush-cache\n");
     flush_cached_logs();
+    trace_entry_raw(ctrl_fd, b"[agent-trace] 19 after-flush-cache\n");
 
     unsafe {
+        trace_entry_raw(ctrl_fd, b"[agent-trace] 20 before-string-table\n");
         let table = &*(table_addr as *const StringTable);
         // 读取 output_path 并保存到全局变量
+        trace_entry_raw(ctrl_fd, b"[agent-trace] 21 before-output-path\n");
         if let Some(output) = table.get_output_path() {
+            trace_entry_raw(ctrl_fd, b"[agent-trace] 22 output-path-read\n");
             if output != "novalue" {
+                trace_entry_raw(ctrl_fd, b"[agent-trace] 23 before-output-path-set\n");
                 let _ = OUTPUT_PATH.set(output.clone());
+                trace_entry_raw(ctrl_fd, b"[agent-trace] 24 after-output-path-set\n");
             }
         }
 
         // 读取 cmdline 参数
+        trace_entry_raw(ctrl_fd, b"[agent-trace] 25 before-cmdline\n");
         if let Some(cmd) = table.get_cmdline() {
+            trace_entry_raw(ctrl_fd, b"[agent-trace] 26 cmdline-read\n");
             if cmd != "novalue" {
+                trace_entry_raw(ctrl_fd, b"[agent-trace] 27 before-process-cmd\n");
                 process_cmd(&cmd);
+                trace_entry_raw(ctrl_fd, b"[agent-trace] 28 after-process-cmd\n");
             }
         }
     }
 
     // 不设置线程名，保持继承的进程名，避免被安全 SDK 通过 /proc/self/task/*/comm 检测
 
+    trace_entry_raw(ctrl_fd, b"[agent-trace] 29 before-final-flush\n");
     flush_cached_logs();
+    trace_entry_raw(ctrl_fd, b"[agent-trace] 30 before-command-loop\n");
 
     let reader = sock;
     let reader_fd_for_raw = reader.as_raw_fd();
     loop {
+        trace_entry_raw(ctrl_fd, b"[agent-trace] 31 command-loop-read\n");
         let mut header = [0u8; 5];
         match read_exact_raw_fd(reader_fd_for_raw, &mut header).and_then(|_| {
             let kind = header[0];
@@ -231,14 +436,19 @@ pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
                     break;
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                trace_entry_raw(ctrl_fd, b"[agent-trace] 32 command-loop-eof\n");
+                break;
+            }
             Err(e) => {
                 // 读取错误
+                trace_entry_raw(ctrl_fd, b"[agent-trace] 33 command-loop-error\n");
                 write_stream(format!("读取命令错误: {}", e).as_bytes());
                 break;
             }
         }
     }
+    trace_entry_raw(ctrl_fd, b"[agent-trace] 34 command-loop-exit\n");
     if SHOULD_EXIT.load(Ordering::Relaxed) {
         log_msg_sync("收到 shutdown，开始退出清理\n".to_string());
     } else if SHOULD_DETACH.load(Ordering::Relaxed) {

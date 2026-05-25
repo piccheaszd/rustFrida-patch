@@ -191,6 +191,37 @@ Validation after the change:
   after loader execution, without a new tombstone. This points to late/PID
   anti-debug handling rather than the prior fd/VMA linker crash.
 
+## 2026-05-25 Agent Entry Fixes
+
+The late path was further narrowed from loader/linker failure to post-HELLO
+target exit:
+
+- agent entry now avoids libc `fcntl()` for `UnixStream::try_clone()` and
+  duplicates the control fd with a raw `fcntl` syscall;
+- agent Rust allocations now use a raw anonymous `mmap` allocator, avoiding the
+  injected-process libc allocator during early entry;
+- agent frame writes and command-loop reads use raw `write`/`read` syscalls for
+  the control socket;
+- the raw command-loop reader now retries `EINTR` and waits/retries on
+  `EAGAIN`, matching blocking socket semantics;
+- host HELLO handling now registers the command sender and marks the session
+  connected synchronously before spawning the tx thread, removing the previous
+  "HELLO logged but wait timed out" race;
+- host diagnostics now distinguish true connection timeout from "connected then
+  immediately disconnected".
+
+Validation after these fixes:
+
+- `--spawn-late` reaches the agent command loop. The last agent marker is
+  `31 command-loop-read`; the agent does not emit the normal command-loop EOF
+  or exit markers. The host then receives socket EOF and the target process
+  exits without a fresh tombstone, consistent with post-resume target-side
+  termination/self-protection rather than an agent-managed shutdown path.
+- `--spawn-early` with the existing `RegisterNatives` `Hook.WXSHADOW` test
+  script still reaches `Agent 已连接`, initializes QuickJS, applies the
+  `WXSHADOW` patch, captures JNI registration output, resumes the child, and
+  shuts down through the managed cleanup path.
+
 ## Remaining Work
 
 1. Improve automatic thread probing so it can find a usable user-mode transition

@@ -8,7 +8,6 @@ use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
 
 const FRAME_KIND_CMD: u8 = 1;
 const FRAME_KIND_QBDI_HELPER: u8 = 2;
@@ -27,17 +26,29 @@ const FRAME_KIND_BYE: u8 = 0x87;
 pub static GLOBAL_STREAM: OnceLock<Mutex<UnixStream>> = OnceLock::new();
 pub static GLOBAL_STREAM_FD: OnceLock<i32> = OnceLock::new();
 
+#[inline(always)]
+unsafe fn raw_write_syscall(fd: i32, buf: *const u8, len: usize) -> isize {
+    let ret: isize;
+    core::arch::asm!(
+        "svc #0",
+        inlateout("x0") fd as isize => ret,
+        in("x1") buf,
+        in("x2") len,
+        in("x8") 64usize,
+        options(nostack)
+    );
+    ret
+}
+
 fn write_frame(stream: &mut UnixStream, kind: u8, payload: &[u8]) -> std::io::Result<()> {
-    stream.write_all(&[kind])?;
-    stream.write_all(&(payload.len() as u32).to_le_bytes())?;
-    stream.write_all(payload)
+    write_frame_raw_fd(stream.as_raw_fd(), kind, payload)
 }
 
 fn write_all_raw_fd(fd: i32, mut data: &[u8]) -> std::io::Result<()> {
     while !data.is_empty() {
-        let wrote = unsafe { libc::write(fd, data.as_ptr() as *const libc::c_void, data.len()) };
+        let wrote = unsafe { raw_write_syscall(fd, data.as_ptr(), data.len()) };
         if wrote < 0 {
-            let err = std::io::Error::last_os_error();
+            let err = std::io::Error::from_raw_os_error((-wrote) as i32);
             if err.kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
@@ -92,9 +103,7 @@ pub(crate) fn write_stream(data: &[u8]) {
             Err(std::sync::TryLockError::WouldBlock) => return,
             Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
         };
-        let _ = stream.set_write_timeout(Some(Duration::from_millis(10)));
         let _ = write_frame(&mut stream, FRAME_KIND_LOG, data);
-        let _ = stream.set_write_timeout(None);
     }
 }
 
@@ -112,11 +121,10 @@ pub(crate) fn write_stream_raw(data: &[u8]) {
         let mut header = [0u8; 5];
         header[0] = FRAME_KIND_LOG;
         header[1..].copy_from_slice(&(data.len() as u32).to_le_bytes());
-        let _ = unsafe { libc::write(*fd, header.as_ptr() as *const libc::c_void, header.len()) };
+        let _ = unsafe { raw_write_syscall(*fd, header.as_ptr(), header.len()) };
         let mut offset = 0usize;
         while offset < data.len() {
-            let wrote =
-                unsafe { libc::write(*fd, data[offset..].as_ptr() as *const libc::c_void, data.len() - offset) };
+            let wrote = unsafe { raw_write_syscall(*fd, data[offset..].as_ptr(), data.len() - offset) };
             if wrote <= 0 {
                 break;
             }

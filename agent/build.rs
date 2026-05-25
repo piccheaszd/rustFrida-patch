@@ -8,6 +8,7 @@ fn main() -> anyhow::Result<()> {
     println!("cargo:rustc-cdylib-link-arg=-Wl,-u,pthread_create,--export-dynamic-symbol=pthread_create");
     println!("cargo:rustc-cdylib-link-arg=-Wl,-u,pthread_detach,--export-dynamic-symbol=pthread_detach");
     println!("cargo:rustc-cdylib-link-arg=-Wl,-u,nanosleep,--export-dynamic-symbol=nanosleep");
+    println!("cargo:rustc-cdylib-link-arg=-Wl,-u,rustfrida_probe_entry,--export-dynamic-symbol=rustfrida_probe_entry");
 
     Ok(())
 }
