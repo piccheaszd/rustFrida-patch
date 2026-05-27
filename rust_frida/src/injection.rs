@@ -264,7 +264,7 @@ fn use_stream_agent_transfer() -> bool {
     !env_flag_enabled("RF_AGENT_MEMFD")
 }
 
-pub(crate) fn build_loader_agent_data(use_pthread_loader: bool) -> Result<Vec<u8>, String> {
+fn build_loader_agent_data(use_pthread_loader: bool) -> Result<Vec<u8>, String> {
     let mut tokens = Vec::new();
 
     if use_pthread_loader {
@@ -326,7 +326,7 @@ pub(crate) fn build_loader_agent_data(use_pthread_loader: bool) -> Result<Vec<u8
     Ok(data)
 }
 
-pub(crate) fn build_agent_entrypoint() -> Result<Vec<u8>, String> {
+fn build_agent_entrypoint() -> Result<Vec<u8>, String> {
     let name = std::env::var("RF_AGENT_ENTRYPOINT").unwrap_or_else(|_| "hello_entry".to_string());
 
     if name.is_empty() {
@@ -1043,7 +1043,7 @@ fn is_system_resolver_module(path: &str) -> bool {
 }
 
 /// Unix socket fd-passing: 通过 SCM_RIGHTS 发送 fd
-pub(crate) fn send_fd(sockfd: RawFd, fd_to_send: RawFd) -> Result<(), String> {
+fn send_fd(sockfd: RawFd, fd_to_send: RawFd) -> Result<(), String> {
     use std::io::IoSlice;
 
     let dummy = [0u8; 1];
@@ -1125,7 +1125,7 @@ fn recv_exact(sockfd: RawFd, buf: &mut [u8]) -> Result<(), String> {
 }
 
 /// 向 ctrl socket 写入数据
-pub(crate) fn send_exact(sockfd: RawFd, buf: &[u8]) -> Result<(), String> {
+fn send_exact(sockfd: RawFd, buf: &[u8]) -> Result<(), String> {
     let mut done = 0;
     while done < buf.len() {
         let n = unsafe {
@@ -1286,11 +1286,7 @@ fn drain_loader_messages_for(ctrl_fd: RawFd, duration: std::time::Duration) {
 
 /// Host 端执行 loader IPC 握手协议
 /// 返回 REPL 用的 host_fd
-pub(crate) fn run_loader_handshake(
-    ctrl_fd: RawFd,
-    target_pid: i32,
-    loader_ctx_addr: Option<usize>,
-) -> Result<InjectionResult, String> {
+fn run_loader_handshake(ctrl_fd: RawFd, target_pid: i32, loader_ctx_addr: usize) -> Result<InjectionResult, String> {
     // 1. 接收 HELLO 消息: [type:u8][thread_id:i32]
     let mut msg_type = [0u8; 1];
     recv_exact(ctrl_fd, &mut msg_type)?;
@@ -1413,17 +1409,11 @@ pub(crate) fn run_loader_handshake(
         }
     }
 
-    let (loader_ctx_addr_value, agent_current_thread_eval_impl) = if let Some(loader_ctx_addr) = loader_ctx_addr {
-        let loader_ctx = read_loader_runtime_context(target_pid, loader_ctx_addr)?;
-        if loader_ctx.agent_current_thread_eval_impl == 0 {
-            unsafe { close(host_repl_fd) };
-            return Err("Loader 未解析 rustfrida_loadjs_current_thread".to_string());
-        }
-        (loader_ctx_addr as u64, loader_ctx.agent_current_thread_eval_impl)
-    } else {
-        log_verbose!("spawn-native: 无远程 loader ctx 地址，禁用 ptrace current-thread eval");
-        (0, 0)
-    };
+    let loader_ctx = read_loader_runtime_context(target_pid, loader_ctx_addr)?;
+    if loader_ctx.agent_current_thread_eval_impl == 0 {
+        unsafe { close(host_repl_fd) };
+        return Err("Loader 未解析 rustfrida_loadjs_current_thread".to_string());
+    }
 
     // 5. 发送 ACK
     send_exact(ctrl_fd, &[message_type::ACK])?;
@@ -1433,8 +1423,8 @@ pub(crate) fn run_loader_handshake(
     Ok(InjectionResult {
         host_fd: host_repl_fd,
         target_pid,
-        loader_ctx_addr: loader_ctx_addr_value,
-        agent_current_thread_eval_impl,
+        loader_ctx_addr: loader_ctx_addr as u64,
+        agent_current_thread_eval_impl: loader_ctx.agent_current_thread_eval_impl,
     })
 }
 
@@ -1777,7 +1767,7 @@ fn inject_via_bootstrapper_once(
     }
 
     // === Host 端 loader IPC 握手 ===
-    let result = match run_loader_handshake(host_ctrl_fd, pid, Some(loader_ctx_addr)) {
+    let result = match run_loader_handshake(host_ctrl_fd, pid, loader_ctx_addr) {
         Ok(result) => result,
         Err(e) => {
             unsafe { close(host_ctrl_fd) };

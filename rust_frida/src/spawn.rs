@@ -11,16 +11,12 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::injection::{
-    build_agent_entrypoint, build_loader_agent_data, inject_via_bootstrapper, run_loader_handshake, send_fd,
-    InjectionResult, FRIDA_LOADER,
-};
+use crate::injection::{inject_via_bootstrapper, InjectionResult};
 use crate::proc_mem::ProcMem;
 use crate::process::{parse_proc_maps, wait_until_stopped, MapEntry};
 use crate::{log_error, log_info, log_step, log_success, log_verbose, log_warn};
@@ -30,7 +26,6 @@ const ZYMBIOTE_ELF: &[u8] = include_bytes!("../../zymbiote/build/zymbiote.elf");
 
 /// ACK 字节
 const ACK_BYTE: u8 = 0x42;
-const LOAD_NATIVE_BYTE: u8 = 0x4e;
 const SPAWN_REPL_READY_MIN_WAIT: Duration = Duration::from_millis(750);
 const SPAWN_REPL_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const SPAWN_REPL_READY_POLL: Duration = Duration::from_millis(100);
@@ -41,19 +36,6 @@ struct SpawnHello {
     pid: u32,
     ppid: u32,
     package_name: String,
-}
-
-#[repr(C)]
-struct NativeLoadHeader {
-    loader_size: u32,
-    entrypoint_size: u32,
-    agent_data_size: u32,
-    current_thread_eval_size: u32,
-    sym_name_size: u32,
-    pthread_err_size: u32,
-    dlsym_err_size: u32,
-    cmdline_size: u32,
-    output_path_size: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -374,31 +356,6 @@ pub(crate) fn spawn_and_inject(
 
     // 6. 不立即恢复子进程 — 由 main.rs 在脚本加载完成后调用 resume_child
     //    子进程主线程仍阻塞在 zymbiote recv(ACK)，agent 线程可独立工作
-
-    Ok((pid, injection))
-}
-
-/// Spawn native 后端：子进程由 zymbiote 自己 mmap loader 并加载 agent，避免对
-/// app 子进程执行 ptrace attach。Zygote patch 仍按现有 spawn 流程建立和还原。
-pub(crate) fn spawn_native_and_inject(
-    package: &str,
-    timeout_secs: u64,
-    string_overrides: &HashMap<String, String>,
-) -> Result<(i32, InjectionResult), String> {
-    log_info!("Spawn native 模式: 准备注入 {}", package);
-
-    let hello = spawn_and_wait_hello(package, timeout_secs)?;
-    let pid = hello.pid as i32;
-
-    log_info!("正在请求子进程 {} 自加载 agent...", pid);
-    let injection = match start_native_loader(hello.pid, string_overrides) {
-        Ok(result) => result,
-        Err(e) => {
-            log_warn!("spawn-native 子进程 {} 加载失败，正在恢复子进程: {}", pid, e);
-            let _ = resume_child(hello.pid);
-            return Err(e);
-        }
-    };
 
     Ok((pid, injection))
 }
@@ -816,124 +773,6 @@ fn do_resume_unmatched(pid: u32, ppid: u32, mut stream: std::os::unix::net::Unix
 
 /// 活跃连接（等待 ACK 的子进程 stream + fork 时刻的 ppid）
 static ACTIVE_CONNECTIONS: OnceLock<Mutex<HashMap<u32, (std::os::unix::net::UnixStream, u32)>>> = OnceLock::new();
-
-fn nul_terminated_string(
-    overrides: &HashMap<String, String>,
-    key: &str,
-    default_value: &'static [u8],
-) -> Result<Vec<u8>, String> {
-    let mut value = overrides
-        .get(key)
-        .map(|s| s.as_bytes().to_vec())
-        .unwrap_or_else(|| default_value.to_vec());
-    if value.contains(&0) {
-        return Err(format!("{} 包含 NUL 字节，不能用于 spawn-native 字符串表", key));
-    }
-    value.push(0);
-    Ok(value)
-}
-
-fn native_header_bytes(header: &NativeLoadHeader) -> &[u8] {
-    unsafe {
-        std::slice::from_raw_parts(
-            header as *const NativeLoadHeader as *const u8,
-            std::mem::size_of::<NativeLoadHeader>(),
-        )
-    }
-}
-
-fn checked_u32_len(name: &str, bytes: &[u8]) -> Result<u32, String> {
-    u32::try_from(bytes.len()).map_err(|_| format!("{} 过大: {} bytes", name, bytes.len()))
-}
-
-fn send_native_loader_request(
-    stream: &mut std::os::unix::net::UnixStream,
-    loader_target_fd: RawFd,
-    string_overrides: &HashMap<String, String>,
-) -> Result<(), String> {
-    let entrypoint = build_agent_entrypoint()?;
-    let agent_data = build_loader_agent_data(false)?;
-    let current_thread_eval = b"rustfrida_loadjs_current_thread\0".to_vec();
-    let sym_name = nul_terminated_string(string_overrides, "sym_name", b"hello_entry")?;
-    let pthread_err = nul_terminated_string(string_overrides, "pthread_err", b"pthreadded")?;
-    let dlsym_err = nul_terminated_string(string_overrides, "dlsym_err", b"dlsymFail")?;
-    let cmdline = nul_terminated_string(string_overrides, "cmdline", b"novalue")?;
-    let output_path = nul_terminated_string(string_overrides, "output_path", b"novalue")?;
-
-    let header = NativeLoadHeader {
-        loader_size: checked_u32_len("loader", FRIDA_LOADER)?,
-        entrypoint_size: checked_u32_len("entrypoint", &entrypoint)?,
-        agent_data_size: checked_u32_len("agent_data", &agent_data)?,
-        current_thread_eval_size: checked_u32_len("current_thread_eval", &current_thread_eval)?,
-        sym_name_size: checked_u32_len("sym_name", &sym_name)?,
-        pthread_err_size: checked_u32_len("pthread_err", &pthread_err)?,
-        dlsym_err_size: checked_u32_len("dlsym_err", &dlsym_err)?,
-        cmdline_size: checked_u32_len("cmdline", &cmdline)?,
-        output_path_size: checked_u32_len("output_path", &output_path)?,
-    };
-
-    stream
-        .write_all(&[LOAD_NATIVE_BYTE])
-        .map_err(|e| format!("发送 spawn-native 命令失败: {}", e))?;
-    send_fd(stream.as_raw_fd(), loader_target_fd)?;
-    stream
-        .write_all(native_header_bytes(&header))
-        .map_err(|e| format!("发送 spawn-native header 失败: {}", e))?;
-
-    for (name, bytes) in [
-        ("loader", FRIDA_LOADER),
-        ("entrypoint", entrypoint.as_slice()),
-        ("agent_data", agent_data.as_slice()),
-        ("current_thread_eval", current_thread_eval.as_slice()),
-        ("sym_name", sym_name.as_slice()),
-        ("pthread_err", pthread_err.as_slice()),
-        ("dlsym_err", dlsym_err.as_slice()),
-        ("cmdline", cmdline.as_slice()),
-        ("output_path", output_path.as_slice()),
-    ] {
-        stream
-            .write_all(bytes)
-            .map_err(|e| format!("发送 spawn-native {} 失败: {}", name, e))?;
-    }
-
-    log_verbose!(
-        "spawn-native 请求已发送: loader={} bytes agent_data={} bytes",
-        FRIDA_LOADER.len(),
-        agent_data.len()
-    );
-    Ok(())
-}
-
-fn start_native_loader(pid: u32, string_overrides: &HashMap<String, String>) -> Result<InjectionResult, String> {
-    let mut sv = [0i32; 2];
-    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) } != 0 {
-        return Err(format!(
-            "spawn-native socketpair 失败: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-
-    let host_loader_fd = sv[0];
-    let target_loader_fd = sv[1];
-
-    let send_result = (|| {
-        let conns = ACTIVE_CONNECTIONS.get_or_init(|| Mutex::new(HashMap::new()));
-        let mut map = conns.lock().unwrap();
-        let (stream, _) = map
-            .get_mut(&pid)
-            .ok_or_else(|| format!("未找到子进程 {} 的活跃连接", pid))?;
-        send_native_loader_request(stream, target_loader_fd, string_overrides)
-    })();
-
-    unsafe { libc::close(target_loader_fd) };
-
-    if let Err(e) = send_result {
-        unsafe { libc::close(host_loader_fd) };
-        return Err(e);
-    }
-
-    run_loader_handshake(host_loader_fd, pid as i32, None)
-}
 
 /// 恢复子进程：发 ACK → 等子进程关闭 socket → 等 SIGSTOP → 还原 patch → SIGCONT
 /// 与 Frida 一致的流程：先等 EOF 确保子进程已通过 recv(ACK) 并关闭连接，
@@ -1593,9 +1432,8 @@ fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
 fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
     let maps = parse_proc_maps(pid)?;
 
-    // 1. 找到 payload 写入位置（libstagefright.so 的 R+X 段末尾页，按 payload 实际大小占用多页）
-    let zymbiote_payload_size = zymbiote_payload_template_size()?;
-    let loc = find_payload_location(&maps, zymbiote_payload_size)?;
+    // 1. 找到 payload 写入位置（libstagefright.so 的 R+X 段末尾页）
+    let loc = find_payload_location(&maps)?;
     log_verbose!(
         "Payload 写入位置: 0x{:x} (backing: {} +0x{:x})",
         loc.base,
@@ -1644,15 +1482,13 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
     )?;
     log_verbose!("Payload 构建完成: {} bytes", payload_data.len());
 
-    // 验证 payload 不越过预留的尾部页范围。
+    // 验证 payload 不超过一页（payload 占用目标段的末尾一页）
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-    let payload_pages = payload_data.len().div_ceil(page_size) * page_size;
-    if payload_pages as u64 > loc.vma_end - loc.base {
+    if payload_data.len() > page_size {
         return Err(format!(
-            "payload 大小 ({} bytes, aligned {}) 超过预留范围 0x{:x}",
+            "payload 大小 ({} bytes) 超过页面大小 ({} bytes)",
             payload_data.len(),
-            payload_pages,
-            loc.vma_end - loc.base
+            page_size
         ));
     }
 
@@ -1901,36 +1737,21 @@ struct PayloadLocation {
 
 /// 找到 payload 写入位置：libstagefright.so 的 R+X 段末尾页
 /// 与 Frida 一致：取第一个匹配的 libstagefright.so R+X 段
-fn zymbiote_payload_template_size() -> Result<usize, String> {
-    let elf = goblin::elf::Elf::parse(ZYMBIOTE_ELF).map_err(|e| format!("解析 zymbiote ELF 失败: {}", e))?;
-    let text_seg = elf
-        .program_headers
-        .iter()
-        .find(|ph| {
-            ph.p_type == goblin::elf::program_header::PT_LOAD && (ph.p_flags & goblin::elf::program_header::PF_X) != 0
-        })
-        .ok_or_else(|| "zymbiote ELF 中未找到可执行 LOAD 段".to_string())?;
-    Ok(text_seg.p_filesz as usize)
-}
-
-fn find_payload_location(maps: &[MapEntry], required_size: usize) -> Result<PayloadLocation, String> {
+fn find_payload_location(maps: &[MapEntry]) -> Result<PayloadLocation, String> {
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
     if page_size == 0 || (page_size & (page_size - 1)) != 0 {
         return Err(format!("非法 page_size: {}", page_size));
     }
-    let required_size = required_size.max(1) as u64;
-    let required_pages = required_size.div_ceil(page_size) * page_size;
 
     // 查找 libstagefright.so 的第一个 r-x 段（与 Frida payload_base == 0 guard 一致）
     for entry in maps {
         if entry.path.ends_with("/libstagefright.so") && entry.is_readable() && entry.is_executable() {
-            if entry.end <= entry.start || entry.end - entry.start < required_pages {
+            if entry.end <= entry.start || entry.end - entry.start < page_size {
                 return Err(format!(
-                    "libstagefright.so R+X 段过小: start=0x{:x} end=0x{:x} size=0x{:x} required=0x{:x} page_size=0x{:x}",
+                    "libstagefright.so R+X 段过小: start=0x{:x} end=0x{:x} size=0x{:x} page_size=0x{:x}",
                     entry.start,
                     entry.end,
                     entry.end - entry.start,
-                    required_pages,
                     page_size
                 ));
             }
@@ -1940,7 +1761,7 @@ fn find_payload_location(maps: &[MapEntry], required_size: usize) -> Result<Payl
                     entry.start, entry.end, page_size
                 ));
             }
-            let base = entry.end - required_pages;
+            let base = entry.end - page_size;
             // 与 Frida 一致：基础 prot = R|X，如果段可写则加 W
             let mut prot = (libc::PROT_READ | libc::PROT_EXEC) as u64;
             if entry.is_writable() {

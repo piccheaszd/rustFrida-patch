@@ -951,7 +951,7 @@ rustfrida_build_symbol_resolver (RustFridaLinkedModule * module, int diagfd, con
     return false;
   }
 
-  if (libc != NULL && libc->dl_iterate_phdr != NULL)
+  if (libc->dl_iterate_phdr != NULL)
   {
     RustFridaDlIterateContext ctx;
 
@@ -1096,14 +1096,14 @@ rustfrida_resolver_lookup (const RustFridaSymbolResolver * resolver, const char 
 static void
 rustfrida_set_error (RustFridaLinkedModule * module, const FridaLibcApi * libc, const char * message)
 {
-  if (libc != NULL && libc->sprintf != NULL)
+  if (libc->sprintf != NULL)
     libc->sprintf (module->error, "%s", message);
 }
 
 static void
 rustfrida_set_symbol_error (RustFridaLinkedModule * module, const FridaLibcApi * libc, const char * prefix, const char * name)
 {
-  if (libc != NULL && libc->sprintf != NULL)
+  if (libc->sprintf != NULL)
   {
     libc->sprintf (module->error, "%s%s (modules=%zu)", prefix, name, module->resolver.count);
   }
@@ -1717,7 +1717,7 @@ rustfrida_apply_relocations (RustFridaLinkedModule * module, ElfW(Rela) * rela, 
         }
         break;
       default:
-        if (libc != NULL && libc->sprintf != NULL)
+        if (libc->sprintf != NULL)
           libc->sprintf (module->error, "unsupported relocation type: %zu", type);
         return false;
     }
@@ -2967,21 +2967,8 @@ frida_receive_fd_diag (int sockfd, const FridaLibcApi * libc, char * diag_buf)
   res = frida_raw_recvmsg (sockfd, &msg, 0);
   if (res == -1 || res == 0 || msg.msg_controllen == 0)
   {
-    if (libc != NULL && libc->sprintf != NULL)
-    {
-      libc->sprintf (diag_buf, "recvfd:res=%d,ctl=%d,fd=%d",
-          res, (int) msg.msg_controllen, sockfd);
-    }
-    else
-    {
-      diag_buf[0] = 'r';
-      diag_buf[1] = 'e';
-      diag_buf[2] = 'c';
-      diag_buf[3] = 'v';
-      diag_buf[4] = 'f';
-      diag_buf[5] = 'd';
-      diag_buf[6] = '\0';
-    }
+    libc->sprintf (diag_buf, "recvfd:res=%d,ctl=%d,fd=%d",
+        res, (int) msg.msg_controllen, sockfd);
     return -1;
   }
 

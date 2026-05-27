@@ -221,25 +221,17 @@ pub struct JSEngine {
 impl JSEngine {
     /// Create a new JS engine with all APIs registered
     pub fn new() -> Option<Self> {
-        jsapi::console::output_verbose("[quickjs-init] JSRuntime::new begin");
         let runtime = JSRuntime::new()?;
-        jsapi::console::output_verbose("[quickjs-init] JSRuntime::new done");
-        jsapi::console::output_verbose("[quickjs-init] JSContext::new begin");
         let context = runtime.new_context()?;
-        jsapi::console::output_verbose("[quickjs-init] JSContext::new done");
 
         // Register all JavaScript APIs
-        jsapi::console::output_verbose("[quickjs-init] register_all_apis begin");
         jsapi::register_all_apis(&context);
-        jsapi::console::output_verbose("[quickjs-init] register_all_apis done");
 
         // 预缓存 hook callback 热路径用到的 atom（x0..x30 / sp / pc / lr / returnAddress /
         // trampoline / __hookCtxPtr / __hookTrampoline），消除每次回调的 CString+JS_NewAtom 开销。
-        jsapi::console::output_verbose("[quickjs-init] init_hot_atoms begin");
         unsafe {
             jsapi::callback_util::init_hot_atoms(context.as_ptr());
         }
-        jsapi::console::output_verbose("[quickjs-init] init_hot_atoms done");
 
         Some(JSEngine { runtime, context })
     }
@@ -305,15 +297,11 @@ unsafe impl Sync for JSEngine {}
 
 /// Get or initialize the global JS engine
 pub fn get_or_init_engine() -> Result<(), String> {
-    jsapi::console::output_verbose("[quickjs-init] lock engine begin");
     let mut engine = JS_ENGINE
         .lock()
         .map_err(|e| format!("Failed to lock JS engine: {}", e))?;
-    jsapi::console::output_verbose("[quickjs-init] lock engine done");
     if engine.is_none() {
-        jsapi::console::output_verbose("[quickjs-init] JSEngine::new begin");
         *engine = Some(JSEngine::new().ok_or_else(|| "Failed to create JS engine".to_string())?);
-        jsapi::console::output_verbose("[quickjs-init] JSEngine::new done");
     }
     Ok(())
 }
@@ -328,36 +316,23 @@ pub fn load_script(script: &str) -> Result<String, String> {
 
 /// Load + execute with an explicit filename (用于 QuickJS 报错时显示 `filename:line:col`)。
 pub fn load_script_with_filename(script: &str, filename: &str) -> Result<String, String> {
-    jsapi::console::output_verbose("[quickjs-eval] lock engine begin");
     let mut engine = JS_ENGINE
         .lock()
         .map_err(|e| format!("Failed to lock JS engine: {}", e))?;
-    jsapi::console::output_verbose("[quickjs-eval] lock engine done");
     if engine.is_none() {
-        jsapi::console::output_verbose("[quickjs-eval] lazy JSEngine::new begin");
         *engine = Some(JSEngine::new().ok_or_else(|| "Failed to create JS engine".to_string())?);
-        jsapi::console::output_verbose("[quickjs-eval] lazy JSEngine::new done");
     }
     let engine = engine.as_ref().ok_or("JS engine not initialized")?;
     let _owner_guard = JsEngineOwnerGuard::acquire();
-    jsapi::console::output_verbose("[quickjs-eval] JS_Eval begin");
     let value = engine.eval_file(script, filename)?;
-    jsapi::console::output_verbose("[quickjs-eval] JS_Eval done");
-    jsapi::console::output_verbose("[quickjs-eval] flush_java_ready_callbacks begin");
     engine.flush_java_ready_callbacks()?;
-    jsapi::console::output_verbose("[quickjs-eval] flush_java_ready_callbacks done");
-    jsapi::console::output_verbose("[quickjs-eval] run_pending_jobs begin");
     engine.run_pending_jobs();
-    jsapi::console::output_verbose("[quickjs-eval] run_pending_jobs done");
     let result = if value.is_undefined() {
         "undefined".to_string()
     } else {
-        jsapi::console::output_verbose("[quickjs-eval] value.to_string begin");
         value.to_string(engine.context().as_ptr()).unwrap_or_default()
     };
-    jsapi::console::output_verbose("[quickjs-eval] value.to_string done");
     value.free(engine.context().as_ptr());
-    jsapi::console::output_verbose("[quickjs-eval] value.free done");
     Ok(result)
 }
 

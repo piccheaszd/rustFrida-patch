@@ -484,27 +484,6 @@ pub(crate) fn load_script_file_pre_resume(session: &Session, script_path: &str) 
     load_script_file_with_mode(session, script_path, false, true)
 }
 
-pub(crate) fn preinit_quickjs_pre_resume(session: &Session, timeout_secs: u64) -> Result<(), String> {
-    let sender = session.get_sender().ok_or_else(|| "agent 未连接".to_string())?;
-
-    session.eval_state.clear();
-    send_command(sender, "jsinit").map_err(|e| format!("发送 jsinit 失败: {}", e))?;
-    match session
-        .eval_state
-        .recv_timeout(std::time::Duration::from_secs(timeout_secs))
-    {
-        Some(Ok(output)) => {
-            if !output.is_empty() && output != "initialized" {
-                log_info!("QuickJS 预初始化返回: {}", output);
-            }
-            Ok(())
-        }
-        Some(Err(err)) if err.contains("已初始化") => Ok(()),
-        Some(Err(err)) => Err(format!("QuickJS 预初始化失败: {}", err)),
-        None => Err(format!("等待 QuickJS 预初始化超时 ({}s)", timeout_secs)),
-    }
-}
-
 fn load_script_file_with_mode(
     session: &Session,
     script_path: &str,

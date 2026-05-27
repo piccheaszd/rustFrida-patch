@@ -18,64 +18,6 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 
-#define RUSTFRIDA_ZYMBIOTE_CMD_RESUME      0x42
-#define RUSTFRIDA_ZYMBIOTE_CMD_LOAD_NATIVE 0x4e
-#define RUSTFRIDA_NATIVE_MAX_LOADER_SIZE   (128u * 1024u)
-#define RUSTFRIDA_NATIVE_MAX_STRING_SIZE   8192u
-
-typedef struct _RustFridaNativeLoadHeader RustFridaNativeLoadHeader;
-typedef struct _RustFridaNativeStringTable RustFridaNativeStringTable;
-typedef struct _RustFridaNativeLoaderContext RustFridaNativeLoaderContext;
-
-struct _RustFridaNativeLoadHeader
-{
-    uint32_t loader_size;
-    uint32_t entrypoint_size;
-    uint32_t agent_data_size;
-    uint32_t current_thread_eval_size;
-    uint32_t sym_name_size;
-    uint32_t pthread_err_size;
-    uint32_t dlsym_err_size;
-    uint32_t cmdline_size;
-    uint32_t output_path_size;
-};
-
-struct _RustFridaNativeStringTable
-{
-    uint64_t sym_name;
-    uint32_t sym_name_len;
-    uint32_t _pad0;
-    uint64_t pthread_err;
-    uint32_t pthread_err_len;
-    uint32_t _pad1;
-    uint64_t dlsym_err;
-    uint32_t dlsym_err_len;
-    uint32_t _pad2;
-    uint64_t cmdline;
-    uint32_t cmdline_len;
-    uint32_t _pad3;
-    uint64_t output_path;
-    uint32_t output_path_len;
-    uint32_t _pad4;
-};
-
-struct _RustFridaNativeLoaderContext
-{
-    int32_t ctrlfds[2];
-    const char *agent_entrypoint;
-    const char *agent_data;
-    const char *fallback_address;
-    void *libc;
-    uint64_t string_table_addr;
-    const char *agent_current_thread_eval;
-    const uint64_t *resolver_module_bases;
-    uint64_t resolver_module_count;
-    void *worker;
-    void *agent_handle;
-    void *agent_entrypoint_impl;
-    void *agent_current_thread_eval_impl;
-};
-
 /* ========== ZymbioteContext ========== */
 /* 此结构体的布局必须与 Rust 侧（spawn.rs）写入顺序完全一致 */
 typedef struct _ZymbioteContext ZymbioteContext;
@@ -133,11 +75,6 @@ static ssize_t rustfrida_sendmsg(int sockfd, const struct msghdr *msg, int flags
 static bool rustfrida_sendmsg_all(int sockfd, struct iovec *iov, size_t iovlen, int flags);
 static ssize_t rustfrida_recv(int sockfd, void *buf, size_t len, int flags);
 static void rustfrida_patch_build_fields(JNIEnv *env);
-static bool rustfrida_recv_exact(int fd, void *buf, size_t len);
-static int rustfrida_recv_fd(int fd);
-static bool rustfrida_start_native_loader(int gate_fd);
-static void *rustfrida_raw_mmap(void *addr, size_t length, int prot, int flags, int fd, unsigned long offset);
-static unsigned long rustfrida_align_up(unsigned long value, unsigned long alignment);
 
 /* ========== ARM64 raw syscall ========== */
 /* 不依赖 libc，直接 svc #0 */
@@ -148,7 +85,6 @@ static unsigned long rustfrida_align_up(unsigned long value, unsigned long align
 #define __NR_lseek    62
 #define __NR_read     63
 #define __NR_write    64
-#define __NR_recvmsg  212
 #define __NR_mprotect 226
 #define __NR_mmap     222
 
@@ -159,7 +95,6 @@ static unsigned long rustfrida_align_up(unsigned long value, unsigned long align
 #define MY_MAP_SHARED  0x01
 #define MY_MAP_PRIVATE 0x02
 #define MY_MAP_FIXED   0x10
-#define MY_MAP_ANONYMOUS 0x20
 
 static inline long
 raw_syscall6(long nr, long a0, long a1, long a2, long a3, long a4, long a5)
@@ -176,232 +111,6 @@ raw_syscall6(long nr, long a0, long a1, long a2, long a3, long a4, long a5)
                      : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5), "r"(x8)
                      : "memory");
     return x0;
-}
-
-static unsigned long
-rustfrida_align_up(unsigned long value, unsigned long alignment)
-{
-    return (value + alignment - 1) & ~(alignment - 1);
-}
-
-static void *
-rustfrida_raw_mmap(void *addr, size_t length, int prot, int flags, int fd, unsigned long offset)
-{
-    long res = raw_syscall6(__NR_mmap, (long)addr, (long)length, prot, flags, fd, (long)offset);
-    if (res < 0 && res > -4096)
-        return (void *)-1;
-    return (void *)res;
-}
-
-static bool
-rustfrida_recv_exact(int fd, void *buf, size_t len)
-{
-    uint8_t *cursor = (uint8_t *)buf;
-
-    while (len != 0)
-    {
-        ssize_t n = rustfrida_recv(fd, cursor, len, 0);
-        if (n <= 0)
-            return false;
-
-        cursor += n;
-        len -= (size_t)n;
-    }
-
-    return true;
-}
-
-static int
-rustfrida_recv_fd(int fd)
-{
-    uint8_t dummy;
-    struct iovec iov;
-    union
-    {
-        struct cmsghdr header;
-        uint8_t storage[CMSG_SPACE(sizeof(int))];
-    } control;
-    struct msghdr msg;
-    long res;
-    struct cmsghdr *cmsg;
-
-    iov.iov_base = &dummy;
-    iov.iov_len = sizeof(dummy);
-
-    msg.msg_name = NULL;
-    msg.msg_namelen = 0;
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = &control;
-    msg.msg_controllen = sizeof(control);
-    msg.msg_flags = 0;
-
-    res = raw_syscall6(__NR_recvmsg, fd, (long)&msg, 0, 0, 0, 0);
-    if (res <= 0 || msg.msg_controllen == 0)
-        return -1;
-
-    cmsg = CMSG_FIRSTHDR(&msg);
-    if (cmsg == NULL || cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS)
-        return -1;
-
-    return *((int *)CMSG_DATA(cmsg));
-}
-
-static bool
-rustfrida_valid_native_header(const RustFridaNativeLoadHeader *h)
-{
-    uint32_t string_sizes[5];
-
-    if (h->loader_size == 0 || h->loader_size > RUSTFRIDA_NATIVE_MAX_LOADER_SIZE)
-        return false;
-    if (h->entrypoint_size == 0 || h->agent_data_size == 0 || h->current_thread_eval_size == 0)
-        return false;
-    if (h->entrypoint_size > RUSTFRIDA_NATIVE_MAX_STRING_SIZE ||
-        h->agent_data_size > RUSTFRIDA_NATIVE_MAX_STRING_SIZE ||
-        h->current_thread_eval_size > RUSTFRIDA_NATIVE_MAX_STRING_SIZE)
-        return false;
-
-    string_sizes[0] = h->sym_name_size;
-    string_sizes[1] = h->pthread_err_size;
-    string_sizes[2] = h->dlsym_err_size;
-    string_sizes[3] = h->cmdline_size;
-    string_sizes[4] = h->output_path_size;
-
-    for (unsigned int i = 0; i != 5; i++)
-    {
-        if (string_sizes[i] == 0 || string_sizes[i] > RUSTFRIDA_NATIVE_MAX_STRING_SIZE)
-            return false;
-    }
-
-    return true;
-}
-
-static bool
-rustfrida_start_native_loader(int gate_fd)
-{
-    RustFridaNativeLoadHeader header;
-    int loader_ctrlfd;
-    unsigned long loader_size_aligned;
-    unsigned long data_size;
-    unsigned long total_size;
-    uint8_t *base;
-    uint8_t *cursor;
-    RustFridaNativeLoaderContext *ctx;
-    RustFridaNativeStringTable *table;
-    char *entrypoint;
-    char *agent_data;
-    char *current_thread_eval;
-    char *sym_name;
-    char *pthread_err;
-    char *dlsym_err;
-    char *cmdline;
-    char *output_path;
-    typedef void (*RustFridaLoadFunc)(RustFridaNativeLoaderContext *ctx);
-
-    loader_ctrlfd = rustfrida_recv_fd(gate_fd);
-    if (loader_ctrlfd == -1)
-        return false;
-
-    if (!rustfrida_recv_exact(gate_fd, &header, sizeof(header)))
-        return false;
-    if (!rustfrida_valid_native_header(&header))
-        return false;
-
-    loader_size_aligned = rustfrida_align_up(header.loader_size, 16);
-    data_size = sizeof(RustFridaNativeLoaderContext) +
-        sizeof(RustFridaNativeStringTable) +
-        header.entrypoint_size +
-        header.agent_data_size +
-        header.current_thread_eval_size +
-        header.sym_name_size +
-        header.pthread_err_size +
-        header.dlsym_err_size +
-        header.cmdline_size +
-        header.output_path_size;
-    total_size = loader_size_aligned + rustfrida_align_up(data_size, 16);
-
-    base = (uint8_t *)rustfrida_raw_mmap(NULL, total_size,
-        PROT_READ | PROT_WRITE | PROT_EXEC,
-        MY_MAP_PRIVATE | MY_MAP_ANONYMOUS, -1, 0);
-    if (base == (void *)-1)
-        return false;
-
-    if (!rustfrida_recv_exact(gate_fd, base, header.loader_size))
-        return false;
-
-    cursor = base + loader_size_aligned;
-    ctx = (RustFridaNativeLoaderContext *)cursor;
-    cursor += sizeof(RustFridaNativeLoaderContext);
-    table = (RustFridaNativeStringTable *)cursor;
-    cursor += sizeof(RustFridaNativeStringTable);
-
-    entrypoint = (char *)cursor;
-    if (!rustfrida_recv_exact(gate_fd, entrypoint, header.entrypoint_size))
-        return false;
-    cursor += header.entrypoint_size;
-
-    agent_data = (char *)cursor;
-    if (!rustfrida_recv_exact(gate_fd, agent_data, header.agent_data_size))
-        return false;
-    cursor += header.agent_data_size;
-
-    current_thread_eval = (char *)cursor;
-    if (!rustfrida_recv_exact(gate_fd, current_thread_eval, header.current_thread_eval_size))
-        return false;
-    cursor += header.current_thread_eval_size;
-
-    sym_name = (char *)cursor;
-    if (!rustfrida_recv_exact(gate_fd, sym_name, header.sym_name_size))
-        return false;
-    cursor += header.sym_name_size;
-
-    pthread_err = (char *)cursor;
-    if (!rustfrida_recv_exact(gate_fd, pthread_err, header.pthread_err_size))
-        return false;
-    cursor += header.pthread_err_size;
-
-    dlsym_err = (char *)cursor;
-    if (!rustfrida_recv_exact(gate_fd, dlsym_err, header.dlsym_err_size))
-        return false;
-    cursor += header.dlsym_err_size;
-
-    cmdline = (char *)cursor;
-    if (!rustfrida_recv_exact(gate_fd, cmdline, header.cmdline_size))
-        return false;
-    cursor += header.cmdline_size;
-
-    output_path = (char *)cursor;
-    if (!rustfrida_recv_exact(gate_fd, output_path, header.output_path_size))
-        return false;
-
-    table->sym_name = (uint64_t)(uintptr_t)sym_name;
-    table->sym_name_len = header.sym_name_size;
-    table->pthread_err = (uint64_t)(uintptr_t)pthread_err;
-    table->pthread_err_len = header.pthread_err_size;
-    table->dlsym_err = (uint64_t)(uintptr_t)dlsym_err;
-    table->dlsym_err_len = header.dlsym_err_size;
-    table->cmdline = (uint64_t)(uintptr_t)cmdline;
-    table->cmdline_len = header.cmdline_size;
-    table->output_path = (uint64_t)(uintptr_t)output_path;
-    table->output_path_len = header.output_path_size;
-
-    ctx->ctrlfds[0] = -1;
-    ctx->ctrlfds[1] = loader_ctrlfd;
-    ctx->agent_entrypoint = entrypoint;
-    ctx->agent_data = agent_data;
-    ctx->fallback_address = NULL;
-    ctx->libc = NULL;
-    ctx->string_table_addr = (uint64_t)(uintptr_t)table;
-    ctx->agent_current_thread_eval = current_thread_eval;
-    ctx->resolver_module_bases = NULL;
-    ctx->resolver_module_count = 0;
-    ctx->worker = NULL;
-    ctx->agent_handle = NULL;
-    ctx->agent_entrypoint_impl = NULL;
-    ctx->agent_current_thread_eval_impl = NULL;
-
-    ((RustFridaLoadFunc)base)(ctx);
-    return true;
 }
 
 /* ========== prop spoofing 辅助函数 ========== */
@@ -1060,23 +769,11 @@ rustfrida_wait_for_permission_to_resume(const char *package_name, bool *revert_n
             goto beach;
     }
 
-    /* 阻塞等待命令：0x42 = resume，0x4e = 子进程内 native loader */
+    /* 阻塞等待 ACK (1 字节 0x42) */
     {
         uint8_t rx;
 
         if (rustfrida_recv(fd, &rx, 1, 0) != 1)
-            goto beach;
-
-        if (rx == RUSTFRIDA_ZYMBIOTE_CMD_LOAD_NATIVE)
-        {
-            if (!rustfrida_start_native_loader(fd))
-                goto beach;
-
-            if (rustfrida_recv(fd, &rx, 1, 0) != 1)
-                goto beach;
-        }
-
-        if (rx != RUSTFRIDA_ZYMBIOTE_CMD_RESUME)
             goto beach;
     }
 
