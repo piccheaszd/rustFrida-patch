@@ -36,12 +36,19 @@ impl JSContext {
 
     /// Evaluate a script
     pub fn eval(&self, script: &str, filename: &str) -> Result<JSValue, String> {
+        crate::jsapi::console::output_verbose("[quickjs-eval] CString script begin");
         let cscript = CString::new(script).map_err(|e| format!("Invalid script: {}", e))?;
+        crate::jsapi::console::output_verbose("[quickjs-eval] CString script done");
+        crate::jsapi::console::output_verbose("[quickjs-eval] CString filename begin");
         let cfilename = CString::new(filename).map_err(|e| format!("Invalid filename: {}", e))?;
+        crate::jsapi::console::output_verbose("[quickjs-eval] CString filename done");
 
         // Update stack top for cross-thread usage (prevents false stack overflow detection)
+        crate::jsapi::console::output_verbose("[quickjs-eval] qjs_update_stack_top begin");
         unsafe { ffi::qjs_update_stack_top(self.ptr.as_ptr()) };
+        crate::jsapi::console::output_verbose("[quickjs-eval] qjs_update_stack_top done");
 
+        crate::jsapi::console::output_verbose("[quickjs-eval] ffi::JS_Eval begin");
         let val = unsafe {
             ffi::JS_Eval(
                 self.ptr.as_ptr(),
@@ -51,6 +58,7 @@ impl JSContext {
                 ffi::JS_EVAL_TYPE_GLOBAL as i32,
             )
         };
+        crate::jsapi::console::output_verbose("[quickjs-eval] ffi::JS_Eval done");
 
         let result = JSValue(val);
         if result.is_exception() {

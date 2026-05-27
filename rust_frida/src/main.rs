@@ -37,7 +37,7 @@ fn auto_load_delay() -> Duration {
 }
 
 use crate::logger::{DIM, RESET};
-use args::{Args, QuickJsProfile};
+use args::{Args, InjectionBackend, QuickJsProfile};
 use clap::Parser;
 #[cfg(feature = "qbdi")]
 use communication::send_qbdi_helper;
@@ -45,8 +45,8 @@ use communication::{send_command, start_socketpair_handler};
 use injection::{inject_via_bootstrapper, watch_and_inject, InjectionResult};
 use process::find_pid_by_name;
 use repl::{
-    load_script_file, load_script_file_pre_resume, print_eval_result, print_help, rewrite_jseval_for_agent,
-    run_js_repl, try_jseval_on_main_thread_if_java, try_loadjs_on_main_thread_if_java,
+    load_script_file, load_script_file_pre_resume, preinit_quickjs_pre_resume, print_eval_result, print_help,
+    rewrite_jseval_for_agent, run_js_repl, try_jseval_on_main_thread_if_java, try_loadjs_on_main_thread_if_java,
     try_managedcounter_on_main_thread, CommandCompleter, PreResumeLoad,
 };
 use rustyline::error::ReadlineError;
@@ -129,6 +129,14 @@ fn main() {
         log_error!("--profile 仅在 --spawn 或 --server 模式下可用");
         std::process::exit(1);
     }
+    if args.backend == InjectionBackend::SpawnNative && args.spawn.is_none() {
+        log_error!("--backend spawn-native 仅支持 --spawn");
+        std::process::exit(1);
+    }
+    if args.backend == InjectionBackend::SpawnNative && args.spawn_late {
+        log_error!("--backend spawn-native 不支持 --spawn-late");
+        std::process::exit(1);
+    }
 
     // 属性 profile 预处理
     if let Some(ref profile_name) = args.profile {
@@ -196,7 +204,9 @@ fn main() {
     //   be installed before Application.onCreate()/RegisterNatives.
     // - plain `--spawn package` defaults to late attach for a stable REPL.
     // - `--spawn-early` and `--spawn-late` force either side explicitly.
-    let spawn_pre_resume = args.spawn.is_some() && !args.spawn_late && (args.load_script.is_some() || args.spawn_early);
+    let spawn_pre_resume = args.spawn.is_some()
+        && !args.spawn_late
+        && (args.backend == InjectionBackend::SpawnNative || args.load_script.is_some() || args.spawn_early);
 
     // 根据参数选择注入方式，返回 (target_pid, host_fd)
     let (target_pid, injection): (Option<i32>, InjectionResult) = if let Some(ref package) = args.spawn {
@@ -204,7 +214,9 @@ fn main() {
         spawn::register_cleanup_handler();
         // Spawn 模式：注入 Zygote 后启动 App
         let spawn_timeout = args.timeout.unwrap_or(20).max(1);
-        let spawn_result = if spawn_pre_resume {
+        let spawn_result = if args.backend == InjectionBackend::SpawnNative {
+            spawn::spawn_native_and_inject(package, spawn_timeout, &string_overrides)
+        } else if spawn_pre_resume {
             spawn::spawn_and_inject(package, spawn_timeout, &string_overrides)
         } else {
             spawn::spawn_resume_then_inject(package, spawn_timeout, &string_overrides)
@@ -318,6 +330,9 @@ fn main() {
             format!("__quickjs_profile__ {}", args.quickjs_profile.as_agent_value()),
         );
     }
+    if args.backend == InjectionBackend::SpawnNative {
+        let _ = send_command(sender, "__quickjs_keep_engine_on_unload__");
+    }
 
     // ── RPC HTTP 服务器（如启用）──
     // legacy 模式只有一个 session (id=0)，用 SessionManager 包一层供 http_rpc 复用
@@ -352,6 +367,11 @@ fn main() {
                 match load_script_file_pre_resume(&session, script_path) {
                     Ok(PreResumeLoad::Loaded) => {}
                     Err(e) => log_error!("{}", e),
+                }
+            } else if args.backend == InjectionBackend::SpawnNative {
+                log_info!("spawn-native: 子进程暂停中预初始化 QuickJS");
+                if let Err(e) = preinit_quickjs_pre_resume(&session, args.connect_timeout.max(10)) {
+                    log_error!("{}", e);
                 }
             }
             // resume: hook 已就位，恢复子进程
@@ -538,13 +558,25 @@ fn main() {
 
     // 等待 agent 完成清理并主动关闭 socket (disconnected=true)。
     // cleanup 里 drain thunk_in_flight 可能耗时 (HashMap.put 高频场景 1~2 分钟)。
-    // 不设硬超时：agent 清理完才算真正退出，否则 munmap pool 未完成，app 仍可能崩。
-    // 每 10s 打印一次进度，用户 Ctrl-C 可随时中断。
+    // ptrace 路径保持等待完整清理；spawn-native 不依赖 ptrace cleanup，且部分加固
+    // App 会把恢复后的 JS_Eval 卡死，必须给 host 一个可退出的上限。
     let start = std::time::Instant::now();
     let mut next_report = std::time::Duration::from_secs(10);
+    let cleanup_deadline = if args.backend == InjectionBackend::SpawnNative {
+        Some(std::time::Duration::from_secs(15))
+    } else {
+        None
+    };
     while !session.disconnected.load(Ordering::Acquire) {
         std::thread::sleep(std::time::Duration::from_millis(100));
         let elapsed = start.elapsed();
+        if cleanup_deadline.is_some_and(|deadline| elapsed >= deadline) {
+            log_warn!(
+                "spawn-native agent 清理等待超过 {}s，继续还原 zygote 并退出 host",
+                elapsed.as_secs()
+            );
+            break;
+        }
         if elapsed >= next_report {
             log_info!("等待 agent 清理中... ({}s)", elapsed.as_secs());
             next_report += std::time::Duration::from_secs(10);

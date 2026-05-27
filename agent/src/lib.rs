@@ -677,6 +677,10 @@ fn process_cmd(command: &str) {
             }
         }
         #[cfg(feature = "quickjs")]
+        Some("__quickjs_keep_engine_on_unload__") => {
+            quickjs_loader::set_keep_js_engine_on_unload(true);
+        }
+        #[cfg(feature = "quickjs")]
         Some("javastealth") => {
             let mode = command
                 .split_whitespace()

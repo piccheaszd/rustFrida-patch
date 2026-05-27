@@ -25,6 +25,7 @@ use crate::communication::{log_msg, write_stream};
 
 static ENGINE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static HOOK_RUNTIME_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static KEEP_JS_ENGINE_ON_UNLOAD: AtomicBool = AtomicBool::new(false);
 static HOOK_EXEC_VMA_NAME: &[u8] = b"wwb_hook_exec\0";
 
 #[repr(C)]
@@ -49,6 +50,16 @@ fn hook_engine_exec_ranges() -> Vec<(u64, u64)> {
         .take(n as usize)
         .filter_map(|r| (r.base != 0 && r.size != 0).then_some((r.base, r.size)))
         .collect()
+}
+
+fn log_verbose(msg: String) {
+    if quickjs_hook::jsapi::console::is_verbose() {
+        log_msg(msg);
+    }
+}
+
+pub fn set_keep_js_engine_on_unload(on: bool) {
+    KEEP_JS_ENGINE_ON_UNLOAD.store(on, Ordering::Release);
 }
 
 /// 从 /proc/self/maps 找 libart.so 的 r-xp 基址（用作 mmap hint）
@@ -192,8 +203,11 @@ unsafe impl Sync for ExecMemory {}
 /// selected before any ART controller patch is installed.
 pub fn init_hook_runtime() -> Result<(), String> {
     if HOOK_RUNTIME_INITIALIZED.load(Ordering::SeqCst) {
+        log_verbose("[quickjs-init] hook runtime already initialized\n".to_string());
         return Ok(());
     }
+
+    log_verbose("[quickjs-init] hook runtime begin\n".to_string());
 
     // Minimal profile avoids /proc/self/maps during engine initialization; some
     // hardened apps crash on that read path immediately after injection.
@@ -202,13 +216,28 @@ pub fn init_hook_runtime() -> Result<(), String> {
     } else {
         find_libart_base().unwrap_or(0)
     };
+    log_verbose(format!(
+        "[quickjs-init] profile={} libart_hint=0x{:x}\n",
+        quickjs_hook::api_profile_name(),
+        libart_hint
+    ));
+
+    log_verbose("[quickjs-init] allocating exec memory\n".to_string());
     let exec_mem = EXEC_MEM
         .get_or_init(|| ExecMemory::new_near(64 * 1024, libart_hint).expect("Failed to allocate executable memory"));
+    log_verbose(format!(
+        "[quickjs-init] exec memory base={:p} size={}\n",
+        exec_mem.as_ptr(),
+        exec_mem.size()
+    ));
 
     // Initialize hook engine
+    log_verbose("[quickjs-init] init_hook_engine begin\n".to_string());
     init_hook_engine(exec_mem.as_ptr(), exec_mem.size())?;
+    log_verbose("[quickjs-init] init_hook_engine done\n".to_string());
 
     // 注册 recomp handlers
+    log_verbose("[quickjs-init] install recomp handlers begin\n".to_string());
     quickjs_hook::recomp::set_handler(crate::recompiler::ensure_and_translate);
     quickjs_hook::recomp::set_translate_existing_handler(|addr| crate::recompiler::translate_addr(addr).ok());
     quickjs_hook::recomp::set_alloc_slot_handler(crate::recompiler::alloc_trampoline_slot);
@@ -226,6 +255,7 @@ pub fn init_hook_runtime() -> Result<(), String> {
     });
 
     HOOK_RUNTIME_INITIALIZED.store(true, Ordering::SeqCst);
+    log_verbose("[quickjs-init] hook runtime done\n".to_string());
     Ok(())
 }
 
@@ -235,20 +265,27 @@ pub fn init() -> Result<(), String> {
         return Err("JS 引擎已初始化".to_string());
     }
 
+    log_verbose("[quickjs-init] init begin\n".to_string());
     quickjs_hook::recomp::set_cleanup_release_only(false);
+    log_verbose("[quickjs-init] before hook runtime\n".to_string());
     init_hook_runtime()?;
+    log_verbose("[quickjs-init] after hook runtime\n".to_string());
 
     if let Some(output_path) = crate::OUTPUT_PATH.get() {
+        log_verbose(format!("[quickjs-init] set qbdi output dir {}\n", output_path));
         set_qbdi_output_dir(output_path.clone());
     }
 
     // 先设置 console callback，确保引擎初始化期间的日志（如 [jniIds]）能通过 socket 输出
+    log_verbose("[quickjs-init] set console callback\n".to_string());
     set_console_callback(|msg| {
         write_stream(format!("[JS] {}", msg).as_bytes());
     });
 
     // 初始化 JS 引擎（complete_script 依赖它）
+    log_verbose("[quickjs-init] get_or_init_engine begin\n".to_string());
     get_or_init_engine()?;
+    log_verbose("[quickjs-init] get_or_init_engine done\n".to_string());
 
     #[cfg(feature = "qbdi")]
     if let Err(err) = preload_qbdi_helper() {
@@ -258,6 +295,7 @@ pub fn init() -> Result<(), String> {
     }
 
     ENGINE_INITIALIZED.store(true, Ordering::SeqCst);
+    log_verbose("[quickjs-init] init done\n".to_string());
 
     Ok(())
 }
@@ -510,8 +548,13 @@ pub fn cleanup_for_unload_leak_safe() {
     }
     detach_current_jni_thread();
     stage("phase3 detach_jni_thread", &mut t);
-    cleanup_engine();
-    stage("phase3 cleanup_engine", &mut t);
+    if KEEP_JS_ENGINE_ON_UNLOAD.load(Ordering::Acquire) {
+        quickjs_hook::jsapi::console::clear_console_callback();
+        stage("phase3 keep_js_engine_on_unload", &mut t);
+    } else {
+        cleanup_engine();
+        stage("phase3 cleanup_engine", &mut t);
+    }
 
     log_msg(format!(
         "[quickjs] cleanup done (managed-safe unload, executable pools and walkstack guards retained, total {}ms)\n",

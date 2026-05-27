@@ -17,6 +17,14 @@ pub(crate) enum QuickJsProfile {
     Minimal,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum InjectionBackend {
+    /// Existing ptrace/bootstrapper backend.
+    Ptrace,
+    /// Spawn-only backend where the app child maps the loader from zymbiote.
+    SpawnNative,
+}
+
 impl QuickJsProfile {
     pub(crate) fn as_agent_value(self) -> &'static str {
         match self {
@@ -90,6 +98,10 @@ pub(crate) struct Args {
     /// Spawn late 模式：即使带 -l，也先恢复 App，等待主线程进入 Looper 后再按 PID attach（稳定优先，不保证早期 hook）
     #[arg(long = "spawn-late", requires = "spawn", conflicts_with = "spawn_early")]
     pub(crate) spawn_late: bool,
+
+    /// 注入后端：ptrace 为默认路径；spawn-native 仅支持 --spawn，避免对子进程 ptrace attach
+    #[arg(long = "backend", value_enum, default_value_t = InjectionBackend::Ptrace)]
+    pub(crate) backend: InjectionBackend,
 
     /// 监听超时时间（秒），默认无限等待
     #[arg(short = 't', long = "timeout")]
