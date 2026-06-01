@@ -1,6 +1,9 @@
 [features]
+default = ["ptrace-backend"]
 frida-gum = []
 qbdi = []
+ptrace-backend = ["nix/ptrace"]
+noptrace = []
 
 [package]
 name = "rust_frida"
@@ -13,7 +16,7 @@ description = "ARM64架构下的动态库注入和远程函数调用工具"
 ldmonitor = { path = "../ldmonitor" }
 libc = "1.0.0-alpha.1"
 clap = { version = "4.5.37", features = ["derive"] }
-nix = { version = "0.30.1", features = ["ptrace", "socket", "uio"] }
+nix = { version = "0.30.1", features = ["socket", "uio"] }
 goblin = "0.9"
 once_cell = "1.21.3"
 rand = "0.8"

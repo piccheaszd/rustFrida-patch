@@ -1,22 +1,35 @@
 #![cfg(all(target_os = "android", target_arch = "aarch64"))]
 
 use libc::{c_void, close};
+#[cfg(not(feature = "noptrace"))]
 use nix::errno::Errno;
+#[cfg(not(feature = "noptrace"))]
 use nix::sys::ptrace;
+#[cfg(not(feature = "noptrace"))]
 use nix::sys::wait::{waitpid, WaitStatus};
+#[cfg(not(feature = "noptrace"))]
 use nix::unistd::Pid;
+#[cfg(not(feature = "noptrace"))]
 use std::mem::size_of;
 use std::os::unix::io::RawFd;
+#[cfg(not(feature = "noptrace"))]
 use std::time::Duration;
 
+#[cfg(not(feature = "noptrace"))]
 use crate::proc_mem::ProcMem;
+#[cfg(not(feature = "noptrace"))]
 use crate::process::{
     attach_to_process, call_target_function_with_return_trap, parse_proc_maps, sample_thread_stop_point,
     ThreadStopSample,
 };
-use crate::types::{bootstrap_status, message_type, FridaBootstrapContext, FridaLibcApi, RustFridaLoaderContext};
-use crate::{log_error, log_info, log_success, log_verbose, log_warn};
+use crate::types::message_type;
+#[cfg(not(feature = "noptrace"))]
+use crate::types::{bootstrap_status, FridaBootstrapContext, FridaLibcApi, RustFridaLoaderContext};
+#[cfg(not(feature = "noptrace"))]
+use crate::{log_error, log_info};
+use crate::{log_success, log_verbose, log_warn};
 
+#[cfg(not(feature = "noptrace"))]
 pub(crate) const BOOTSTRAPPER: &[u8] = include_bytes!("../../loader/build/bootstrapper.bin");
 pub(crate) const FRIDA_LOADER: &[u8] = include_bytes!("../../loader/build/rustfrida-loader.bin");
 
@@ -30,18 +43,24 @@ pub(crate) const AGENT_SO: &[u8] = include_bytes!("../../target/aarch64-linux-an
 pub(crate) const QBDI_HELPER_SO: &[u8] = include_bytes!(env!("QBDI_HELPER_SO_PATH"));
 
 // aarch64 syscall numbers
+#[cfg(not(feature = "noptrace"))]
 const SYS_PIDFD_OPEN: i64 = 434;
+#[cfg(not(feature = "noptrace"))]
 const SYS_PIDFD_GETFD: i64 = 438;
+#[cfg(not(feature = "noptrace"))]
 const PAGE_SIZE: u64 = 4096;
 
+#[cfg(not(feature = "noptrace"))]
 fn align_down(value: u64, alignment: u64) -> u64 {
     value & !(alignment - 1)
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn align_up(value: u64, alignment: u64) -> u64 {
     (value + alignment - 1) & !(alignment - 1)
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn padded_agent_memfd_len() -> Result<usize, String> {
     let elf = goblin::elf::Elf::parse(AGENT_SO).map_err(|e| format!("解析 agent ELF 失败: {}", e))?;
     let mut len = AGENT_SO.len() as u64;
@@ -61,11 +80,13 @@ fn padded_agent_memfd_len() -> Result<usize, String> {
     usize::try_from(len).map_err(|_| "agent padded memfd 长度溢出".to_string())
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn mem_write_value<T>(mem: &ProcMem, addr: usize, value: &T) -> Result<(), String> {
     let bytes = unsafe { std::slice::from_raw_parts(value as *const T as *const u8, size_of::<T>()) };
     mem.pwrite_all(bytes, addr as u64)
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn mem_read_value<T: Default>(mem: &ProcMem, addr: usize) -> Result<T, String> {
     let mut value = T::default();
     let bytes = unsafe { std::slice::from_raw_parts_mut(&mut value as *mut T as *mut u8, size_of::<T>()) };
@@ -73,15 +94,18 @@ fn mem_read_value<T: Default>(mem: &ProcMem, addr: usize) -> Result<T, String> {
     Ok(value)
 }
 
+#[cfg(not(feature = "noptrace"))]
 const MPROTECT_SYSCALL_STUB: &[u8] = &[
     0x48, 0x1c, 0x80, 0xd2, // mov x8, #226 (__NR_mprotect)
     0x01, 0x00, 0x00, 0xd4, // svc #0
     0xc0, 0x03, 0x5f, 0xd6, // ret
 ];
+#[cfg(not(feature = "noptrace"))]
 const BRK_RETURN_TRAP: &[u8] = &[
     0x00, 0x00, 0x20, 0xd4, // brk #0
 ];
 
+#[cfg(not(feature = "noptrace"))]
 fn call_target_function_brk(
     mem: &ProcMem,
     tid: i32,
@@ -93,6 +117,7 @@ fn call_target_function_brk(
     call_target_function_with_return_trap(tid, func_addr, args, return_trap_addr)
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn remote_mprotect_syscall(
     mem: &ProcMem,
     tid: i32,
@@ -127,6 +152,7 @@ pub(crate) struct InjectionResult {
 }
 
 /// 通过 pidfd_getfd 从目标进程提取文件描述符到 host
+#[cfg(not(feature = "noptrace"))]
 fn extract_fd_from_target(pid: i32, target_fd: i32) -> Result<RawFd, String> {
     // pidfd_open(pid, flags=0)
     let pidfd = unsafe { libc::syscall(SYS_PIDFD_OPEN, pid, 0) };
@@ -160,6 +186,7 @@ fn extract_fd_from_target(pid: i32, target_fd: i32) -> Result<RawFd, String> {
 /// 注意：不使用 frida_memfd 类型——即使该类型存在（Frida 残留），其 MLS range
 /// 定义可能不完整，导致 fsetxattr 返回 0 但 kernel 无法验证 context、退回 unlabeled:s0。
 /// tmpfs 是原生类型，天然支持所有 MLS ranges，且 selinux.rs 已有 TE allow 规则。
+#[cfg(not(feature = "noptrace"))]
 fn relabel_fd_for_injection(fd: RawFd, target_pid: i32) {
     // 读取目标进程的 MLS range
     let mls = read_target_mls_range(target_pid).unwrap_or_else(|| "s0".to_string());
@@ -208,6 +235,7 @@ fn relabel_fd_for_injection(fd: RawFd, target_pid: i32) {
 }
 
 /// 读取目标进程的 SELinux MLS range（例如 "s0:c15,c257,c512,c768"）
+#[cfg(not(feature = "noptrace"))]
 fn read_target_mls_range(pid: i32) -> Option<String> {
     let ctx = std::fs::read_to_string(format!("/proc/{}/attr/current", pid)).ok()?;
     let ctx = ctx.trim_end_matches('\0').trim();
@@ -234,6 +262,7 @@ fn env_value_enabled(value: &str) -> bool {
     value != "0" && !value.eq_ignore_ascii_case("false")
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn use_stream_agent_transfer() -> bool {
     if let Ok(mode) = std::env::var("RF_AGENT_TRANSFER") {
         let mode = mode.trim();
@@ -264,6 +293,7 @@ fn use_stream_agent_transfer() -> bool {
     !env_flag_enabled("RF_AGENT_MEMFD")
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn build_loader_agent_data(use_pthread_loader: bool) -> Result<Vec<u8>, String> {
     let mut tokens = Vec::new();
 
@@ -326,7 +356,45 @@ fn build_loader_agent_data(use_pthread_loader: bool) -> Result<Vec<u8>, String> 
     Ok(data)
 }
 
-fn build_agent_entrypoint() -> Result<Vec<u8>, String> {
+pub(crate) fn build_pure_loader_agent_data() -> Result<Vec<u8>, String> {
+    let mut tokens = vec!["stream-agent".to_string(), "agent-ctrl=loader".to_string()];
+
+    if env_flag_enabled("RF_LOADER_DEBUG") {
+        log_verbose!("loader debug trace: enabled");
+        tokens.push("loader-debug".to_string());
+    } else {
+        log_verbose!("loader debug trace: disabled (set RF_LOADER_DEBUG=1 for full loader IPC trace)");
+    }
+
+    if env_flag_enabled("RF_HOLD_BEFORE_ENTRY") {
+        log_verbose!("loader trace: 进入 agent 前保持 3s");
+        tokens.push("hold-entry".to_string());
+    }
+
+    if env_flag_enabled("RF_CATCH_ENTRY_SIGNALS") {
+        log_verbose!("loader trace: 捕获 entry 窗口 native signal");
+        tokens.push("catch-signals".to_string());
+    }
+
+    if let Ok(name) = std::env::var("RF_AGENT_VMA_NAME") {
+        if !name.is_empty() {
+            if name.len() > 63 {
+                return Err("RF_AGENT_VMA_NAME 最多 63 字节".to_string());
+            }
+            if !name.bytes().all(|b| (0x21..=0x7e).contains(&b) && b != b';') {
+                return Err("RF_AGENT_VMA_NAME 仅允许非空白 ASCII，且不能包含分号".to_string());
+            }
+            log_verbose!("agent VMA name: {}", name);
+            tokens.push(format!("vma={}", name));
+        }
+    }
+
+    let mut data = tokens.join(";").into_bytes();
+    data.push(0);
+    Ok(data)
+}
+
+pub(crate) fn build_agent_entrypoint() -> Result<Vec<u8>, String> {
     let name = std::env::var("RF_AGENT_ENTRYPOINT").unwrap_or_else(|_| "hello_entry".to_string());
 
     if name.is_empty() {
@@ -348,6 +416,7 @@ fn build_agent_entrypoint() -> Result<Vec<u8>, String> {
 }
 
 /// 根据 UID 查找 /data/data/ 目录下对应的应用数据目录
+#[cfg(not(feature = "noptrace"))]
 fn find_data_dir_by_uid(uid: u32) -> Option<String> {
     use std::fs;
     use std::os::unix::fs::MetadataExt;
@@ -375,6 +444,7 @@ fn find_data_dir_by_uid(uid: u32) -> Option<String> {
 }
 
 /// 使用 eBPF 监听 SO 加载并自动附加
+#[cfg(not(feature = "noptrace"))]
 pub(crate) fn watch_and_inject(
     so_pattern: &str,
     timeout_secs: Option<u64>,
@@ -449,6 +519,7 @@ pub(crate) fn watch_and_inject(
 
 /// 在目标进程中找到一个足够大的 r-xp 区域用于 code-swap
 /// 优先选择 linker64（所有 Android 进程都有），避免覆盖 libc 的热代码
+#[cfg(not(feature = "noptrace"))]
 fn find_executable_region(pid: i32, min_size: usize) -> Result<usize, String> {
     let maps_path = format!("/proc/{}/maps", pid);
     let raw = std::fs::read(&maps_path).map_err(|e| format!("读取 {} 失败: {}", maps_path, e))?;
@@ -497,6 +568,7 @@ fn find_executable_region(pid: i32, min_size: usize) -> Result<usize, String> {
     Err("未找到可用的 r-xp 区域".into())
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn read_task_text(pid: i32, tid: i32, name: &str) -> String {
     std::fs::read_to_string(format!("/proc/{}/task/{}/{}", pid, tid, name))
         .unwrap_or_default()
@@ -504,6 +576,7 @@ fn read_task_text(pid: i32, tid: i32, name: &str) -> String {
         .to_string()
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn thread_state(status: &str) -> char {
     status
         .lines()
@@ -512,6 +585,7 @@ fn thread_state(status: &str) -> char {
         .unwrap_or('?')
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn kernel_wait_reason(value: &str) -> Option<&'static str> {
     const WAIT_PATTERNS: &[(&str, &str)] = &[
         ("get_signal", "signal-path"),
@@ -534,6 +608,7 @@ fn kernel_wait_reason(value: &str) -> Option<&'static str> {
         .find_map(|(needle, reason)| value.contains(needle).then_some(*reason))
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn score_probe_presample(pid: i32, tid: i32, comm: &str, state: char, wchan: &str) -> i32 {
     let mut score = 0;
     if tid == pid {
@@ -555,6 +630,7 @@ fn score_probe_presample(pid: i32, tid: i32, comm: &str, state: char, wchan: &st
     score
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn score_thread_sample(pid: i32, sample: &ThreadStopSample) -> i32 {
     let mut score = 0;
     let pc_map = sample.pc_map.as_deref().unwrap_or("");
@@ -595,6 +671,7 @@ fn score_thread_sample(pid: i32, sample: &ThreadStopSample) -> i32 {
     score
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn choose_probe_injection_thread(pid: i32) -> Option<i32> {
     let limit = std::env::var("RF_THREAD_PROBE_LIMIT")
         .ok()
@@ -722,6 +799,7 @@ fn choose_probe_injection_thread(pid: i32) -> Option<i32> {
     None
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn choose_injection_thread(pid: i32) -> Result<i32, String> {
     if let Ok(value) = std::env::var("RF_INJECT_THREAD") {
         let value = value.trim();
@@ -812,6 +890,7 @@ fn choose_injection_thread(pid: i32) -> Result<i32, String> {
     Ok(best_tid)
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn is_risky_injection_thread(comm: &str) -> bool {
     const RISKY_NAMES: &[&str] = &[
         "Runtime worker",
@@ -839,11 +918,13 @@ fn is_risky_injection_thread(comm: &str) -> bool {
     RISKY_NAMES.iter().any(|name| comm.contains(name))
 }
 
+#[cfg(not(feature = "noptrace"))]
 struct StopWorldSession {
     tids: Vec<i32>,
     active: bool,
 }
 
+#[cfg(not(feature = "noptrace"))]
 impl StopWorldSession {
     fn new(selected_tid: i32) -> Self {
         Self {
@@ -918,6 +999,7 @@ impl StopWorldSession {
     }
 }
 
+#[cfg(not(feature = "noptrace"))]
 impl Drop for StopWorldSession {
     fn drop(&mut self) {
         self.detach_all();
@@ -925,6 +1007,7 @@ impl Drop for StopWorldSession {
 }
 
 /// 写入 StringTable 到预分配的内存区域（不使用 malloc）
+#[cfg(not(feature = "noptrace"))]
 fn write_string_table_at(
     mem: &ProcMem,
     base_addr: usize,
@@ -1001,6 +1084,7 @@ fn write_string_table_at(
     Ok(table_addr)
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn collect_resolver_module_bases(pid: i32) -> Result<Vec<u64>, String> {
     const RESOLVER_MODULE_COUNT: usize = 4;
 
@@ -1025,6 +1109,7 @@ fn collect_resolver_module_bases(pid: i32) -> Result<Vec<u64>, String> {
     Ok(bases.into_iter().flatten().collect())
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn resolver_module_priority(path: &str) -> Option<usize> {
     match path.rsplit('/').next().unwrap_or(path) {
         "linker64" => Some(0),
@@ -1035,6 +1120,7 @@ fn resolver_module_priority(path: &str) -> Option<usize> {
     }
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn is_system_resolver_module(path: &str) -> bool {
     path.starts_with("/apex/")
         || path.starts_with("/system/")
@@ -1043,6 +1129,7 @@ fn is_system_resolver_module(path: &str) -> bool {
 }
 
 /// Unix socket fd-passing: 通过 SCM_RIGHTS 发送 fd
+#[cfg(not(feature = "noptrace"))]
 fn send_fd(sockfd: RawFd, fd_to_send: RawFd) -> Result<(), String> {
     use std::io::IoSlice;
 
@@ -1286,6 +1373,7 @@ fn drain_loader_messages_for(ctrl_fd: RawFd, duration: std::time::Duration) {
 
 /// Host 端执行 loader IPC 握手协议
 /// 返回 REPL 用的 host_fd
+#[cfg(not(feature = "noptrace"))]
 fn run_loader_handshake(ctrl_fd: RawFd, target_pid: i32, loader_ctx_addr: usize) -> Result<InjectionResult, String> {
     // 1. 接收 HELLO 消息: [type:u8][thread_id:i32]
     let mut msg_type = [0u8; 1];
@@ -1428,6 +1516,85 @@ fn run_loader_handshake(ctrl_fd: RawFd, target_pid: i32, loader_ctx_addr: usize)
     })
 }
 
+/// Pure spawn loader IPC handshake.
+///
+/// The zymbiote child passes its existing hello socket to the in-process loader.
+/// Host does not extract or pass target fds here: agent.so is streamed on this
+/// socket and the loader reuses the same socket as the agent command channel.
+pub(crate) fn run_loader_handshake_pure(ctrl_fd: RawFd, target_pid: i32) -> Result<InjectionResult, String> {
+    let mut msg_type = [0u8; 1];
+    recv_exact(ctrl_fd, &mut msg_type)?;
+    if msg_type[0] != message_type::HELLO {
+        return Err(format!(
+            "pure loader: 期望 HELLO({}), 收到 {}",
+            message_type::HELLO,
+            msg_type[0]
+        ));
+    }
+    let mut tid_buf = [0u8; 4];
+    recv_exact(ctrl_fd, &mut tid_buf)?;
+    let thread_id = i32::from_le_bytes(tid_buf);
+    log_verbose!("Pure loader worker tid: {}", thread_id);
+
+    let size = (AGENT_SO.len() as u64).to_le_bytes();
+    if let Err(e) = send_exact(ctrl_fd, &size) {
+        log_warn!("pure agent stream size 发送失败，读取 loader 诊断: {}", e);
+        drain_loader_messages_for(ctrl_fd, std::time::Duration::from_millis(750));
+        return Err(e);
+    }
+    if let Err(e) = send_exact(ctrl_fd, AGENT_SO) {
+        log_warn!("pure agent stream 发送失败，读取 loader 诊断: {}", e);
+        drain_loader_messages_for(ctrl_fd, std::time::Duration::from_millis(750));
+        return Err(e);
+    }
+    log_verbose!(
+        "pure agent SO 已通过 zymbiote socket 流式发送 ({} bytes)",
+        AGENT_SO.len()
+    );
+
+    loop {
+        recv_exact(ctrl_fd, &mut msg_type)?;
+        match msg_type[0] {
+            t if t == message_type::READY => {
+                log_success!("Pure loader: agent 加载成功");
+                break;
+            }
+            t if t == message_type::DEBUG || t == message_type::LOG => {
+                let msg = recv_loader_string(ctrl_fd)?;
+                log_verbose!("Pure loader debug: {}", msg);
+            }
+            t if t == message_type::ERROR_DLOPEN || t == message_type::ERROR_DLSYM => {
+                let msg = recv_loader_string(ctrl_fd)?;
+                let kind = if t == message_type::ERROR_DLOPEN {
+                    "link"
+                } else {
+                    "entrypoint"
+                };
+                unsafe { close(ctrl_fd) };
+                return Err(format!("Pure loader {} 失败: {}", kind, msg));
+            }
+            t if t == message_type::BYE => {
+                unsafe { close(ctrl_fd) };
+                return Err("Pure loader 在 READY 前退出 (BYE)".to_string());
+            }
+            t => {
+                unsafe { close(ctrl_fd) };
+                return Err(format!("Pure loader 协议错误: 期望 READY/DEBUG/ERROR, 收到 {}", t));
+            }
+        }
+    }
+
+    send_exact(ctrl_fd, &[message_type::ACK])?;
+
+    Ok(InjectionResult {
+        host_fd: ctrl_fd,
+        target_pid,
+        loader_ctx_addr: 0,
+        agent_current_thread_eval_impl: 0,
+    })
+}
+
+#[cfg(not(feature = "noptrace"))]
 fn read_loader_runtime_context(pid: i32, loader_ctx_addr: usize) -> Result<RustFridaLoaderContext, String> {
     let mem = ProcMem::open(pid as u32)?;
     let mut ctx = RustFridaLoaderContext::default();
@@ -1444,6 +1611,7 @@ fn read_loader_runtime_context(pid: i32, loader_ctx_addr: usize) -> Result<RustF
 /// Frida-style 注入：bootstrapper 在目标进程内探测 libc/linker API，
 /// loader 在 worker 线程中完成自定义 linker + entrypoint 查找 + hello_entry 调用。
 /// 使用 code-swap 技术：零 host 端偏移计算，bootstrapper 通过 raw syscall 自行分配内存。
+#[cfg(not(feature = "noptrace"))]
 pub(crate) fn inject_via_bootstrapper(
     pid: i32,
     string_overrides: &std::collections::HashMap<String, String>,
@@ -1473,6 +1641,7 @@ pub(crate) fn inject_via_bootstrapper(
     Err(last_err)
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn inject_via_bootstrapper_once(
     pid: i32,
     string_overrides: &std::collections::HashMap<String, String>,
@@ -1700,6 +1869,12 @@ fn inject_via_bootstrapper_once(
     // 写入 LibcApi（给 loader 用）
     mem_write_value(&mem, loader_libc_addr, &libc_api)?;
 
+    let loader_code_prot = if env_flag_enabled("RF_KEEP_LOADER_RWX") {
+        log_verbose!("loader code permission: keeping RWX (RF_KEEP_LOADER_RWX=1)");
+        libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC
+    } else {
+        libc::PROT_READ | libc::PROT_EXEC
+    };
     remote_mprotect_syscall(
         &mem,
         trace_tid,
@@ -1708,7 +1883,7 @@ fn inject_via_bootstrapper_once(
         alloc_return_trap_addr,
         alloc_base,
         code_pages,
-        libc::PROT_READ | libc::PROT_EXEC,
+        loader_code_prot,
     )?;
     remote_mprotect_syscall(
         &mem,

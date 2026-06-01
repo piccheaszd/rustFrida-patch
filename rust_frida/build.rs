@@ -8,15 +8,28 @@ fn main() {
         std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
     let workspace_root = manifest_dir.parent().expect("rust_frida must be inside workspace root");
     let profile_dir = if profile == "release" { "release" } else { "debug" };
-    let agent_build_flag = if profile_dir == "release" { " --release" } else { "" };
+    let noptrace = std::env::var_os("CARGO_FEATURE_NOPTRACE").is_some();
+    let release_flag = if profile_dir == "release" { " --release" } else { "" };
+    let agent_feature_flag = if noptrace {
+        " --no-default-features --features quickjs,noptrace"
+    } else {
+        ""
+    };
+    let agent_build_flag = format!("{}{}", release_flag, agent_feature_flag);
     let agent_so = workspace_root
         .join("target")
         .join(&target)
         .join(profile_dir)
         .join("libagent.so");
+    let agent_feature_marker = workspace_root
+        .join("target")
+        .join(&target)
+        .join(profile_dir)
+        .join("libagent.features");
 
     // 当 agent.so 变化时重新编译 host（include_bytes! 缓存问题）
     println!("cargo::rerun-if-changed={}", agent_so.display());
+    println!("cargo::rerun-if-changed={}", agent_feature_marker.display());
     println!("cargo::rerun-if-changed=../loader/build/bootstrapper.bin");
     println!("cargo::rerun-if-changed=../loader/build/rustfrida-loader.bin");
 
@@ -72,6 +85,27 @@ fn main() {
             panic!(
                 "missing embedded agent {}: {}. Run `cargo build -p agent{}` first",
                 agent_so.display(),
+                e,
+                agent_build_flag
+            );
+        }
+    }
+
+    let expected_agent_feature = if noptrace { "noptrace=1" } else { "noptrace=0" };
+    match std::fs::read_to_string(&agent_feature_marker) {
+        Ok(features) if features.lines().any(|line| line.trim() == expected_agent_feature) => {}
+        Ok(features) => {
+            panic!(
+                "embedded agent feature mismatch: expected {}, got {:?}. Run `cargo build -p agent{}` first",
+                expected_agent_feature,
+                features.trim(),
+                agent_build_flag
+            );
+        }
+        Err(e) => {
+            panic!(
+                "missing embedded agent feature marker {}: {}. Run `cargo build -p agent{}` first",
+                agent_feature_marker.display(),
                 e,
                 agent_build_flag
             );

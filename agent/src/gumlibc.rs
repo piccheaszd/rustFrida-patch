@@ -1,6 +1,8 @@
-use libc::{c_long, pid_t, SYS_kill, SYS_wait4};
-use libc::{SYS_clone, SYS_exit, SYS_ptrace};
+use libc::c_long;
+#[cfg(not(feature = "noptrace"))]
+use libc::{pid_t, SYS_clone, SYS_exit, SYS_kill, SYS_ptrace, SYS_wait4};
 use std::arch::asm;
+#[cfg(not(feature = "noptrace"))]
 use std::ffi::c_void;
 
 pub fn gum_libc_syscall_4(n: c_long, a: usize, b: usize, c: usize, d: usize) -> usize {
@@ -18,18 +20,22 @@ pub fn gum_libc_syscall_4(n: c_long, a: usize, b: usize, c: usize, d: usize) -> 
     result
 }
 
+#[cfg(not(feature = "noptrace"))]
 pub fn gum_libc_ptrace(request: i32, pid: i32, address: usize, data: usize) -> i32 {
     gum_libc_syscall_4(SYS_ptrace, request as usize, pid as usize, address, data) as i32
 }
 
+#[cfg(not(feature = "noptrace"))]
 pub fn gum_libc_waitpid(pid: i32, status: usize, options: usize) -> i32 {
     gum_libc_syscall_4(SYS_wait4, pid as usize, status, options, 0) as i32
 }
 
+#[cfg(not(feature = "noptrace"))]
 pub fn gum_libc_kill(pid: i32, sig: i32) -> i32 {
     gum_libc_syscall_4(SYS_kill, pid as usize, sig as usize, 0, 0) as i32
 }
 
+#[cfg(not(feature = "noptrace"))]
 pub(crate) fn gum_libc_clone(
     child_func: *mut usize,
     threadid: usize,

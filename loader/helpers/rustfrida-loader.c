@@ -182,6 +182,7 @@ typedef struct {
   void * agent_handle;
   void * agent_entrypoint_impl;
   void * agent_current_thread_eval_impl;
+  uint64_t spawn_resume_flag;
 } RustFridaLoaderContext;
 
 /*
@@ -192,6 +193,7 @@ typedef struct {
   uint64_t table;       /* *const StringTable */
   int32_t  ctrl_fd;     /* REPL socketpair fd */
   int32_t  agent_memfd; /* -1 (unused in this path) */
+  uint64_t resume_flag; /* pure spawn resume flag, 0 otherwise */
 } AgentArgs;
 
 typedef void * (* hello_entry_fn) (void *);
@@ -2546,6 +2548,7 @@ frida_main (void * user_data)
   bool hold_before_entry;
   bool catch_entry_signals;
   bool stream_agent;
+  bool agent_ctrl_is_loader;
   const char * agent_vma_name;
 
   frida_memset (&agent_module, 0, sizeof (agent_module));
@@ -2558,6 +2561,7 @@ frida_main (void * user_data)
   hold_before_entry = frida_agent_data_has_token (ctx->agent_data, "hold-entry");
   catch_entry_signals = frida_agent_data_has_token (ctx->agent_data, "catch-signals");
   stream_agent = frida_agent_data_has_token (ctx->agent_data, "stream-agent");
+  agent_ctrl_is_loader = frida_agent_data_has_token (ctx->agent_data, "agent-ctrl=loader");
   rustfrida_loader_debug_enabled = frida_agent_data_has_token (ctx->agent_data, "loader-debug");
   agent_vma_name = frida_agent_data_get_last_value (ctx->agent_data, "vma");
 
@@ -2636,7 +2640,15 @@ frida_main (void * user_data)
     ctx->agent_handle = (void *) agent_module.base;
   }
 
-  /* Receive the REPL socketpair fd for the agent */
+  /* Receive the REPL socketpair fd for the agent, or reuse the loader control
+   * socket in pure spawn where no fd passing or remote fd extraction is used. */
+  if (agent_ctrl_is_loader)
+  {
+    frida_send_debug (ctrlfd, "loader:reuse-ctrl-for-agent", libc);
+    agent_ctrlfd = ctrlfd;
+  }
+  else
+  {
   frida_send_debug (ctrlfd, "loader:waiting-repl-fd", libc);
   {
     char recv_diag[32];
@@ -2652,6 +2664,7 @@ frida_main (void * user_data)
   frida_send_log (ctrlfd, "worker: repl fd received", libc);
   if (agent_ctrlfd != -1)
     frida_enable_close_on_exec (agent_ctrlfd, libc);
+  }
 
   /* Signal READY and wait for ACK before entering agent */
   frida_send_debug (ctrlfd, "loader:send-ready", libc);
@@ -2666,6 +2679,10 @@ frida_main (void * user_data)
     frida_send_error (ctrlfd, FRIDA_MESSAGE_ERROR_DLOPEN,
         "frida_receive_ack failed", libc);
     goto beach;
+  }
+  if (agent_ctrl_is_loader)
+  {
+    ctrlfd = -1;
   }
   if (close_loader_ctrl && ctrlfd != -1)
   {
@@ -2688,6 +2705,7 @@ frida_main (void * user_data)
     args.table      = ctx->string_table_addr;
     args.ctrl_fd    = agent_ctrlfd;
     args.agent_memfd = -1;
+    args.resume_flag = ctx->spawn_resume_flag;
 
     if (catch_entry_signals)
     {

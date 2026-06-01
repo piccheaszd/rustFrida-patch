@@ -11,14 +11,20 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::os::unix::io::IntoRawFd;
 use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::injection::{inject_via_bootstrapper, InjectionResult};
+#[cfg(not(feature = "noptrace"))]
+use crate::injection::inject_via_bootstrapper;
+use crate::injection::{
+    build_agent_entrypoint, build_pure_loader_agent_data, run_loader_handshake_pure, InjectionResult, FRIDA_LOADER,
+};
 use crate::proc_mem::ProcMem;
 use crate::process::{parse_proc_maps, wait_until_stopped, MapEntry};
+use crate::types::{FridaLibcApi, RustFridaLoaderContext};
 use crate::{log_error, log_info, log_step, log_success, log_verbose, log_warn};
 
 /// 嵌入编译好的 zymbiote ELF
@@ -26,6 +32,9 @@ const ZYMBIOTE_ELF: &[u8] = include_bytes!("../../zymbiote/build/zymbiote.elf");
 
 /// ACK 字节
 const ACK_BYTE: u8 = 0x42;
+#[cfg(feature = "noptrace")]
+const SELF_RESTORE_BYTE: u8 = 0x43;
+const PURE_STAGE1_BYTE: u8 = 0x50;
 const SPAWN_REPL_READY_MIN_WAIT: Duration = Duration::from_millis(750);
 const SPAWN_REPL_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const SPAWN_REPL_READY_POLL: Duration = Duration::from_millis(100);
@@ -43,6 +52,16 @@ struct SpawnTarget {
     package: String,
     process_name: String,
     request_keys: Vec<String>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct PureStage1Header {
+    image_size: u64,
+    code_size: u64,
+    ctx_offset: u64,
+    resume_flag_offset: u64,
+    reloc_count: u64,
 }
 
 /// Zygote patch 信息（用于退出时还原）
@@ -142,18 +161,30 @@ fn cleanup_orphan_spawn_connections() {
 
     for (orphan_pid, (mut stream, ppid)) in orphan_entries {
         log_warn!("清理超时孤儿连接: pid={}", orphan_pid);
-        // 发 ACK 恢复子进程，避免永远挂起
-        let _ = stream.write_all(&[ACK_BYTE]);
-        // 等 EOF → 等 SIGSTOP → 还原 → SIGCONT（同步执行，
-        // 防止 fire-and-forget 线程未完成就 exit 导致子进程卡在 SIGSTOP）
-        drain_until_eof(&mut stream, std::time::Duration::from_secs(5));
-        drop(stream);
-        if let Err(e) = wait_until_stopped(orphan_pid) {
-            log_verbose!("等待孤儿子进程 {} SIGSTOP 失败: {}", orphan_pid, e);
-        } else {
-            let _ = revert_child_patch_by_ppid(orphan_pid, ppid);
+        #[cfg(feature = "noptrace")]
+        {
+            let _ = stream.write_all(&[SELF_RESTORE_BYTE]);
+            drain_until_eof(&mut stream, std::time::Duration::from_secs(5));
+            drop(stream);
+            let _ = ppid;
+            continue;
         }
-        unsafe { libc::kill(orphan_pid as i32, libc::SIGCONT) };
+
+        #[cfg(not(feature = "noptrace"))]
+        {
+            // 发 ACK 恢复子进程，避免永远挂起
+            let _ = stream.write_all(&[ACK_BYTE]);
+            // 等 EOF → 等 SIGSTOP → 还原 → SIGCONT（同步执行，
+            // 防止 fire-and-forget 线程未完成就 exit 导致子进程卡在 SIGSTOP）
+            drain_until_eof(&mut stream, std::time::Duration::from_secs(5));
+            drop(stream);
+            if let Err(e) = wait_until_stopped(orphan_pid) {
+                log_verbose!("等待孤儿子进程 {} SIGSTOP 失败: {}", orphan_pid, e);
+            } else {
+                let _ = revert_child_patch_by_ppid(orphan_pid, ppid);
+            }
+            unsafe { libc::kill(orphan_pid as i32, libc::SIGCONT) };
+        }
     }
 }
 
@@ -179,6 +210,10 @@ const CTX_CLOSE: usize = 192;
 const CTX_RAISE: usize = 200;
 const CTX_PROP_REMAP: usize = 208;
 const CTX_BLOCK_IN_SETCONTEXT: usize = 216;
+const CTX_PURE_SPAWN_DONE: usize = 224;
+const CTX_SETARGV0_SLOT: usize = 232;
+const CTX_SETARGV0_ORIGINAL: usize = 240;
+const CTX_CHILD_HOOKS_RESTORED: usize = 248;
 /// 读取 stream 直到 EOF 或错误（用于等待子进程关闭 socket）
 fn drain_until_eof(stream: &mut std::os::unix::net::UnixStream, timeout: std::time::Duration) {
     stream.set_read_timeout(Some(timeout)).ok();
@@ -330,7 +365,191 @@ pub(crate) fn wait_for_repl_ready(pid: i32) {
     }
 }
 
+fn nul_terminated(value: impl AsRef<[u8]>) -> Vec<u8> {
+    let mut bytes = value.as_ref().to_vec();
+    bytes.push(0);
+    bytes
+}
+
+fn string_table_value(overrides: &HashMap<String, String>, name: &str, default_value: &'static [u8]) -> Vec<u8> {
+    overrides
+        .get(name)
+        .map(|s| nul_terminated(s.as_bytes()))
+        .unwrap_or_else(|| nul_terminated(default_value))
+}
+
+fn align_up_usize(value: usize, align: usize) -> usize {
+    (value + align - 1) & !(align - 1)
+}
+
+fn append_zeroed<T>(image: &mut Vec<u8>) -> usize {
+    let offset = align_up_usize(image.len(), std::mem::align_of::<T>());
+    image.resize(offset + std::mem::size_of::<T>(), 0);
+    offset
+}
+
+fn write_value_at<T: Copy>(image: &mut [u8], offset: usize, value: &T) {
+    let bytes = unsafe { std::slice::from_raw_parts(value as *const T as *const u8, std::mem::size_of::<T>()) };
+    image[offset..offset + bytes.len()].copy_from_slice(bytes);
+}
+
+fn append_bytes(image: &mut Vec<u8>, bytes: &[u8], align: usize) -> usize {
+    let offset = align_up_usize(image.len(), align);
+    image.resize(offset, 0);
+    image.extend_from_slice(bytes);
+    offset
+}
+
+fn push_reloc(relocs: &mut Vec<u32>, offset: usize) -> Result<(), String> {
+    let reloc = u32::try_from(offset).map_err(|_| "pure stage-1 relocation offset 溢出".to_string())?;
+    relocs.push(reloc);
+    Ok(())
+}
+
+fn take_active_connection(pid: u32) -> Result<(std::os::unix::net::UnixStream, u32), String> {
+    let conns = ACTIVE_CONNECTIONS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = conns.lock().unwrap();
+    map.remove(&pid)
+        .ok_or_else(|| format!("未找到子进程 {} 的活跃 zymbiote 连接", pid))
+}
+
+fn send_pure_stage1(
+    stream: &mut std::os::unix::net::UnixStream,
+    string_overrides: &HashMap<String, String>,
+) -> Result<(), String> {
+    let entrypoint = build_agent_entrypoint()?;
+    let agent_data = build_pure_loader_agent_data()?;
+    let current_eval = b"rustfrida_loadjs_current_thread\0".to_vec();
+    let sym_name = string_table_value(string_overrides, "sym_name", b"hello_entry");
+    let pthread_err = string_table_value(string_overrides, "pthread_err", b"pthreadded");
+    let dlsym_err = string_table_value(string_overrides, "dlsym_err", b"dlsymFail");
+    let cmdline = string_table_value(string_overrides, "cmdline", b"novalue");
+    let output_path = string_table_value(string_overrides, "output_path", b"novalue");
+
+    let page_size = 4096usize;
+    let code_size = align_up_usize(FRIDA_LOADER.len(), page_size);
+    let mut image = vec![0u8; code_size];
+    image[..FRIDA_LOADER.len()].copy_from_slice(FRIDA_LOADER);
+
+    let ctx_offset = append_zeroed::<RustFridaLoaderContext>(&mut image);
+    let api_offset = append_zeroed::<FridaLibcApi>(&mut image);
+    let table_offset = append_bytes(&mut image, &[0u8; 16 * 5], 8);
+    let resume_flag_offset = append_bytes(&mut image, &[0u8; 8], 8);
+    let entrypoint_offset = append_bytes(&mut image, &entrypoint, 1);
+    let agent_data_offset = append_bytes(&mut image, &agent_data, 1);
+    let current_eval_offset = append_bytes(&mut image, &current_eval, 1);
+    let sym_name_offset = append_bytes(&mut image, &sym_name, 1);
+    let pthread_err_offset = append_bytes(&mut image, &pthread_err, 1);
+    let dlsym_err_offset = append_bytes(&mut image, &dlsym_err, 1);
+    let cmdline_offset = append_bytes(&mut image, &cmdline, 1);
+    let output_path_offset = append_bytes(&mut image, &output_path, 1);
+
+    let ctx = RustFridaLoaderContext {
+        ctrlfds: [-1, -1],
+        agent_entrypoint: entrypoint_offset as u64,
+        agent_data: agent_data_offset as u64,
+        fallback_address: 0,
+        libc: api_offset as u64,
+        string_table_addr: table_offset as u64,
+        agent_current_thread_eval: current_eval_offset as u64,
+        spawn_resume_flag: resume_flag_offset as u64,
+        ..Default::default()
+    };
+    write_value_at(&mut image, ctx_offset, &ctx);
+
+    let table_entries = [
+        (sym_name_offset, sym_name.len()),
+        (pthread_err_offset, pthread_err.len()),
+        (dlsym_err_offset, dlsym_err.len()),
+        (cmdline_offset, cmdline.len()),
+        (output_path_offset, output_path.len()),
+    ];
+    for (idx, (ptr, len)) in table_entries.iter().enumerate() {
+        let base = table_offset + idx * 16;
+        image[base..base + 8].copy_from_slice(&(*ptr as u64).to_ne_bytes());
+        image[base + 8..base + 12].copy_from_slice(&(*len as u32).to_ne_bytes());
+    }
+
+    let mut relocs = Vec::new();
+    push_reloc(
+        &mut relocs,
+        ctx_offset + std::mem::offset_of!(RustFridaLoaderContext, agent_entrypoint),
+    )?;
+    push_reloc(
+        &mut relocs,
+        ctx_offset + std::mem::offset_of!(RustFridaLoaderContext, agent_data),
+    )?;
+    push_reloc(
+        &mut relocs,
+        ctx_offset + std::mem::offset_of!(RustFridaLoaderContext, libc),
+    )?;
+    push_reloc(
+        &mut relocs,
+        ctx_offset + std::mem::offset_of!(RustFridaLoaderContext, string_table_addr),
+    )?;
+    push_reloc(
+        &mut relocs,
+        ctx_offset + std::mem::offset_of!(RustFridaLoaderContext, agent_current_thread_eval),
+    )?;
+    push_reloc(
+        &mut relocs,
+        ctx_offset + std::mem::offset_of!(RustFridaLoaderContext, spawn_resume_flag),
+    )?;
+    for idx in 0..5 {
+        push_reloc(&mut relocs, table_offset + idx * 16)?;
+    }
+
+    let image_size = align_up_usize(image.len(), page_size);
+    image.resize(image_size, 0);
+
+    let header = PureStage1Header {
+        image_size: image.len() as u64,
+        code_size: code_size as u64,
+        ctx_offset: ctx_offset as u64,
+        resume_flag_offset: resume_flag_offset as u64,
+        reloc_count: relocs.len() as u64,
+    };
+    let header_bytes = unsafe {
+        std::slice::from_raw_parts(
+            &header as *const PureStage1Header as *const u8,
+            std::mem::size_of::<PureStage1Header>(),
+        )
+    };
+
+    stream
+        .write_all(&[PURE_STAGE1_BYTE])
+        .and_then(|_| stream.write_all(header_bytes))
+        .and_then(|_| stream.write_all(&image))
+        .and_then(|_| {
+            for reloc in &relocs {
+                stream.write_all(&reloc.to_ne_bytes())?;
+            }
+            Ok(())
+        })
+        .map_err(|e| format!("发送 pure stage-1 loader 失败: {}", e))
+}
+
+pub(crate) fn spawn_pure(
+    package: &str,
+    timeout_secs: u64,
+    string_overrides: &HashMap<String, String>,
+) -> Result<(i32, InjectionResult), String> {
+    log_info!("Pure Spawn 模式: 准备自加载 agent {}", package);
+
+    let hello = spawn_and_wait_hello(package, timeout_secs)?;
+    let pid = hello.pid as i32;
+    let (mut stream, _ppid) = take_active_connection(hello.pid)?;
+
+    log_info!("正在向子进程 {} 下发 stage-1 loader...", pid);
+    send_pure_stage1(&mut stream, string_overrides)?;
+    let ctrl_fd = stream.into_raw_fd();
+    let injection = run_loader_handshake_pure(ctrl_fd, pid)?;
+
+    Ok((pid, injection))
+}
+
 /// Spawn 注入主入口
+#[cfg(not(feature = "noptrace"))]
 pub(crate) fn spawn_and_inject(
     package: &str,
     timeout_secs: u64,
@@ -364,6 +583,7 @@ pub(crate) fn spawn_and_inject(
 ///
 /// 这是稳定优先路径，不保证早期 hook。普通 `--spawn` 默认走这里；
 /// `--spawn -l` 或显式 `--spawn-early` 才使用 setArgV0/setcontext 阻塞点注入。
+#[cfg(not(feature = "noptrace"))]
 pub(crate) fn spawn_resume_then_inject(
     package: &str,
     timeout_secs: u64,
@@ -500,47 +720,8 @@ fn generate_socket_name() -> String {
     format!("rustfrida-zymbiote-{}", hex)
 }
 
-/// 检查进程是否为 64 位（读取 /proc/<pid>/exe 的 ELF header）
-fn is_process_64bit(pid: u32) -> bool {
-    use std::os::unix::io::AsRawFd;
-
-    let exe_path = format!("/proc/{}/exe", pid);
-    let file = match std::fs::File::open(&exe_path) {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
-
-    // 读取 ELF header 前 5 字节: e_ident[0..4] = magic, e_ident[4] = EI_CLASS
-    let mut header = [0u8; 5];
-    let fd = file.as_raw_fd();
-    let n = loop {
-        let ret = unsafe { libc::pread(fd, header.as_mut_ptr() as *mut libc::c_void, 5, 0) };
-        if ret >= 0 {
-            break ret;
-        }
-        if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-            continue;
-        }
-        break ret;
-    };
-    if n < 5 {
-        return false;
-    }
-
-    // 验证 ELF magic: 0x7f 'E' 'L' 'F'
-    if header[0] != 0x7f || header[1] != b'E' || header[2] != b'L' || header[3] != b'F' {
-        return false;
-    }
-
-    // EI_CLASS: 1 = ELFCLASS32, 2 = ELFCLASS64
-    header[4] == 2
-}
-
-fn proc_name_implies_64bit(proc_name: &str) -> bool {
-    proc_name == "zygote64" || proc_name == "usap64"
-}
-
-/// 枚举所有 64 位 zygote 进程 PID
+/// 枚举 zygote64 进程 PID。
+/// 当前 no-ptrace pure spawn 只支持 arm64 目标，不再扫描/patch 32-bit zygote。
 fn find_zygote_pids() -> Result<Vec<(u32, String)>, String> {
     use std::fs;
 
@@ -566,7 +747,7 @@ fn find_zygote_pids() -> Result<Vec<(u32, String)>, String> {
                 .and_then(|s| std::str::from_utf8(s).ok())
                 .unwrap_or("");
 
-            if proc_name == "zygote" || proc_name == "zygote64" || proc_name == "usap32" || proc_name == "usap64" {
+            if proc_name == "zygote64" {
                 // 过滤 App Zygote：Android 为 isolated service 创建的应用级 zygote，
                 // 进程名也叫 "zygote" 但 UID 不是 root。注入会失败（内存布局不同）。
                 let status_path = format!("/proc/{}/status", pid);
@@ -583,11 +764,6 @@ fn find_zygote_pids() -> Result<Vec<(u32, String)>, String> {
                             continue;
                         }
                     }
-                }
-                // 过滤 32 位进程：zymbiote payload 是 ARM64 ELF，注入 32 位进程会崩溃
-                if !proc_name_implies_64bit(proc_name) && !is_process_64bit(pid) {
-                    log_verbose!("跳过 32 位进程 {} (pid={})", proc_name, pid);
-                    continue;
                 }
                 results.push((pid, proc_name.to_string()));
             }
@@ -742,33 +918,48 @@ fn handle_zymbiote_connection(mut stream: std::os::unix::net::UnixStream) -> Res
 /// 对未匹配 spawn 请求的子进程执行完整 resume 流程
 /// 与 Frida connection.resume() 一致：ACK → 等 EOF → wait SIGSTOP → revert → SIGCONT
 fn do_resume_unmatched(pid: u32, ppid: u32, mut stream: std::os::unix::net::UnixStream) {
-    // 1. 发送 ACK
-    if stream.write_all(&[ACK_BYTE]).is_err() {
+    #[cfg(feature = "noptrace")]
+    {
+        if stream.write_all(&[SELF_RESTORE_BYTE]).is_err() {
+            return;
+        }
+        drain_until_eof(&mut stream, std::time::Duration::from_secs(10));
+        drop(stream);
+        log_verbose!("未匹配子进程 {} 已请求 child 侧恢复 hook", pid);
+        let _ = ppid;
         return;
     }
 
-    // 2. 等待子进程关闭连接（EOF）
-    drain_until_eof(&mut stream, std::time::Duration::from_secs(10));
-    drop(stream);
+    #[cfg(not(feature = "noptrace"))]
+    {
+        // 1. 发送 ACK
+        if stream.write_all(&[ACK_BYTE]).is_err() {
+            return;
+        }
 
-    // 3. 检查子进程是否仍存在
-    if !std::path::Path::new(&format!("/proc/{}", pid)).exists() {
-        log_verbose!("未匹配子进程 {} 已不存在，跳过还原", pid);
-        return;
+        // 2. 等待子进程关闭连接（EOF）
+        drain_until_eof(&mut stream, std::time::Duration::from_secs(10));
+        drop(stream);
+
+        // 3. 检查子进程是否仍存在
+        if !std::path::Path::new(&format!("/proc/{}", pid)).exists() {
+            log_verbose!("未匹配子进程 {} 已不存在，跳过还原", pid);
+            return;
+        }
+
+        // 4. 等待子进程 SIGSTOP（与 resume_child 一致：即使失败也尝试还原和 SIGCONT）
+        if let Err(e) = wait_until_stopped(pid) {
+            log_verbose!("等待未匹配子进程 {} SIGSTOP 失败: {}，仍尝试还原", pid, e);
+        }
+
+        // 5. 还原子进程 patch（使用 ppid 匹配正确的 zygote patch）
+        if let Err(e) = revert_child_patch_by_ppid(pid, ppid) {
+            log_verbose!("还原未匹配子进程 {} patch 失败: {}", pid, e);
+        }
+
+        // 6. SIGCONT 恢复子进程
+        unsafe { libc::kill(pid as i32, libc::SIGCONT) };
     }
-
-    // 4. 等待子进程 SIGSTOP（与 resume_child 一致：即使失败也尝试还原和 SIGCONT）
-    if let Err(e) = wait_until_stopped(pid) {
-        log_verbose!("等待未匹配子进程 {} SIGSTOP 失败: {}，仍尝试还原", pid, e);
-    }
-
-    // 5. 还原子进程 patch（使用 ppid 匹配正确的 zygote patch）
-    if let Err(e) = revert_child_patch_by_ppid(pid, ppid) {
-        log_verbose!("还原未匹配子进程 {} patch 失败: {}", pid, e);
-    }
-
-    // 6. SIGCONT 恢复子进程
-    unsafe { libc::kill(pid as i32, libc::SIGCONT) };
 }
 
 /// 活跃连接（等待 ACK 的子进程 stream + fork 时刻的 ppid）
@@ -1605,7 +1796,61 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
         buf
     };
 
-    // 写入 payload
+    let setargv0_slot = if let Some((addr, backup, _)) = setargv0_search {
+        Some((addr, backup))
+    } else {
+        // 降级模式：block_in_setcontext 已置 1，阻塞由 setcontext GOT 替换承担
+        None
+    };
+
+    // 10. 准备 setcontext GOT 备份（可选）
+    //     与 Frida 一致：already-patched 时 GOT 中可能是旧的替换值，
+    //     必须用原始函数地址作为备份，而非从内存中读取当前值
+    let setcontext_got = if let Some((func_addr, Some(got))) = &setcontext_info {
+        let backup = if already_patched {
+            // already-patched: GOT 中是旧 patch 的替换值，使用原始函数地址
+            func_addr.to_ne_bytes()
+        } else {
+            let mut buf = [0u8; 8];
+            mem.pread_exact(&mut buf, *got)?;
+            buf
+        };
+        Some((*got, backup))
+    } else {
+        None
+    };
+
+    // 11. 属性伪装: 准备 capset GOT 备份（仅指定 --profile 时）
+    //     capset hook 在 cap drop 前执行 mount --bind
+    let capset_got = if PROP_PROFILE_DIR.get().and_then(|v| v.as_ref()).is_some() {
+        let got = find_got_entry_for_import(&maps, "libandroid_runtime.so", "capset");
+        if let Some(got) = got {
+            let backup = if already_patched {
+                libc_funcs.capset.to_ne_bytes()
+            } else {
+                let mut buf = [0u8; 8];
+                mem.pread_exact(&mut buf, got)?;
+                buf
+            };
+            Some((got, backup))
+        } else {
+            log_warn!("未找到 capset GOT，属性 mount 将不可用");
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some((addr, backup)) = &setargv0_slot {
+        write_ctx_u64(&mut payload_data, ctx_base_in_payload, CTX_SETARGV0_SLOT, *addr)?;
+        write_ctx_u64(
+            &mut payload_data,
+            ctx_base_in_payload,
+            CTX_SETARGV0_ORIGINAL,
+            u64::from_ne_bytes(*backup),
+        )?;
+    }
+    // 12. 写入 payload
     mem.pwrite_all(&payload_data, loc.base).map_err(|e| {
         format!(
             "payload 写入失败: {} vma=[0x{:x},0x{:x}) perms={} path={}{}",
@@ -1619,63 +1864,29 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
     })?;
     log_verbose!("Payload 写入完成");
 
-    // 10. 替换 setArgV0 指针 → zymbiote replacement（Some 时）
-    let setargv0_slot = if let Some((addr, backup, _)) = setargv0_search {
-        mem.pwrite_all(&replacement_setargv0_addr.to_ne_bytes(), addr)?;
+    // 13. 替换 setArgV0 指针 → zymbiote replacement（Some 时）
+    if let Some((addr, backup)) = &setargv0_slot {
+        mem.pwrite_all(&replacement_setargv0_addr.to_ne_bytes(), *addr)?;
         log_verbose!(
             "setArgV0 指针已替换: 0x{:x} → 0x{:x}",
-            u64::from_ne_bytes(backup),
+            u64::from_ne_bytes(*backup),
             replacement_setargv0_addr
         );
-        Some((addr, backup))
-    } else {
-        // 降级模式：block_in_setcontext 已置 1，阻塞由 setcontext GOT 替换承担
-        None
-    };
+    }
 
-    // 11. 替换 setcontext GOT slot（可选）
-    //     与 Frida 一致：already-patched 时 GOT 中可能是旧的替换值，
-    //     必须用原始函数地址作为备份，而非从内存中读取当前值
-    let setcontext_got = if let Some((func_addr, Some(got))) = &setcontext_info {
-        let backup = if already_patched {
-            // already-patched: GOT 中是旧 patch 的替换值，使用原始函数地址
-            func_addr.to_ne_bytes()
-        } else {
-            let mut buf = [0u8; 8];
-            mem.pread_exact(&mut buf, *got)?;
-            buf
-        };
+    // 14. 替换 setcontext GOT slot（可选）
+    if let Some((got, _)) = &setcontext_got {
         mem.pwrite_all(&replacement_setcontext_addr.to_ne_bytes(), *got)?;
         log_verbose!("setcontext GOT 已替换: 0x{:x}", got);
-        Some((*got, backup))
-    } else {
-        None
-    };
+    }
 
-    // 12. 属性伪装: 替换 capset GOT（仅指定 --profile 时）
-    //     capset hook 在 cap drop 前执行 mount --bind
-    let capset_got = if PROP_PROFILE_DIR.get().and_then(|v| v.as_ref()).is_some() {
-        let got = find_got_entry_for_import(&maps, "libandroid_runtime.so", "capset");
-        if let Some(got) = got {
-            let backup = if already_patched {
-                libc_funcs.capset.to_ne_bytes()
-            } else {
-                let mut buf = [0u8; 8];
-                mem.pread_exact(&mut buf, got)?;
-                buf
-            };
-            mem.pwrite_all(&replacement_prctl_addr.to_ne_bytes(), got)?;
-            log_verbose!("capset GOT 已替换: 0x{:x}", got);
-            Some((got, backup))
-        } else {
-            log_warn!("未找到 capset GOT，属性 mount 将不可用");
-            None
-        }
-    } else {
-        None
-    };
+    // 15. 替换 capset GOT（可选）
+    if let Some((got, _)) = &capset_got {
+        mem.pwrite_all(&replacement_prctl_addr.to_ne_bytes(), *got)?;
+        log_verbose!("capset GOT 已替换: 0x{:x}", got);
+    }
 
-    // 13. SIGCONT 恢复 zygote — guard 在 drop 时自动发送
+    // 16. SIGCONT 恢复 zygote — guard 在 drop 时自动发送
     //     正常路径：显式 drop guard 触发 SIGCONT
     //     异常路径：? 返回 Err 时 guard 自动 drop 触发 SIGCONT
     drop(sigcont_guard);
@@ -2235,6 +2446,10 @@ fn build_payload(
     write_u64(ctx, CTX_PROP_REMAP - CTX_SOCKET_PATH, prop_remap);
     // block_in_setcontext 默认 0，由调用者在三层 slot 全部 miss 时 flip 为 1
     write_u64(ctx, CTX_BLOCK_IN_SETCONTEXT - CTX_SOCKET_PATH, 0);
+    write_u64(ctx, CTX_PURE_SPAWN_DONE - CTX_SOCKET_PATH, 0);
+    write_u64(ctx, CTX_SETARGV0_SLOT - CTX_SOCKET_PATH, 0);
+    write_u64(ctx, CTX_SETARGV0_ORIGINAL - CTX_SOCKET_PATH, 0);
+    write_u64(ctx, CTX_CHILD_HOOKS_RESTORED - CTX_SOCKET_PATH, 0);
     // 无需 GOT 重定位：zymbiote 用 -shared -nostdlib 构建，
     // ARM64 ADRP+ADD 为 PC-relative 寻址，代码和数据在同一段内，
     // 移动到新地址后相对偏移不变。实测 .got 为空且无动态重定位。
@@ -2253,6 +2468,15 @@ fn write_u64(buf: &mut [u8], offset: usize, value: u64) {
     if offset + 8 <= buf.len() {
         buf[offset..offset + 8].copy_from_slice(&value.to_ne_bytes());
     }
+}
+
+fn write_ctx_u64(payload: &mut [u8], ctx_base: usize, field_offset: usize, value: u64) -> Result<(), String> {
+    let offset = ctx_base + field_offset - CTX_SOCKET_PATH;
+    if offset + 8 > payload.len() {
+        return Err(format!("ZymbioteContext 偏移越界: {} + 8 > {}", offset, payload.len()));
+    }
+    payload[offset..offset + 8].copy_from_slice(&value.to_ne_bytes());
+    Ok(())
 }
 
 /// 恢复所有挂起的子进程连接（发 ACK → 等 EOF → 等 SIGSTOP → 还原 → SIGCONT）
@@ -2287,22 +2511,34 @@ fn cleanup_pending_connections() {
             continue;
         }
 
-        // 1. 发送 ACK 解除子进程阻塞
-        if stream.write_all(&[ACK_BYTE]).is_err() {
-            // 连接已断开，子进程可能已退出，仍尝试 SIGCONT
-            unsafe { libc::kill(pid as i32, libc::SIGCONT) };
+        #[cfg(feature = "noptrace")]
+        {
+            if stream.write_all(&[SELF_RESTORE_BYTE]).is_ok() {
+                drain_until_eof(&mut stream, std::time::Duration::from_secs(2));
+            }
+            drop(stream);
             continue;
         }
 
-        // 2. 等待子进程关闭 socket（收到 ACK 后 close(fd)）
-        drain_until_eof(&mut stream, std::time::Duration::from_secs(2));
-        drop(stream);
+        #[cfg(not(feature = "noptrace"))]
+        {
+            // 1. 发送 ACK 解除子进程阻塞
+            if stream.write_all(&[ACK_BYTE]).is_err() {
+                // 连接已断开，子进程可能已退出，仍尝试 SIGCONT
+                unsafe { libc::kill(pid as i32, libc::SIGCONT) };
+                continue;
+            }
 
-        // 3. 等待子进程 raise(SIGSTOP)，然后还原 patch 并恢复
-        if wait_until_stopped(pid).is_ok() {
-            let _ = revert_child_patch_by_ppid(pid, ppid);
+            // 2. 等待子进程关闭 socket（收到 ACK 后 close(fd)）
+            drain_until_eof(&mut stream, std::time::Duration::from_secs(2));
+            drop(stream);
+
+            // 3. 等待子进程 raise(SIGSTOP)，然后还原 patch 并恢复
+            if wait_until_stopped(pid).is_ok() {
+                let _ = revert_child_patch_by_ppid(pid, ppid);
+            }
+            unsafe { libc::kill(pid as i32, libc::SIGCONT) };
         }
-        unsafe { libc::kill(pid as i32, libc::SIGCONT) };
     }
 }
 

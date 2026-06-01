@@ -52,6 +52,10 @@ struct _ZymbioteContext
     /* 控制标志（由 Rust 侧填充） */
     uint64_t prop_remap;            /* 非零 = 启用属性 remap */
     uint64_t block_in_setcontext;   /* 非零 = 降级模式：在 setcontext 阻塞（setArgV0 slot 未找到） */
+    uint64_t pure_spawn_done;       /* 非零 = pure stage-1 已接管，后续 hook 直接放行 */
+    uint64_t setargv0_slot;         /* child 自恢复: setArgV0 指针槽 */
+    uint64_t setargv0_original;     /* child 自恢复: setArgV0 原值 */
+    uint64_t child_hooks_restored;  /* 非零 = child 侧 hook 指针已恢复 */
 };
 
 /* 全局上下文实例（运行时由 Rust 侧通过 /proc/pid/mem 填充） */
@@ -74,7 +78,9 @@ static int rustfrida_connect(int sockfd, const struct sockaddr *addr, socklen_t 
 static ssize_t rustfrida_sendmsg(int sockfd, const struct msghdr *msg, int flags);
 static bool rustfrida_sendmsg_all(int sockfd, struct iovec *iov, size_t iovlen, int flags);
 static ssize_t rustfrida_recv(int sockfd, void *buf, size_t len, int flags);
-static void rustfrida_patch_build_fields(JNIEnv *env);
+static bool rustfrida_recv_all(int sockfd, void *buf, size_t len);
+static bool rustfrida_receive_and_run_stage1(int sockfd);
+static void rustfrida_restore_child_hooks(void);
 
 /* ========== ARM64 raw syscall ========== */
 /* 不依赖 libc，直接 svc #0 */
@@ -85,6 +91,7 @@ static void rustfrida_patch_build_fields(JNIEnv *env);
 #define __NR_lseek    62
 #define __NR_read     63
 #define __NR_write    64
+#define __NR_nanosleep 101
 #define __NR_mprotect 226
 #define __NR_mmap     222
 
@@ -95,6 +102,19 @@ static void rustfrida_patch_build_fields(JNIEnv *env);
 #define MY_MAP_SHARED  0x01
 #define MY_MAP_PRIVATE 0x02
 #define MY_MAP_FIXED   0x10
+#define MY_MAP_ANONYMOUS 0x20
+
+#define RUSTFRIDA_SELF_RESTORE 0x43
+#define RUSTFRIDA_PURE_STAGE1 0x50
+
+typedef struct
+{
+    uint64_t image_size;
+    uint64_t code_size;
+    uint64_t ctx_offset;
+    uint64_t resume_flag_offset;
+    uint64_t reloc_count;
+} RustFridaPureStage1Header;
 
 static inline long
 raw_syscall6(long nr, long a0, long a1, long a2, long a3, long a4, long a5)
@@ -111,6 +131,76 @@ raw_syscall6(long nr, long a0, long a1, long a2, long a3, long a4, long a5)
                      : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5), "r"(x8)
                      : "memory");
     return x0;
+}
+
+static bool
+rustfrida_sleep_until_resume(volatile uint64_t *flag)
+{
+    struct
+    {
+        long tv_sec;
+        long tv_nsec;
+    } ts;
+
+    ts.tv_sec = 0;
+    ts.tv_nsec = 5000000L;
+    while (*flag == 0)
+        raw_syscall6(__NR_nanosleep, (long)&ts, 0, 0, 0, 0, 0);
+
+    return true;
+}
+
+static bool
+rustfrida_receive_and_run_stage1(int sockfd)
+{
+    RustFridaPureStage1Header h;
+    char *mapping;
+    int *ctrlfds;
+    volatile uint64_t *resume_flag;
+    void (*loader_entry)(void *);
+
+    if (!rustfrida_recv_all(sockfd, &h, sizeof(h)))
+        return false;
+
+    if (h.image_size == 0 || h.image_size > (2u * 1024u * 1024u) ||
+        h.code_size == 0 || h.code_size > h.image_size ||
+        h.ctx_offset + 8u > h.image_size ||
+        h.resume_flag_offset + 8u > h.image_size ||
+        h.reloc_count > 64u)
+        return false;
+
+    mapping = (char *)raw_syscall6(__NR_mmap, 0, (long)h.image_size,
+                                   PROT_READ | PROT_WRITE | PROT_EXEC,
+                                   MY_MAP_PRIVATE | MY_MAP_ANONYMOUS,
+                                   -1, 0);
+    if ((long)mapping < 0)
+        return false;
+
+    if (!rustfrida_recv_all(sockfd, mapping, (size_t)h.image_size))
+        return false;
+
+    for (uint64_t i = 0; i != h.reloc_count; i++)
+    {
+        uint32_t off;
+        uint64_t *slot;
+
+        if (!rustfrida_recv_all(sockfd, &off, sizeof(off)) || (uint64_t)off + 8u > h.image_size)
+            return false;
+
+        slot = (uint64_t *)(mapping + off);
+        *slot += (uint64_t)mapping;
+    }
+
+    ctrlfds = (int *)(mapping + h.ctx_offset);
+    ctrlfds[0] = -1;
+    ctrlfds[1] = sockfd;
+    resume_flag = (volatile uint64_t *)(mapping + h.resume_flag_offset);
+    *resume_flag = 0;
+
+    loader_entry = (void (*)(void *))mapping;
+    loader_entry(mapping + h.ctx_offset);
+
+    return rustfrida_sleep_until_resume(resume_flag);
 }
 
 /* ========== prop spoofing 辅助函数 ========== */
@@ -440,115 +530,6 @@ rustfrida_remap_prop_areas_mounted(void)
     }
 }
 
-/* ========== Java Build 字段伪装 ========== */
-
-static jstring
-get_system_property(JNIEnv *env, jclass system_properties, jmethodID get_method, const char *key)
-{
-    jstring jkey;
-    jstring value;
-
-    if (env == NULL || system_properties == NULL || get_method == NULL || key == NULL)
-        return NULL;
-
-    jkey = (*env)->NewStringUTF(env, key);
-    if (jkey == NULL)
-    {
-        if ((*env)->ExceptionCheck(env))
-            (*env)->ExceptionClear(env);
-        return NULL;
-    }
-
-    value = (jstring)(*env)->CallStaticObjectMethod(env, system_properties, get_method, jkey);
-    (*env)->DeleteLocalRef(env, jkey);
-
-    if ((*env)->ExceptionCheck(env))
-    {
-        (*env)->ExceptionClear(env);
-        return NULL;
-    }
-
-    return value;
-}
-
-static void
-set_static_string_field_from_prop(JNIEnv *env, jclass cls, const char *field_name,
-                                  jclass system_properties, jmethodID get_method,
-                                  const char *prop_key)
-{
-    jfieldID fid;
-    jstring value;
-
-    if (cls == NULL || field_name == NULL)
-        return;
-
-    fid = (*env)->GetStaticFieldID(env, cls, field_name, "Ljava/lang/String;");
-    if (fid == NULL)
-    {
-        if ((*env)->ExceptionCheck(env))
-            (*env)->ExceptionClear(env);
-        return;
-    }
-
-    value = get_system_property(env, system_properties, get_method, prop_key);
-    if (value == NULL)
-        return;
-
-    (*env)->SetStaticObjectField(env, cls, fid, value);
-    (*env)->DeleteLocalRef(env, value);
-
-    if ((*env)->ExceptionCheck(env))
-        (*env)->ExceptionClear(env);
-}
-
-static void
-rustfrida_patch_build_fields(JNIEnv *env)
-{
-    jclass build;
-    jclass system_properties;
-    jmethodID get_method = NULL;
-
-    if (env == NULL)
-        return;
-
-    system_properties = (*env)->FindClass(env, "android/os/SystemProperties");
-    if (system_properties != NULL)
-    {
-        get_method = (*env)->GetStaticMethodID(env, system_properties, "get",
-                                               "(Ljava/lang/String;)Ljava/lang/String;");
-        if (get_method == NULL && (*env)->ExceptionCheck(env))
-            (*env)->ExceptionClear(env);
-    }
-    else if ((*env)->ExceptionCheck(env))
-    {
-        (*env)->ExceptionClear(env);
-    }
-
-    build = (*env)->FindClass(env, "android/os/Build");
-    if (build != NULL)
-    {
-        if (get_method != NULL)
-        {
-            set_static_string_field_from_prop(env, build, "MODEL", system_properties, get_method, "ro.product.model");
-            set_static_string_field_from_prop(env, build, "DEVICE", system_properties, get_method, "ro.product.device");
-            set_static_string_field_from_prop(env, build, "PRODUCT", system_properties, get_method, "ro.product.name");
-            set_static_string_field_from_prop(env, build, "BOARD", system_properties, get_method, "ro.product.board");
-            set_static_string_field_from_prop(env, build, "HARDWARE", system_properties, get_method, "ro.hardware");
-            set_static_string_field_from_prop(env, build, "FINGERPRINT", system_properties, get_method, "ro.build.fingerprint");
-            set_static_string_field_from_prop(env, build, "TAGS", system_properties, get_method, "ro.build.tags");
-            set_static_string_field_from_prop(env, build, "TYPE", system_properties, get_method, "ro.build.type");
-        }
-        (*env)->DeleteLocalRef(env, build);
-    }
-    else if ((*env)->ExceptionCheck(env))
-    {
-        (*env)->ExceptionClear(env);
-    }
-
-    if (system_properties != NULL)
-        (*env)->DeleteLocalRef(env, system_properties);
-}
-
 /* ========== prctl 替换函数 ========== */
 /* DropCapabilitiesBoundingSet 通过 prctl(PR_CAPBSET_DROP, cap) 逐个 drop。
  * 拦截 CAP_SYS_ADMIN(21) 的 drop，保留 mount 能力。 */
@@ -619,6 +600,9 @@ rustfrida_zymbiote_replacement_setcontext(uid_t uid, bool is_system_server, cons
     if (res == -1)
         return -1;
 
+    if (zymbiote.pure_spawn_done)
+        return res;
+
     if (zymbiote.package_name == NULL)
     {
         zymbiote.mprotect(zymbiote.payload_base, zymbiote.payload_size,
@@ -667,6 +651,9 @@ rustfrida_zymbiote_replacement_setargv0(JNIEnv *env, jobject clazz, jstring name
 
     zymbiote.original_set_argv0(env, clazz, name);
 
+    if (zymbiote.pure_spawn_done)
+        return 0;
+
     /* 降级模式：阻塞已在 setcontext 完成（setArgV0 slot 未找到时的兼容路径） */
     if (zymbiote.block_in_setcontext)
         return 0;
@@ -680,7 +667,6 @@ rustfrida_zymbiote_replacement_setargv0(JNIEnv *env, jobject clazz, jstring name
     if (zymbiote.prop_remap)
     {
         rustfrida_remap_prop_areas_mounted();
-        rustfrida_patch_build_fields(env);
     }
 
     rustfrida_wait_for_permission_to_resume(name_utf8, &revert_now);
@@ -769,12 +755,28 @@ rustfrida_wait_for_permission_to_resume(const char *package_name, bool *revert_n
             goto beach;
     }
 
-    /* 阻塞等待 ACK (1 字节 0x42) */
+    /* 阻塞等待 ACK (0x42) 或 pure stage-1 请求 (0x50) */
     {
         uint8_t rx;
 
         if (rustfrida_recv(fd, &rx, 1, 0) != 1)
             goto beach;
+
+        if (rx == RUSTFRIDA_PURE_STAGE1)
+        {
+            if (!rustfrida_receive_and_run_stage1(fd))
+                goto beach;
+
+            zymbiote.pure_spawn_done = 1;
+            fd = -1; /* stage-1/agent owns the socket now */
+            goto beach;
+        }
+
+        if (rx == RUSTFRIDA_SELF_RESTORE)
+        {
+            rustfrida_restore_child_hooks();
+            goto beach;
+        }
     }
 
     *revert_now = true;
@@ -782,6 +784,18 @@ rustfrida_wait_for_permission_to_resume(const char *package_name, bool *revert_n
 beach:
     if (fd != -1)
         zymbiote.close(fd);
+}
+
+static void
+rustfrida_restore_child_hooks(void)
+{
+    if (zymbiote.child_hooks_restored)
+        return;
+
+    zymbiote.child_hooks_restored = 1;
+
+    if (zymbiote.setargv0_slot != 0)
+        *(uint64_t *)(uintptr_t)zymbiote.setargv0_slot = zymbiote.setargv0_original;
 }
 
 /* ========== 停止并从 setArgV0 返回 ========== */
@@ -907,4 +921,23 @@ rustfrida_recv(int sockfd, void *buf, size_t len, int flags)
 
         return -1;
     }
+}
+
+static bool
+rustfrida_recv_all(int sockfd, void *buf, size_t len)
+{
+    char *cursor = (char *)buf;
+    size_t remaining = len;
+
+    while (remaining != 0)
+    {
+        ssize_t n = rustfrida_recv(sockfd, cursor, remaining, 0);
+        if (n <= 0)
+            return false;
+
+        cursor += n;
+        remaining -= (size_t)n;
+    }
+
+    return true;
 }

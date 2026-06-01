@@ -19,7 +19,12 @@ git submodule update --init --recursive
 
 ## 构建
 
-最终产物 `rustfrida` 通过 `include_bytes!` 内嵌了 loader shellcode 和 agent SO，有严格的**构建顺序**：
+当前有两种主程序构建，二者都会输出名为 `rustfrida` 的 Android arm64 二进制：
+
+- 默认构建：带 ptrace backend，支持 PID/name attach、`--watch-so`、server、trace、普通 spawn 和 pure spawn。
+- `noptrace` 构建：编译期移除 ptrace 注入/远程调用/trace 后端，只保留属性命令和 `--spawn --spawn-pure` 自加载路径。
+
+最终产物 `rustfrida` 通过 `include_bytes!` 内嵌 loader blob 和 agent SO。agent 与 host 的 feature 必须匹配，`rust_frida/build.rs` 会读取 `libagent.features`，发现 stale 或 `noptrace` 不一致时直接报错并给出需要重跑的 `cargo build -p agent ...` 命令。
 
 ```
 loader shellcode  ──┐
@@ -27,44 +32,61 @@ loader shellcode  ──┐
 agent (libagent.so) ┘
 ```
 
-### 1. 构建 loader shellcode（bootstrapper + rustfrida-loader）
+### 1. 构建 loader blob（bootstrapper + rustfrida-loader）
 
 ```bash
-python3 build_helpers.py
+python3 loader/build_helpers.py
 # 输出:
 #   loader/build/bootstrapper.bin
 #   loader/build/rustfrida-loader.bin
 ```
 
-loader 是 bare-metal ARM64 shellcode，被 `rustfrida` 通过 `include_bytes!` 嵌入。**修改 loader C 代码后需重新运行此步。**
+loader 是 ARM64 shellcode，被 `rustfrida` 通过 `include_bytes!` 嵌入。修改 `loader/` 下 C 代码后需要重新生成；当前 `rust_frida/build.rs` 也会在发现 blob 缺失或落后时自动运行 `python3 loader/build_helpers.py`。
 
-### 2. 构建 agent（libagent.so）
+### 2. 默认 ptrace 构建
 
 ```bash
 cargo build -p agent --release
-# 输出: target/aarch64-linux-android/release/libagent.so
+cargo build -p rust_frida --release
 ```
 
-agent 是注入到目标进程的动态库，包含 hook 引擎、QuickJS、Java hook 等。**必须先于 rustfrida 构建**，因为 rustfrida 通过 `include_bytes!` 嵌入 agent SO。
+输出：
 
-### 3. 构建 rustfrida（主程序）
+```text
+target/aarch64-linux-android/release/libagent.so
+target/aarch64-linux-android/release/rustfrida
+```
+
+### 3. noptrace pure spawn 构建
 
 ```bash
-cargo build -p rust_frida --release
-# 输出: target/aarch64-linux-android/release/rustfrida
+cargo build -p agent --release --no-default-features --features quickjs,noptrace
+cargo build -p rust_frida --release --no-default-features --features noptrace
 ```
 
-rustfrida 内嵌了 `bootstrapper.bin` + `rustfrida-loader.bin` + `libagent.so`，是一个自包含的单文件。
+`noptrace` 版仍然内嵌同一个 loader blob，但 host 不会在目标 App 子进程中调用 `inject_via_bootstrapper()`，也不会读写子进程寄存器。host 只通过 zymbiote socket 传输 stage-1 loader、agent SO 和 pre-resume 脚本。
 
-### 2026-05-18 upstream 同步说明
+两套构建会覆盖同一路径。需要同时保留时，在第二套构建后手动改名：
 
-本分支已合入 upstream `v0.0.4` 的 PID attach 稳定性修复，并保留本分支的 spawn/wxshadow/QuickJS 修复。相关点需要一起理解：
+```bash
+cp target/aarch64-linux-android/release/rustfrida target/aarch64-linux-android/release/rustfrida-noptrace
+```
+
+### 当前实现状态
+
+本分支已合入 upstream `v0.0.4` 的 PID attach 稳定性修复，并新增 `--spawn-pure` / `noptrace` pure spawn 路径。相关点需要一起理解：
 
 - PID 注入会优先选择更适合远程调用的工作线程，并在 bootstrap/loader 执行期间短暂停止同进程其他线程，降低主线程或信号线程干扰。
 - host 侧通过 `/proc/<pid>/mem` 批量读写上下文，减少 ptrace word-write 的不稳定窗口。
 - agent memfd 会按 ELF LOAD 段的 `p_memsz` 进行 padding，loader 将完整段映射为文件支撑 VMA，避免单独匿名 BSS 尾段。
 - 自解析 linker 只索引必要平台模块，并继续使用本分支传入的 resolver host module bases，避免在加固 app 中扫描所有 app `.so`。
 - 当前 loader 同时兼容 `DEBUG`/`LOG` 诊断消息；协议值保持一致，避免破坏旧 host/loader 握手。
+- `--spawn-pure` 是 no-ptrace 子进程路径：zygote 里的 stage-0 payload 只负责阻塞子进程、接收 stage-1 loader 并跳转，loader 在 App 子进程内自链接 agent。
+- zymbiote stage-0 保持小载荷：不内置 ELF linker、QuickJS 或 hook engine；当前 payload 小于一页。
+- `noptrace` 构建只扫描和 patch `zygote64`，不再处理 32-bit zygote / usap；因此只支持 arm64 目标 App。
+- pure spawn 的 pre-resume 脚本统一通过 agent socket 发送；Java 主线程 eval 的 remote-agent 分支在 `noptrace` 下不可用。
+- `hello_entry()` 入口最前面安装 native early hook；不等待 JS、Java 初始化或 log writer。
+- child 侧会自行恢复继承到的 `setArgV0` 指针状态并直接回原流程；zygote 侧 patch 在 host 退出时统一清理。
 - 普通 `--spawn package` 默认走 late spawn：先恢复子进程，等待主线程回到 Looper idle 后再按 PID attach。这个模式不保证早期 hook，但更适合交互式 REPL。
 - `--spawn -l script.js` 默认走 early spawn：在 zygote/setcontext 阻塞窗口里注入并加载脚本，脚本完成后再恢复子进程，用于抢 `Application.onCreate` / `RegisterNatives` 等早期逻辑。
 - `--spawn-early` 可强制无脚本时也走 early spawn；这是诊断/特殊场景用法，稳定性弱于 late。
@@ -83,6 +105,18 @@ printf 'jseval 1+1\nexit\n' | adb shell su -c '/data/local/tmp/rf --spawn com.co
 ```
 
 预期结果是 agent 连接成功，`jsinit` 返回 `=> initialized`，`jseval 1+1` 返回 `=> 2`，退出时 zygote patch 和 QuickJS cleanup 正常完成。
+
+`noptrace` pure spawn smoke：
+
+```bash
+cargo build -p agent --release --no-default-features --features quickjs,noptrace
+cargo build -p rust_frida --release --no-default-features --features noptrace
+adb push target/aarch64-linux-android/release/rustfrida /data/local/tmp/rf-noptrace
+adb shell su -c 'chmod 755 /data/local/tmp/rf-noptrace'
+printf 'jseval 1+1\nexit\n' | adb shell su -c '/data/local/tmp/rf-noptrace --spawn com.coloros.note --spawn-pure -l /data/local/tmp/rf_smoke.js --verbose'
+```
+
+已在 Android 14 arm64 设备上验证 `com.coloros.note` 和 `com.bochk.app.aos` 的 pure spawn；`com.bochk.app.aos` 可在 pre-resume 脚本里监听 `RegisterNatives`，也验证过 `Hook.WXSHADOW` patch。
 
 ### 可选组件（单独构建）
 
@@ -129,28 +163,74 @@ git commit -m "Update tinycc submodule"
 
 ## 部署 & 运行
 
+下面的 `./rf` / `./rf-noptrace` 示例默认在 `adb shell su` 后的 `/data/local/tmp` 目录执行。
+
+默认 ptrace 版：
+
 ```bash
-adb push target/aarch64-linux-android/release/rustfrida /data/local/tmp/
+adb push target/aarch64-linux-android/release/rustfrida /data/local/tmp/rf
+adb shell su -c 'chmod 755 /data/local/tmp/rf'
 
 # PID 注入
-./rustfrida --pid <pid>
-./rustfrida --pid <pid> -l script.js
+./rf --pid <pid>
+./rf --pid <pid> -l script.js
 
 # Spawn 模式（启动时注入）
-./rustfrida --spawn com.example.app
-./rustfrida --spawn com.example.app -l script.js
-./rustfrida --spawn com.example.app --spawn-early
-./rustfrida --spawn com.example.app -l script.js --spawn-late
+./rf --spawn com.example.app
+./rf --spawn com.example.app -l script.js
+./rf --spawn com.example.app --spawn-early
+./rf --spawn com.example.app -l script.js --spawn-late
+./rf --spawn com.example.app --spawn-pure -l early.js
 
 # 等待 SO 加载后注入（eBPF）
-./rustfrida --watch-so libnative.so
+./rf --watch-so libnative.so
 
 # 详细日志
-./rustfrida --pid <pid> --verbose
+./rf --pid <pid> --verbose
 
 # 同步输出日志到文件（终端仍正常输出，文件为纯文本）
-./rustfrida --pid <pid> -l script.js -o /data/local/tmp/rustfrida.log
+./rf --pid <pid> -l script.js -o /data/local/tmp/rustfrida.log
 ```
+
+`noptrace` 版：
+
+```bash
+adb push target/aarch64-linux-android/release/rustfrida /data/local/tmp/rf-noptrace
+adb shell su -c 'chmod 755 /data/local/tmp/rf-noptrace'
+
+# 只支持 arm64 pure spawn；必须带 --spawn-pure
+./rf-noptrace --spawn com.example.app --spawn-pure
+./rf-noptrace --spawn com.example.app --spawn-pure -l /data/local/tmp/early.js
+./rf-noptrace --spawn com.example.app --spawn-pure --profile default
+
+# 属性快照/伪装命令仍可独立使用
+./rf-noptrace --dump-props default
+./rf-noptrace --set-prop default ro.debuggable=0
+```
+
+`noptrace` 构建不包含 `--pid`、`--name`、`--watch-so`、`--server`、trace 命令和 process remote-call 后端。需要这些能力时使用默认 ptrace 版。
+
+### no-ptrace 验证
+
+验证 pure spawn 是否触发 `ptrace`，不要用 `strace`，因为 `strace` 本身就是 ptrace。优先用 eBPF tracepoint/kprobe；设备没有 bpftrace 时可直接用 tracefs raw syscall 事件观察 arm64 `__NR_ptrace == 117`：
+
+```bash
+adb shell su -c '
+TRACE=/sys/kernel/tracing
+I=$TRACE/instances/rustfrida-ptrace
+mkdir -p $I
+echo 0 > $I/tracing_on
+echo > $I/trace
+echo "id == 117" > $I/events/raw_syscalls/sys_enter/filter
+echo 1 > $I/events/raw_syscalls/sys_enter/enable
+echo 1 > $I/tracing_on
+/data/local/tmp/rf-noptrace --spawn com.example.app --spawn-pure -l /data/local/tmp/early.js >/data/local/tmp/rf-run.log 2>&1
+echo 0 > $I/tracing_on
+cat $I/trace
+'
+```
+
+空 trace 或没有目标 `rustfrida`/App 相关记录，才算 no-ptrace 路径通过。只看日志里“没有 ptrace”不够。
 
 ### REPL 命令
 
@@ -166,17 +246,20 @@ exit                # 退出
 
 ## 快速上手
 
-最常见的工作流是：写一个 `script.js`，用 `-l` 加载到目标进程，然后通过日志、RPC 或文件把结果带出来。
+最常见的工作流是：写一个 `script.js`，用 `-l` 加载到目标进程，然后通过日志、RPC 或文件把结果带出来。默认 ptrace 版覆盖 attach 和 spawn；`noptrace` 版只走 `--spawn --spawn-pure`。
 
 ```bash
 # 已运行的进程
-./rustfrida --pid <pid> -l script.js
+./rf --pid <pid> -l script.js
 
 # 从启动阶段注入，适合抓 Application / ClassLoader 初始化
-./rustfrida --spawn com.example.app -l script.js
+./rf --spawn com.example.app -l script.js
 
-# 先进入交互，再手动 loadjs / jseval
-./rustfrida --pid <pid>
+# no-ptrace pure spawn，从 zygote64 子进程内自加载 agent
+./rf-noptrace --spawn com.example.app --spawn-pure -l script.js
+
+# 先进入交互，再手动 loadjs / jseval（默认 ptrace 版）
+./rf --pid <pid>
 ```
 
 最小脚本：
@@ -203,6 +286,8 @@ Java.ready(function() {
 | 监控 JNI 注册 | `Jni` + native hook | `Jni.addr("RegisterNatives")` |
 | 远程触发脚本能力 | HTTP RPC | `rpc.exports = { ... }` |
 | 采集指令 trace 用于回放分析 | `qbdi` | `registerTraceCallbacks()` |
+
+`noptrace` 构建中的脚本 API 仍来自同一个 agent，但 host 侧去掉了 ptrace attach、process remote-call、trace 命令和相关帮助文案；脚本要在恢复前执行时，统一通过 agent socket 发送。
 
 ### 常见场景
 
@@ -322,7 +407,7 @@ rpc.exports = {
 
 ```bash
 adb forward tcp:9191 tcp:9191
-./rustfrida --pid <pid> -l script.js --rpc-port 9191
+./rf --pid <pid> -l script.js --rpc-port 9191
 curl -X POST http://127.0.0.1:9191/rpc/0/ping
 ```
 
@@ -341,16 +426,18 @@ curl -X POST http://127.0.0.1:9191/rpc/0/ping
 
 脚本里用 Frida 风格的 `rpc.exports` 注册方法，host 端通过 HTTP POST 调用，返回值会 `JSON.stringify` 后透传回来。适合把 agent 当成一个常驻服务用——UI、自动化脚本、测试框架都可以直接 `curl` 触发。
 
+HTTP RPC 主要面向默认 ptrace 构建的 legacy/session 使用方式；`noptrace` 构建没有 server 和 process remote-call 后端。
+
 ### 启动
 
 在 legacy 单会话或 `--server` 多会话模式下，加上 `--rpc-port` 即可启动 HTTP 服务器。参数可以是纯端口号（默认绑 `0.0.0.0`），也可以是完整地址：
 
 ```bash
 # legacy 模式：attach + 加载脚本 + 开 RPC 端口
-./rustfrida --pid 1234 -l rpc_test.js --rpc-port 9191
+./rf --pid 1234 -l rpc_test.js --rpc-port 9191
 
 # server 模式：多 session 共享同一个 RPC 端口，按 session id 路由
-./rustfrida --server --rpc-port 127.0.0.1:9191
+./rf --server --rpc-port 127.0.0.1:9191
 
 # 本机访问通过 adb forward 最简单
 adb forward tcp:9191 tcp:9191
@@ -758,6 +845,8 @@ hook(target, callback, Hook.RECOMP)     // 2: 代码页重编译，仅 4B patch
 hook(target, callback, 1)               // 数字也行
 hook(target, callback, true)            // true = WXSHADOW
 ```
+
+`--spawn-pure` 本身不依赖 WXSHADOW；WXSHADOW 是 agent 侧安装 native hook 时的 stealth patch 模式。设备内核需要支持对应 shadow 页能力，严格 stealth 场景下失败会直接返回错误，避免静默退回普通 mprotect 直写。
 
 ### API 速查
 

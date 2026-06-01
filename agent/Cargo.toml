@@ -9,6 +9,7 @@ default = ["quickjs"]
 frida-gum = ["dep:frida-gum"]
 qbdi = ["quickjs-hook?/qbdi"]
 quickjs = ["dep:quickjs-hook"]
+noptrace = []
 
 [dependencies]
 frida-gum = { path = "../frida-gum", features = [

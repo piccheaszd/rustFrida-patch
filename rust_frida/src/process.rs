@@ -1,21 +1,35 @@
 #![cfg(all(target_os = "android", target_arch = "aarch64"))]
 
+#[cfg(not(feature = "noptrace"))]
 use libc::{c_int, c_void, iovec, pid_t, PTRACE_CONT, PTRACE_GETREGSET, PTRACE_SETREGSET};
+#[cfg(not(feature = "noptrace"))]
 use nix::errno::Errno;
+#[cfg(not(feature = "noptrace"))]
 use nix::sys::ptrace;
+#[cfg(not(feature = "noptrace"))]
 use nix::sys::signal::Signal;
+#[cfg(not(feature = "noptrace"))]
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+#[cfg(not(feature = "noptrace"))]
 use nix::unistd::Pid;
 use std::fs::File;
+#[cfg(not(feature = "noptrace"))]
 use std::mem::size_of_val;
 use std::path::Path;
+#[cfg(not(feature = "noptrace"))]
 use std::process;
+#[cfg(not(feature = "noptrace"))]
 use std::time::{Duration, Instant};
 
+use crate::log_warn;
+#[cfg(not(feature = "noptrace"))]
 use crate::types::{UserFpRegs, UserRegs};
-use crate::{log_info, log_success, log_verbose, log_warn};
+#[cfg(not(feature = "noptrace"))]
+use crate::{log_info, log_success, log_verbose};
 
+#[cfg(not(feature = "noptrace"))]
 const PTRACE_SEIZE_RAW: c_int = 0x4206;
+#[cfg(not(feature = "noptrace"))]
 const PTRACE_INTERRUPT_RAW: c_int = 0x4207;
 
 /// 获取指定库的基址
@@ -73,6 +87,7 @@ fn find_map_line_for_addr(pid: i32, addr: u64) -> Option<String> {
 
 /// 解冻 cgroup v2 freezer（Android 12+ 会冻结后台进程）
 /// 冻结状态下 ptrace attach 的 SIGSTOP 无法送达，waitpid 会永远阻塞。
+#[cfg(not(feature = "noptrace"))]
 fn thaw_cgroup_freezer(pid: i32) {
     // cgroup v2 freezer 路径格式：/sys/fs/cgroup/<slice>/uid_<uid>/pid_<pid>/cgroup.freeze
     let cgroup_path = format!("/proc/{}/cgroup", pid);
@@ -96,6 +111,7 @@ fn thaw_cgroup_freezer(pid: i32) {
     }
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn ptrace_stop_confirmed(pid: i32) -> bool {
     let status_path = format!("/proc/{}/status", pid);
     let status = match std::fs::read_to_string(status_path) {
@@ -118,6 +134,7 @@ fn ptrace_stop_confirmed(pid: i32) -> bool {
     stopped && traced_by_self
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn ptrace_traced_by_self(pid: i32) -> bool {
     let status_path = format!("/proc/{}/status", pid);
     let status = match std::fs::read_to_string(status_path) {
@@ -133,6 +150,7 @@ fn ptrace_traced_by_self(pid: i32) -> bool {
     })
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn proc_tgid(tid: i32) -> Option<i32> {
     let status_path = format!("/proc/{}/status", tid);
     let status = std::fs::read_to_string(status_path).ok()?;
@@ -143,6 +161,7 @@ fn proc_tgid(tid: i32) -> Option<i32> {
     })
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn signal_thread_group(tid: i32, signal: libc::c_int) {
     let tgid = proc_tgid(tid).unwrap_or(tid);
     unsafe {
@@ -150,6 +169,7 @@ fn signal_thread_group(tid: i32, signal: libc::c_int) {
     }
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn ptrace_raw(request: c_int, pid: i32, data: usize) -> Result<(), Errno> {
     let result = unsafe {
         libc::ptrace(
@@ -166,6 +186,7 @@ fn ptrace_raw(request: c_int, pid: i32, data: usize) -> Result<(), Errno> {
     }
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn ptrace_status_summary(pid: i32) -> String {
     let status_path = format!("/proc/{}/status", pid);
     let status = match std::fs::read_to_string(status_path) {
@@ -186,6 +207,7 @@ fn ptrace_status_summary(pid: i32) -> String {
     format!("State={}, TracerPid={}", state, tracer)
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn read_task_text(tgid: i32, tid: i32, name: &str) -> String {
     std::fs::read_to_string(format!("/proc/{}/task/{}/{}", tgid, tid, name))
         .unwrap_or_default()
@@ -193,6 +215,7 @@ fn read_task_text(tgid: i32, tid: i32, name: &str) -> String {
         .replace('\0', "\\0")
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn task_state_from_status(status: &str) -> String {
     status
         .lines()
@@ -200,6 +223,7 @@ fn task_state_from_status(status: &str) -> String {
         .unwrap_or_else(|| "<unknown>".to_string())
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn truncate_proc_field(value: &str, max_len: usize) -> String {
     let mut out = String::new();
     for ch in value.chars().take(max_len) {
@@ -211,6 +235,7 @@ fn truncate_proc_field(value: &str, max_len: usize) -> String {
     out
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn map_line_is_executable(line: &str) -> bool {
     line.split_whitespace()
         .nth(1)
@@ -218,6 +243,7 @@ fn map_line_is_executable(line: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(not(feature = "noptrace"))]
 #[derive(Debug, Clone)]
 pub(crate) struct ThreadStopSample {
     pub(crate) tid: i32,
@@ -233,6 +259,7 @@ pub(crate) struct ThreadStopSample {
     pub(crate) lr_map: Option<String>,
 }
 
+#[cfg(not(feature = "noptrace"))]
 impl ThreadStopSample {
     pub(crate) fn pc_is_executable(&self) -> bool {
         self.pc_map.as_deref().map(map_line_is_executable).unwrap_or(false)
@@ -258,6 +285,7 @@ impl ThreadStopSample {
 /// Stop a single thread with PTRACE_SEIZE/PTRACE_INTERRUPT, sample its user
 /// registers and procfs state, then detach immediately. This is diagnostic
 /// selection only; the real injection attach still happens later.
+#[cfg(not(feature = "noptrace"))]
 pub(crate) fn sample_thread_stop_point(tgid: i32, tid: i32, timeout: Duration) -> Result<ThreadStopSample, String> {
     let comm = read_task_text(tgid, tid, "comm");
     let status = read_task_text(tgid, tid, "status");
@@ -309,6 +337,7 @@ pub(crate) fn sample_thread_stop_point(tgid: i32, tid: i32, timeout: Duration) -
     sample_result
 }
 
+#[cfg(not(feature = "noptrace"))]
 pub(crate) fn attach_to_process(pid: i32) -> Result<(), String> {
     let target_pid = Pid::from_raw(pid);
 
@@ -401,11 +430,13 @@ pub(crate) fn attach_to_process(pid: i32) -> Result<(), String> {
     }
 }
 
+#[cfg(not(feature = "noptrace"))]
 pub(crate) fn get_registers_pub(pid: i32) -> Result<UserRegs, String> {
     get_registers(pid)
 }
 
 /// 获取进程寄存器
+#[cfg(not(feature = "noptrace"))]
 fn get_registers(pid: i32) -> Result<UserRegs, String> {
     let mut regs = UserRegs::default();
     let mut iov = iovec {
@@ -429,6 +460,7 @@ fn get_registers(pid: i32) -> Result<UserRegs, String> {
 }
 
 /// 设置进程寄存器
+#[cfg(not(feature = "noptrace"))]
 fn set_registers(pid: i32, regs: &UserRegs) -> Result<(), String> {
     let mut iov = iovec {
         iov_base: regs as *const _ as *mut c_void,
@@ -443,6 +475,7 @@ fn set_registers(pid: i32, regs: &UserRegs) -> Result<(), String> {
 }
 
 /// 获取 FP/SIMD 寄存器 (NT_FPREGSET = 2)
+#[cfg(not(feature = "noptrace"))]
 fn get_fp_registers(pid: i32) -> Result<UserFpRegs, String> {
     let mut regs = UserFpRegs::default();
     let mut iov = iovec {
@@ -465,6 +498,7 @@ fn get_fp_registers(pid: i32) -> Result<UserFpRegs, String> {
 }
 
 /// 设置 FP/SIMD 寄存器 (NT_FPREGSET = 2)
+#[cfg(not(feature = "noptrace"))]
 fn set_fp_registers(pid: i32, regs: &UserFpRegs) -> Result<(), String> {
     let mut iov = iovec {
         iov_base: regs as *const _ as *mut c_void,
@@ -478,6 +512,7 @@ fn set_fp_registers(pid: i32, regs: &UserFpRegs) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn restore_registers(pid: i32, regs: &UserRegs, fp_regs: Option<&UserFpRegs>) -> Result<(), String> {
     set_registers(pid, regs)?;
     if let Some(fp) = fp_regs {
@@ -486,6 +521,7 @@ fn restore_registers(pid: i32, regs: &UserRegs, fp_regs: Option<&UserFpRegs>) ->
     Ok(())
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn restore_registers_best_effort(pid: i32, regs: &UserRegs, fp_regs: Option<&UserFpRegs>, context: &str) {
     if let Err(e) = restore_registers(pid, regs, fp_regs) {
         log_warn!("{}: 恢复寄存器失败: {}", context, e);
@@ -502,6 +538,7 @@ fn restore_registers_best_effort(pid: i32, regs: &UserRegs, fp_regs: Option<&Use
 /// # 返回值
 /// * `Ok(usize)` - 函数返回值
 /// * `Err(String)` - 错误信息
+#[cfg(not(feature = "noptrace"))]
 pub(crate) fn call_target_function(
     pid: i32,
     func_addr: usize,
@@ -515,6 +552,7 @@ pub(crate) fn call_target_function(
 ///
 /// 目标函数返回后会跳到 `return_trap_addr`。调用方应在该地址放置 `brk`
 /// 等会产生 SIGTRAP 的指令，避免使用无效 LR 制造 SIGSEGV。
+#[cfg(not(feature = "noptrace"))]
 pub(crate) fn call_target_function_with_return_trap(
     pid: i32,
     func_addr: usize,
@@ -524,6 +562,7 @@ pub(crate) fn call_target_function_with_return_trap(
     call_target_function_impl(pid, func_addr, args, None, Some(return_trap_addr))
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn call_target_function_impl(
     pid: i32,
     func_addr: usize,
@@ -777,6 +816,7 @@ fn call_target_function_impl(
 /// * `addr` - 目标地址
 /// * `data` - 要写入的数据指针
 /// * `size` - 数据大小（字节数）
+#[cfg(not(feature = "noptrace"))]
 fn write_remote_mem(pid: i32, addr: usize, data: *const u8, size: usize) -> Result<(), String> {
     // 去掉 MTE 标签位（高 byte），ptrace 不支持带标签的地址
     let addr = addr & 0x00FFFFFFFFFFFFFF;
@@ -844,6 +884,7 @@ fn write_remote_mem(pid: i32, addr: usize, data: *const u8, size: usize) -> Resu
 /// * `pid` - 目标进程ID
 /// * `addr` - 目标地址
 /// * `data` - 要写入的字节数组
+#[cfg(not(feature = "noptrace"))]
 pub(crate) fn write_bytes(pid: i32, addr: usize, data: &[u8]) -> Result<(), String> {
     write_remote_mem(pid, addr, data.as_ptr(), data.len())
 }
@@ -854,6 +895,7 @@ pub(crate) fn write_bytes(pid: i32, addr: usize, data: &[u8]) -> Result<(), Stri
 /// * `pid` - 目标进程ID
 /// * `addr` - 目标地址
 /// * `size` - 读取字节数
+#[cfg(not(feature = "noptrace"))]
 pub(crate) fn read_remote_mem(pid: i32, addr: usize, size: usize) -> Result<Vec<u8>, String> {
     let addr = addr & 0x00FFFFFFFFFFFFFF; // 去掉 MTE 标签位
     let mut result = vec![0u8; size];
@@ -894,6 +936,7 @@ pub(crate) fn read_remote_mem(pid: i32, addr: usize, size: usize) -> Result<Vec<
 /// # 参数
 /// * `pid` - 目标进程ID
 /// * `addr` - 目标地址（目标进程中的内存地址）
+#[cfg(not(feature = "noptrace"))]
 pub(crate) fn read_memory<T: Default>(pid: i32, addr: usize) -> Result<T, String> {
     let bytes = read_remote_mem(pid, addr, std::mem::size_of::<T>())?;
     let mut val = T::default();

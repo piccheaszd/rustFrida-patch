@@ -28,19 +28,22 @@ impl QuickJsProfile {
 
 /// 命令行参数结构体
 #[derive(Parser, Debug)]
-#[command(
+#[cfg_attr(
+    not(feature = "noptrace"),
+    command(
     author,
     version,
-    about = "ARM64 Android 动态插桩工具，通过 ptrace 注入 agent.so，支持 QuickJS 脚本/inline hook/Frida Stalker",
+    about = "ARM64 Android 动态插桩工具，支持 ptrace 注入和 pure spawn 自加载 agent",
     long_about = "\
-ARM64 Android 动态插桩工具。通过 ptrace 注入 agent.so 到目标进程，支持 QuickJS 脚本执行、\
-inline hook、Frida Stalker 追踪等功能。
+ARM64 Android 动态插桩工具。支持 ptrace 注入 agent.so 或 pure spawn 自加载 agent，\
+支持 QuickJS 脚本执行、inline hook、Frida Stalker 追踪等功能。
 
 常见用法:
   rustfrida --pid 1234                         # 注入到指定 PID
   rustfrida --name com.example.app             # 按进程名注入
   rustfrida --watch-so libnative.so            # 等待 SO 加载后自动注入
   rustfrida --spawn com.example.app            # 普通 Spawn：冷启动后再按 PID attach，适合 REPL
+  rustfrida --spawn com.example.app --spawn-pure # Pure Spawn：子进程自加载 loader/agent，不 ptrace 子进程
   rustfrida --spawn com.example.app -l early.js # Early Spawn：恢复前加载脚本，抢早期 hook
   rustfrida --spawn com.example.app --spawn-early # 强制恢复前注入（无脚本也 early）
   rustfrida --spawn com.example.app -l hook.js --spawn-late # 强制冷启动后加载脚本
@@ -59,6 +62,32 @@ Server daemon 模式（多 session 并发）:
 
 注入后进入 REPL，输入 help 查看可用命令（jsinit / loadjs / jsrepl / jhook 等）。",
     group(ArgGroup::new("target").required(true).args(["pid", "watch_so", "name", "spawn", "dump_props", "set_prop", "del_prop", "repack_props", "server"]))
+    )
+)]
+#[cfg_attr(
+    feature = "noptrace",
+    command(
+        author,
+        version,
+        about = "ARM64 Android pure spawn 动态插桩工具，无 ptrace backend",
+        long_about = "\
+ARM64 Android pure spawn 动态插桩工具。子进程从 zymbiote socket 接收 stage-1 loader、agent.so 和脚本，\
+不使用 ptrace 修改目标进程寄存器或内存。
+
+常见用法:
+  rustfrida --spawn com.example.app --spawn-pure                 # Pure Spawn：子进程自加载 loader/agent
+  rustfrida --spawn com.example.app --spawn-pure -l early.js      # 恢复前通过 agent socket 加载脚本
+  rustfrida --spawn com.app --spawn-pure --profile default        # Pure Spawn 并应用属性 profile
+
+属性伪装:
+  rustfrida --dump-props default
+  rustfrida --set-prop default ro.build.fingerprint=google/...
+  rustfrida --del-prop default ro.debuggable
+  rustfrida --repack-props default
+
+注入后进入 REPL，输入 help 查看可用命令（trace/ptrace 相关命令不可用）。",
+        group(ArgGroup::new("target").required(true).args(["spawn", "dump_props", "set_prop", "del_prop", "repack_props"]))
+    )
 )]
 pub(crate) struct Args {
     /// 目标进程的PID（与 --watch-so、--name、--spawn 互斥）
@@ -69,27 +98,40 @@ pub(crate) struct Args {
         allow_hyphen_values = true,
         value_parser = parse_pid
     )]
+    #[cfg_attr(feature = "noptrace", arg(hide = true))]
     pub(crate) pid: Option<i32>,
 
     /// 监听指定 SO 路径加载，自动附加到加载该 SO 的进程（需要 ldmonitor eBPF 组件：cargo build -p ldmonitor）
     #[arg(short = 'w', long = "watch-so", conflicts_with_all = ["name", "spawn"])]
+    #[cfg_attr(feature = "noptrace", arg(hide = true))]
     pub(crate) watch_so: Option<String>,
 
     /// 按进程名注入（与 --pid、--watch-so、--spawn 互斥）
     #[arg(short = 'n', long = "name", conflicts_with = "spawn")]
+    #[cfg_attr(feature = "noptrace", arg(hide = true))]
     pub(crate) name: Option<String>,
 
     /// Spawn 模式：不带 -l 时冷启动后再 attach；带 -l 时默认恢复前加载脚本，确保能 hook 到 Application.onCreate() 等早期代码
     #[arg(short = 'f', long = "spawn")]
+    #[cfg_attr(
+        feature = "noptrace",
+        arg(help = "Spawn 目标包名；noptrace 构建下需配合 --spawn-pure")
+    )]
     pub(crate) spawn: Option<String>,
 
     /// Spawn early 模式：即使不带 -l，也在子进程恢复前注入（抢早期窗口，稳定性弱于 late）
     #[arg(long = "spawn-early", requires = "spawn", conflicts_with = "spawn_late")]
+    #[cfg_attr(feature = "noptrace", arg(hide = true))]
     pub(crate) spawn_early: bool,
 
     /// Spawn late 模式：即使带 -l，也先恢复 App，等待主线程进入 Looper 后再按 PID attach（稳定优先，不保证早期 hook）
     #[arg(long = "spawn-late", requires = "spawn", conflicts_with = "spawn_early")]
+    #[cfg_attr(feature = "noptrace", arg(hide = true))]
     pub(crate) spawn_late: bool,
+
+    /// Pure Spawn 模式：子进程从 zymbiote socket 接收 loader/agent 并自加载，不调用 ptrace 注入子进程
+    #[arg(long = "spawn-pure", requires = "spawn", conflicts_with = "spawn_late")]
+    pub(crate) spawn_pure: bool,
 
     /// 监听超时时间（秒），默认无限等待
     #[arg(short = 't', long = "timeout")]
@@ -172,6 +214,10 @@ pub(crate) struct Args {
 
     /// 指定属性覆盖 profile（--spawn 或 --server 模式可用）
     #[arg(long = "profile", value_name = "NAME")]
+    #[cfg_attr(
+        feature = "noptrace",
+        arg(help = "指定属性覆盖 profile（--spawn --spawn-pure 模式可用）")
+    )]
     pub(crate) profile: Option<String>,
 
     /// Server daemon 模式：多 session 并发 spawn/inject，profile 持续生效
@@ -179,6 +225,7 @@ pub(crate) struct Args {
     /// 启动后进入 server REPL，支持同时管理多个注入 session。
     /// 配合 --profile 使用可在整个 server 生命周期内持续生效。
     #[arg(long = "server", conflicts_with_all = ["pid", "watch_so", "name", "spawn"])]
+    #[cfg_attr(feature = "noptrace", arg(hide = true))]
     pub(crate) server: bool,
 
     /// 启动 HTTP RPC 服务器，暴露 agent 端 `rpc.exports` 注册的方法。

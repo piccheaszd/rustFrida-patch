@@ -8,9 +8,11 @@ mod logger;
 mod proc_mem;
 mod process;
 mod props;
+#[cfg(not(feature = "noptrace"))]
 mod remote_agent;
 mod repl;
 mod selinux;
+#[cfg(not(feature = "noptrace"))]
 mod server;
 mod session;
 mod spawn;
@@ -42,7 +44,9 @@ use clap::Parser;
 #[cfg(feature = "qbdi")]
 use communication::send_qbdi_helper;
 use communication::{send_command, start_socketpair_handler};
-use injection::{inject_via_bootstrapper, watch_and_inject, InjectionResult};
+use injection::InjectionResult;
+#[cfg(not(feature = "noptrace"))]
+use injection::{inject_via_bootstrapper, watch_and_inject};
 use process::find_pid_by_name;
 use repl::{
     load_script_file, load_script_file_pre_resume, print_eval_result, print_help, rewrite_jseval_for_agent,
@@ -145,8 +149,16 @@ fn main() {
 
     // ── Server daemon 模式 ──
     if args.server {
-        server::run_server(&args);
-        return;
+        #[cfg(feature = "noptrace")]
+        {
+            log_error!("当前为 noptrace 构建，--server 依赖 ptrace 注入 backend；请使用 --spawn-pure");
+            std::process::exit(1);
+        }
+        #[cfg(not(feature = "noptrace"))]
+        {
+            server::run_server(&args);
+            return;
+        }
     }
 
     // ── 以下为 legacy 单 session 模式 ──
@@ -196,7 +208,8 @@ fn main() {
     //   be installed before Application.onCreate()/RegisterNatives.
     // - plain `--spawn package` defaults to late attach for a stable REPL.
     // - `--spawn-early` and `--spawn-late` force either side explicitly.
-    let spawn_pre_resume = args.spawn.is_some() && !args.spawn_late && (args.load_script.is_some() || args.spawn_early);
+    let spawn_pre_resume = args.spawn.is_some()
+        && (args.spawn_pure || (!args.spawn_late && (args.load_script.is_some() || args.spawn_early)));
 
     // 根据参数选择注入方式，返回 (target_pid, host_fd)
     let (target_pid, injection): (Option<i32>, InjectionResult) = if let Some(ref package) = args.spawn {
@@ -204,9 +217,25 @@ fn main() {
         spawn::register_cleanup_handler();
         // Spawn 模式：注入 Zygote 后启动 App
         let spawn_timeout = args.timeout.unwrap_or(20).max(1);
-        let spawn_result = if spawn_pre_resume {
+        let spawn_result = if args.spawn_pure {
+            spawn::spawn_pure(package, spawn_timeout, &string_overrides)
+        } else if spawn_pre_resume {
+            #[cfg(feature = "noptrace")]
+            {
+                log_error!("当前为 noptrace 构建，--spawn early 需要 ptrace backend；请使用 --spawn-pure");
+                spawn::cleanup_zygote_patches();
+                std::process::exit(1);
+            }
+            #[cfg(not(feature = "noptrace"))]
             spawn::spawn_and_inject(package, spawn_timeout, &string_overrides)
         } else {
+            #[cfg(feature = "noptrace")]
+            {
+                log_error!("当前为 noptrace 构建，--spawn late 需要 ptrace backend；请使用 --spawn-pure");
+                spawn::cleanup_zygote_patches();
+                std::process::exit(1);
+            }
+            #[cfg(not(feature = "noptrace"))]
             spawn::spawn_resume_then_inject(package, spawn_timeout, &string_overrides)
         };
         match spawn_result {
@@ -218,28 +247,46 @@ fn main() {
             }
         }
     } else if let Some(so_pattern) = &args.watch_so {
-        // 使用 eBPF 监听 SO 加载
-        if let Err(e) = crate::selinux::patch_selinux() {
-            log_warn!("SELinux patch 失败（非致命）: {}", e);
+        #[cfg(feature = "noptrace")]
+        {
+            let _ = so_pattern;
+            log_error!("当前为 noptrace 构建，--watch-so 需要 ptrace 注入 backend");
+            std::process::exit(1);
         }
-        match watch_and_inject(so_pattern, args.timeout, &string_overrides) {
-            Ok(result) => (Some(result.target_pid), result),
-            Err(e) => {
-                log_error!("注入失败: {}", e);
-                std::process::exit(1);
+        #[cfg(not(feature = "noptrace"))]
+        {
+            // 使用 eBPF 监听 SO 加载
+            if let Err(e) = crate::selinux::patch_selinux() {
+                log_warn!("SELinux patch 失败（非致命）: {}", e);
+            }
+            match watch_and_inject(so_pattern, args.timeout, &string_overrides) {
+                Ok(result) => (Some(result.target_pid), result),
+                Err(e) => {
+                    log_error!("注入失败: {}", e);
+                    std::process::exit(1);
+                }
             }
         }
     } else if let Some(pid) = resolved_pid {
-        // 直接附加到指定 PID（来自 --pid 或 --name 解析结果）
-        // 注入前 patch SELinux policy，确保目标进程能读写 memfd
-        if let Err(e) = crate::selinux::patch_selinux() {
-            log_warn!("SELinux patch 失败（非致命）: {}", e);
+        #[cfg(feature = "noptrace")]
+        {
+            let _ = pid;
+            log_error!("当前为 noptrace 构建，--pid/--name 需要 ptrace 注入 backend；请使用 --spawn-pure");
+            std::process::exit(1);
         }
-        match inject_via_bootstrapper(pid, &string_overrides) {
-            Ok(result) => (Some(pid), result),
-            Err(e) => {
-                log_error!("注入失败: {}", e);
-                std::process::exit(1);
+        #[cfg(not(feature = "noptrace"))]
+        {
+            // 直接附加到指定 PID（来自 --pid 或 --name 解析结果）
+            // 注入前 patch SELinux policy，确保目标进程能读写 memfd
+            if let Err(e) = crate::selinux::patch_selinux() {
+                log_warn!("SELinux patch 失败（非致命）: {}", e);
+            }
+            match inject_via_bootstrapper(pid, &string_overrides) {
+                Ok(result) => (Some(pid), result),
+                Err(e) => {
+                    log_error!("注入失败: {}", e);
+                    std::process::exit(1);
+                }
             }
         }
     } else {
@@ -299,7 +346,7 @@ fn main() {
             log_warn!("  3. 使用 --verbose 重新运行查看详细注入日志");
             log_warn!("  4. adb logcat | grep rustFrida  （查看 agent 日志）");
             if let Some(pid) = target_pid {
-                if spawn_pre_resume {
+                if spawn_pre_resume && !args.spawn_pure {
                     let _ = spawn::resume_child(pid as u32);
                 }
             }
@@ -355,7 +402,13 @@ fn main() {
                 }
             }
             // resume: hook 已就位，恢复子进程
-            if let Err(e) = spawn::resume_child(pid as u32) {
+            if args.spawn_pure {
+                if let Err(e) = send_command(sender, "__spawn_resume__") {
+                    log_error!("pure spawn 恢复命令发送失败: {}", e);
+                } else {
+                    spawn::wait_for_repl_ready(pid);
+                }
+            } else if let Err(e) = spawn::resume_child(pid as u32) {
                 log_error!("恢复子进程失败: {}", e);
             } else {
                 // 子进程刚恢复时 Android 往往仍处于 bindApplication / 首帧窗口初始化。

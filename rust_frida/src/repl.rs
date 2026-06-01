@@ -6,6 +6,8 @@ use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
 use rustyline::{CompletionType, Config, Context, Editor, Helper};
+#[cfg(not(feature = "noptrace"))]
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -24,65 +26,46 @@ fn script_filename(script_path: &str) -> String {
         .to_string()
 }
 
-fn parse_loadjs_payload_for_host(payload: &str) -> (&str, &str) {
-    if !payload.starts_with('[') {
-        return ("", payload);
-    }
-    let first_line_end = payload.find('\n').unwrap_or(payload.len());
-    let first_line = &payload[..first_line_end];
-    if !first_line.ends_with(']') {
-        return ("", payload);
-    }
-    let filename = &first_line[1..first_line.len() - 1];
-    if filename.is_empty() || filename.contains('[') || filename.contains(']') {
-        return ("", payload);
-    }
-    let script_start = if first_line_end < payload.len() {
-        first_line_end + 1
-    } else {
-        payload.len()
-    };
-    (filename, &payload[script_start..])
+#[cfg(not(feature = "noptrace"))]
+fn remote_main_thread_available(session: &Session) -> bool {
+    session.loader_ctx_addr.load(Ordering::Acquire) != 0
+        && session.agent_current_thread_eval_impl.load(Ordering::Acquire) != 0
 }
 
 pub(crate) fn try_loadjs_on_main_thread_if_java(session: &Session, line: &str) -> Result<bool, String> {
-    let Some(rest) = line
-        .strip_prefix("loadjs ")
-        .or_else(|| line.strip_prefix("loadjs\n"))
-        .or_else(|| line.strip_prefix("loadjs"))
-    else {
-        return Ok(false);
-    };
-    let (filename, script) = parse_loadjs_payload_for_host(rest);
-
-    if !script_uses_java_api(script) {
-        return Ok(false);
-    }
-
-    log_info!("检测到 Java loadjs，切到目标主线程执行");
-    crate::remote_agent::eval_js_on_main_thread(session, script, filename, true)
-        .map_err(|e| format!("主线程执行 loadjs 失败: {}", e))?;
-    Ok(true)
+    let _ = (session, line);
+    Ok(false)
 }
 
 pub(crate) fn try_jseval_on_main_thread_if_java(session: &Session, line: &str) -> Result<bool, String> {
-    let Some(expr) = line
-        .strip_prefix("jseval ")
-        .or_else(|| line.strip_prefix("jseval\n"))
-        .or_else(|| line.strip_prefix("jseval"))
-    else {
-        return Ok(false);
-    };
-
-    if !script_uses_java_api(expr) {
+    #[cfg(feature = "noptrace")]
+    {
+        let _ = (session, line);
         return Ok(false);
     }
+    #[cfg(not(feature = "noptrace"))]
+    {
+        if !remote_main_thread_available(session) {
+            return Ok(false);
+        }
+        let Some(expr) = line
+            .strip_prefix("jseval ")
+            .or_else(|| line.strip_prefix("jseval\n"))
+            .or_else(|| line.strip_prefix("jseval"))
+        else {
+            return Ok(false);
+        };
 
-    log_info!("检测到 Java jseval，切到目标主线程执行");
-    let expr = wrap_jseval_expr(expr);
-    crate::remote_agent::eval_js_on_main_thread(session, &expr, "", false)
-        .map_err(|e| format!("主线程执行 jseval 失败: {}", e))?;
-    Ok(true)
+        if !script_uses_java_api(expr) {
+            return Ok(false);
+        }
+
+        log_info!("检测到 Java jseval，切到目标主线程执行");
+        let expr = wrap_jseval_expr(expr);
+        crate::remote_agent::eval_js_on_main_thread(session, &expr, "", false)
+            .map_err(|e| format!("主线程执行 jseval 失败: {}", e))?;
+        Ok(true)
+    }
 }
 
 fn js_string_literal(value: &str) -> String {
@@ -104,25 +87,39 @@ fn js_string_literal(value: &str) -> String {
 }
 
 pub(crate) fn try_managedcounter_on_main_thread(session: &Session, line: &str) -> Result<bool, String> {
-    let Some(rest) = line.strip_prefix("managedcounter ") else {
+    #[cfg(feature = "noptrace")]
+    {
+        let _ = session;
+        if line.starts_with("managedcounter ") {
+            return Err("managedcounter 在 noptrace 构建中不可用".to_string());
+        }
         return Ok(false);
-    };
-    let mut parts = rest.split_whitespace();
-    let helper_class = parts.next().unwrap_or("");
-    let field_name = parts.next().unwrap_or("");
-    if helper_class.is_empty() || field_name.is_empty() || parts.next().is_some() {
-        return Err("用法: managedcounter <helperClass> <fieldName>".to_string());
     }
+    #[cfg(not(feature = "noptrace"))]
+    {
+        if !remote_main_thread_available(session) {
+            return Ok(false);
+        }
+        let Some(rest) = line.strip_prefix("managedcounter ") else {
+            return Ok(false);
+        };
+        let mut parts = rest.split_whitespace();
+        let helper_class = parts.next().unwrap_or("");
+        let field_name = parts.next().unwrap_or("");
+        if helper_class.is_empty() || field_name.is_empty() || parts.next().is_some() {
+            return Err("用法: managedcounter <helperClass> <fieldName>".to_string());
+        }
 
-    log_info!("managedcounter 切到目标主线程读取");
-    let expr = format!(
+        log_info!("managedcounter 切到目标主线程读取");
+        let expr = format!(
         "(() => {{ try {{ return String(Java.managedReadCounter({}, {})); }} catch (e) {{ return '[managedcounter error] ' + String(e); }} }})()",
         js_string_literal(helper_class),
         js_string_literal(field_name)
     );
-    crate::remote_agent::eval_js_on_main_thread(session, &expr, "", false)
-        .map_err(|e| format!("主线程读取 managedcounter 失败: {}", e))?;
-    Ok(true)
+        crate::remote_agent::eval_js_on_main_thread(session, &expr, "", false)
+            .map_err(|e| format!("主线程读取 managedcounter 失败: {}", e))?;
+        Ok(true)
+    }
 }
 
 fn wrap_jseval_expr(expr: &str) -> String {
@@ -235,6 +232,7 @@ fn java_member_accesses(script: &str) -> Vec<(usize, String)> {
     out
 }
 
+#[cfg(not(feature = "noptrace"))]
 pub(crate) fn script_uses_java_api(script: &str) -> bool {
     !java_member_accesses(script).is_empty()
 }
@@ -282,6 +280,7 @@ pub(crate) fn commands() -> &'static [(&'static str, &'static str, &'static str)
     CMDS.get_or_init(|| {
         #[allow(unused_mut)]
         let mut v: Vec<(&'static str, &'static str, &'static str)> = vec![
+            #[cfg(not(feature = "noptrace"))]
             ("trace", "[tid]", "ptrace 指令追踪"),
             ("jhook", "", "Java/JNI hooking"),
             ("jsinit", "", "初始化 QuickJS 引擎"),
@@ -522,18 +521,11 @@ fn load_script_file_with_mode(
 
     preconfigure_java_stealth_if_declared(session, &script)?;
 
-    let uses_java = script_uses_java_api(&script);
     let filename = script_filename(script_path);
     session.eval_state.clear();
-    if uses_java {
-        log_info!("检测到 Java 脚本，切到目标主线程执行");
-        crate::remote_agent::eval_js_on_main_thread(session, &script, &filename, true)
-            .map_err(|e| format!("主线程加载脚本失败: {}", e))?;
-    } else {
-        log_info!("非 Java 脚本在 agent worker 初始化并执行");
-        send_command(sender, format!("loadjs_init [{}]\n{}", filename, script))
-            .map_err(|e| format!("发送 loadjs_init 失败: {}", e))?;
-    }
+    log_info!("通过 agent socket 初始化并执行脚本");
+    send_command(sender, format!("loadjs_init [{}]\n{}", filename, script))
+        .map_err(|e| format!("发送 loadjs_init 失败: {}", e))?;
     print_eval_result(session, if stop_worker_after_load { 10 } else { 30 });
     Ok(PreResumeLoad::Loaded)
 }

@@ -139,6 +139,7 @@ pub(crate) struct RustFridaLoaderContext {
     pub(crate) agent_handle: u64,                   // void * (runtime, zeroed)
     pub(crate) agent_entrypoint_impl: u64,          // fn ptr (runtime, zeroed)
     pub(crate) agent_current_thread_eval_impl: u64, // fn ptr (runtime, zeroed)
+    pub(crate) spawn_resume_flag: u64,              // pure spawn: *mut u64, 0 for ptrace backend
 }
 
 impl Default for RustFridaLoaderContext {

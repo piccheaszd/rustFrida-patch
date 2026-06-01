@@ -21,6 +21,7 @@ mod pthread_shim;
 mod raw_thread;
 pub mod recompiler;
 pub mod safepoint;
+#[cfg(not(feature = "noptrace"))]
 mod trace;
 mod vma_name;
 
@@ -37,9 +38,11 @@ use crate::communication::{
     shutdown_stream, start_log_writer, write_log_raw_fd, write_stream,
 };
 use crate::crash_handler::install_panic_hook;
+#[cfg(not(feature = "noptrace"))]
 use libc::{kill, pid_t, SIGSTOP};
 use std::alloc::{GlobalAlloc, Layout};
 use std::ffi::c_void;
+#[cfg(not(feature = "noptrace"))]
 use std::process;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -243,6 +246,7 @@ impl StringTable {
 
 static SHOULD_EXIT: AtomicBool = AtomicBool::new(false);
 static SHOULD_DETACH: AtomicBool = AtomicBool::new(false);
+static SPAWN_RESUME_FLAG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static OUTPUT_PATH: OnceLock<String> = OnceLock::new();
 
 #[inline(always)]
@@ -282,6 +286,7 @@ pub struct AgentArgs {
     pub table: u64,       // *const StringTable（目标进程内地址）
     pub ctrl_fd: i32,     // socketpair fd1（agent 端）
     pub agent_memfd: i32, // 目标进程内的 agent.so memfd
+    pub resume_flag: u64, // pure spawn: *mut u64, agent 收到 __spawn_resume__ 后置 1
 }
 
 #[no_mangle]
@@ -289,11 +294,28 @@ pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
     // 从 AgentArgs 读取 ctrl_fd 和 StringTable 指针
     let (ctrl_fd, table_addr) = unsafe {
         let args = &*(args_ptr as *const AgentArgs);
+        if args.resume_flag != 0 {
+            SPAWN_RESUME_FLAG.store(args.resume_flag, Ordering::Release);
+        }
         (args.ctrl_fd, args.table)
     };
 
+    #[cfg(feature = "quickjs")]
+    let native_early_hook_result = quickjs_loader::init_hook_runtime();
+    #[cfg(not(feature = "quickjs"))]
+    let native_early_hook_result: Result<()> = Ok(());
+
     // Send HELLO before any Rust stream setup so entry-stage failures are visible to the host.
     let _ = send_hello_raw_fd(ctrl_fd);
+    match native_early_hook_result {
+        Ok(()) => trace_entry_raw(ctrl_fd, b"[agent-trace] 00 native-early-hook-installed\n"),
+        Err(ref e) => {
+            let _ = write_log_raw_fd(
+                ctrl_fd,
+                format!("[agent] native early hook init failed: {}\n", e).as_bytes(),
+            );
+        }
+    }
     trace_entry_raw(ctrl_fd, b"[agent-trace] 01 after-hello\n");
 
     trace_entry_raw(ctrl_fd, b"[agent-trace] 02 before-panic-hook\n");
@@ -621,6 +643,18 @@ fn cleanup_agent_runtime_for_unload() {
 
 fn process_cmd(command: &str) {
     match command.split_whitespace().next() {
+        Some("__spawn_resume__") => {
+            let flag = SPAWN_RESUME_FLAG.load(Ordering::Acquire);
+            if flag != 0 {
+                unsafe {
+                    core::ptr::write_volatile(flag as *mut u64, 1);
+                }
+                send_eval_ok("spawn_resumed");
+            } else {
+                send_eval_err("spawn resume flag missing");
+            }
+        }
+        #[cfg(not(feature = "noptrace"))]
         Some("trace") => {
             let tid = command
                 .split_whitespace()
