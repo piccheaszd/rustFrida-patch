@@ -66,7 +66,7 @@ cargo build -p rust_frida --release --no-default-features --features noptrace
 
 `noptrace` 版仍然内嵌同一个 loader blob，但 host 不会在目标 App 子进程中调用 `inject_via_bootstrapper()`，也不会读写子进程寄存器。host 只通过 zymbiote socket 传输 stage-1 loader、agent SO 和 pre-resume 脚本。
 
-修改 `zymbiote/` 后需要重新生成两个 zymbiote ELF；默认构建嵌入 `zymbiote.elf`，`noptrace` 构建嵌入 `zymbiote-pure.elf`：
+修改 `zymbiote/` 后需要重新生成 zymbiote ELF；默认构建嵌入 `zymbiote.elf`，`noptrace` 构建嵌入 `zymbiote-pure.elf` 和用于未匹配 child 清理的 `zymbiote-restore.elf`：
 
 ```bash
 ./zymbiote/build.sh
@@ -87,12 +87,12 @@ cp target/aarch64-linux-android/release/rustfrida target/aarch64-linux-android/r
 - agent memfd 会按 ELF LOAD 段的 `p_memsz` 进行 padding，loader 将完整段映射为文件支撑 VMA，避免单独匿名 BSS 尾段。
 - 自解析 linker 只索引必要平台模块，并继续使用本分支传入的 resolver host module bases，避免在加固 app 中扫描所有 app `.so`。
 - 当前 loader 同时兼容 `DEBUG`/`LOG` 诊断消息；协议值保持一致，避免破坏旧 host/loader 握手。
-- `--spawn-pure` 是 no-ptrace 子进程路径：`noptrace` 构建嵌入独立的 pure-only zymbiote stage-0，只负责阻塞子进程、接收 stage-1 loader、跳转，以及未匹配 child 的 hook slot 自恢复；loader 在 App 子进程内自链接 agent。
+- `--spawn-pure` 是 no-ptrace 子进程路径：`noptrace` 构建嵌入独立的 pure-only zymbiote stage-0，只负责阻塞子进程、接收 stage-1 loader 并跳转；loader 在 App 子进程内自链接 agent。
 - pure-only zymbiote stage-0 不内置 ELF linker、QuickJS、hook engine、属性 remap 或 capset mount hook；当前 executable payload 约 2.3KB，小于一页但仍会覆盖真实 `libstagefright.so` 尾页代码。
 - `noptrace` 构建只扫描和 patch `zygote64`，不再处理 32-bit zygote / usap；因此只支持 arm64 目标 App。
 - pure spawn 的 pre-resume 脚本统一通过 agent socket 发送；Java 主线程 eval 的 remote-agent 分支在 `noptrace` 下不可用。
 - `hello_entry()` 入口最前面安装 native early hook；不等待 JS、Java 初始化或 log writer。
-- target pure child 会把 zygote payload 备份和 hook 槽原值随 stage-1 一起下发；loader 在 agent entry 前启动 raw clone 清理线程，等 stage-0 退出 resume 等待后优先恢复 payload 页，再恢复 `setArgV0`/`setcontext` 槽。未匹配 child 仍走 stage-0 self-restore 只恢复 hook 槽；zygote 侧 patch 在 host 退出时统一清理。
+- target pure child 会把 zygote payload 备份和 hook 槽原值随 stage-1 一起下发；loader 在 agent entry 前启动 raw clone 清理线程，等 stage-0 退出 resume 等待后优先恢复 payload 页，再恢复 `setArgV0`/`setcontext` 槽。未匹配 child 不再只走 hook slot 自恢复：host 会下发 restore-only stage-1，由 child 侧恢复 payload 页和 hook 槽；找不到父 zygote patch 时会尝试从 child maps/backing file 重建 cleanup，失败则拒绝 hook-only fallback 并显式报警。
 - 普通 `--spawn package` 默认走 late spawn：先恢复子进程，等待主线程回到 Looper idle 后再按 PID attach。这个模式不保证早期 hook，但更适合交互式 REPL。
 - `--spawn -l script.js` 默认走 early spawn：在 zygote/setcontext 阻塞窗口里注入并加载脚本，脚本完成后再恢复子进程，用于抢 `Application.onCreate` / `RegisterNatives` 等早期逻辑。
 - `--spawn-early` 可强制无脚本时也走 early spawn；这是诊断/特殊场景用法，稳定性弱于 late。
@@ -115,6 +115,7 @@ printf 'jseval 1+1\nexit\n' | adb shell su -c '/data/local/tmp/rf --spawn com.co
 `noptrace` pure spawn smoke：
 
 ```bash
+./zymbiote/build.sh
 cargo build -p agent --release --no-default-features --features quickjs,noptrace
 cargo build -p rust_frida --release --no-default-features --features noptrace
 adb push target/aarch64-linux-android/release/rustfrida /data/local/tmp/rf-noptrace
@@ -123,6 +124,20 @@ printf 'jseval 1+1\nexit\n' | adb shell su -c '/data/local/tmp/rf-noptrace --spa
 ```
 
 已在 Android 14 arm64 设备上验证 `com.coloros.note` 和 `com.bochk.app.aos` 的 pure spawn；`com.bochk.app.aos` 可在 pre-resume 脚本里监听 `RegisterNatives`，也验证过 `Hook.WXSHADOW` patch。
+
+### noptrace 测试矩阵
+
+| 类别 | 当前状态 | 验证目标 |
+| --- | --- | --- |
+| 普通 arm64 App | 已在 ColorOS / Android 14 上用 `com.coloros.note` pure spawn 通过 | agent 连接、pre-resume 脚本执行、退出恢复 zygote patch |
+| 多进程 App | 部分覆盖；仍需专门枚举 secondary process | 未匹配 child 通过 restore-only stage-1 恢复 payload 页和 hook 槽，不留下 `libstagefright.so` 尾页覆盖 |
+| 含 `:remote` / `:push` 的 App | 待专测 | 只消费目标进程 hello，非目标进程恢复后继续运行 |
+| 有 self-ptrace watchdog 的 App | 待专测 | host/App 侧没有 `ptrace` syscall，watchdog 不因注入触发 |
+| 早期 `JNI_OnLoad` 检测 App | 已用 `com.bochk.app.aos` 的 `RegisterNatives` pre-resume hook 做 smoke，仍需专项样本 | native early hook 在 JS/Java/log writer 前安装 |
+| 大量 SO 加载 App | `com.bochk.app.aos` 部分覆盖 | loader/agent 自链接稳定，脚本能在大量 dlopen 场景下保持连接 |
+| WebView-heavy App | 待专测 | WebView 初始化和多进程 sandbox 不触发未恢复 payload 页执行 |
+| 厂商 ROM | ColorOS / Android 14 已测；MIUI / OneUI / HarmonyOS Android 分支（NEXT 前）待测 | zygote64 布局、`libstagefright.so` host 页选择、SELinux/tracefs 验证能力 |
+| no-ptrace 证明 | tracefs raw syscall 在当前 ColorOS 设备上受 SELinux 限制，无法写入 `sys_enter_ptrace` filter | 用 eBPF tracepoint/kprobe 或可写 tracefs 验证 `sys_enter_ptrace(id==117)` 无 rustfrida/App 命中 |
 
 ### 可选组件（单独构建）
 
@@ -213,7 +228,7 @@ adb shell su -c 'chmod 755 /data/local/tmp/rf-noptrace'
 ./rf-noptrace --set-prop default ro.debuggable=0
 ```
 
-`noptrace` 构建不包含 `--pid`、`--name`、`--watch-so`、`--server`、trace 命令和 process remote-call 后端。当前 pure-only stage-0 也不包含属性 profile 注入 hook，`--profile` 在 pure spawn 下会被忽略；需要这些能力时使用默认 ptrace 版。
+`noptrace` 构建不包含 `--pid`、`--name`、`--watch-so`、`--server`、`--profile`、trace 命令和 process remote-call 后端。当前 pure-only stage-0 不包含属性 profile 注入 hook；需要这些能力时使用默认 ptrace 版。
 
 ### no-ptrace 验证
 

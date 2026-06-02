@@ -11,6 +11,7 @@ mod props;
 #[cfg(not(feature = "noptrace"))]
 mod remote_agent;
 mod repl;
+#[cfg(not(feature = "noptrace"))]
 mod selinux;
 #[cfg(not(feature = "noptrace"))]
 mod server;
@@ -47,6 +48,7 @@ use communication::{send_command, start_socketpair_handler};
 use injection::InjectionResult;
 #[cfg(not(feature = "noptrace"))]
 use injection::{inject_via_bootstrapper, watch_and_inject};
+#[cfg(not(feature = "noptrace"))]
 use process::find_pid_by_name;
 use repl::{
     load_script_file, load_script_file_pre_resume, print_eval_result, print_help, rewrite_jseval_for_agent,
@@ -128,42 +130,39 @@ fn main() {
         }
     }
 
-    // --profile 校验: 仅 --spawn 或 --server 可用
-    if args.profile.is_some() && args.spawn.is_none() && !args.server {
-        log_error!("--profile 仅在 --spawn 或 --server 模式下可用");
-        std::process::exit(1);
-    }
+    #[cfg(not(feature = "noptrace"))]
+    {
+        // --profile 校验: 仅 --spawn 或 --server 可用
+        if args.profile.is_some() && args.spawn.is_none() && !args.server {
+            log_error!("--profile 仅在 --spawn 或 --server 模式下可用");
+            std::process::exit(1);
+        }
 
-    // 属性 profile 预处理
-    if let Some(ref profile_name) = args.profile {
-        match props::prep_prop_profile(profile_name) {
-            Ok(profile_dir) => {
-                spawn::set_prop_profile(Some(profile_dir));
-            }
-            Err(e) => {
-                log_error!("属性 profile 预处理失败: {}", e);
-                std::process::exit(1);
+        // 属性 profile 预处理
+        if let Some(ref profile_name) = args.profile {
+            match props::prep_prop_profile(profile_name) {
+                Ok(profile_dir) => {
+                    spawn::set_prop_profile(Some(profile_dir));
+                }
+                Err(e) => {
+                    log_error!("属性 profile 预处理失败: {}", e);
+                    std::process::exit(1);
+                }
             }
         }
     }
 
     // ── Server daemon 模式 ──
+    #[cfg(not(feature = "noptrace"))]
     if args.server {
-        #[cfg(feature = "noptrace")]
-        {
-            log_error!("当前为 noptrace 构建，--server 依赖 ptrace 注入 backend；请使用 --spawn-pure");
-            std::process::exit(1);
-        }
-        #[cfg(not(feature = "noptrace"))]
-        {
-            server::run_server(&args);
-            return;
-        }
+        server::run_server(&args);
+        return;
     }
 
     // ── 以下为 legacy 单 session 模式 ──
 
     // 解析 --name 到 PID（如果指定）
+    #[cfg(not(feature = "noptrace"))]
     let resolved_pid: Option<i32> = if let Some(ref name) = args.name {
         match find_pid_by_name(name) {
             Ok(pid) => {
@@ -208,8 +207,11 @@ fn main() {
     //   be installed before Application.onCreate()/RegisterNatives.
     // - plain `--spawn package` defaults to late attach for a stable REPL.
     // - `--spawn-early` and `--spawn-late` force either side explicitly.
+    #[cfg(not(feature = "noptrace"))]
     let spawn_pre_resume = args.spawn.is_some()
         && (args.spawn_pure || (!args.spawn_late && (args.load_script.is_some() || args.spawn_early)));
+    #[cfg(feature = "noptrace")]
+    let spawn_pre_resume = args.spawn.is_some() && args.spawn_pure;
 
     // 根据参数选择注入方式，返回 (target_pid, host_fd)
     let (target_pid, injection): (Option<i32>, InjectionResult) = if let Some(ref package) = args.spawn {
@@ -220,23 +222,19 @@ fn main() {
         let spawn_result = if args.spawn_pure {
             spawn::spawn_pure(package, spawn_timeout, &string_overrides)
         } else if spawn_pre_resume {
-            #[cfg(feature = "noptrace")]
-            {
-                log_error!("当前为 noptrace 构建，--spawn early 需要 ptrace backend；请使用 --spawn-pure");
-                spawn::cleanup_zygote_patches();
-                std::process::exit(1);
-            }
             #[cfg(not(feature = "noptrace"))]
-            spawn::spawn_and_inject(package, spawn_timeout, &string_overrides)
+            {
+                spawn::spawn_and_inject(package, spawn_timeout, &string_overrides)
+            }
+            #[cfg(feature = "noptrace")]
+            unreachable!("noptrace build requires --spawn-pure for --spawn")
         } else {
-            #[cfg(feature = "noptrace")]
-            {
-                log_error!("当前为 noptrace 构建，--spawn late 需要 ptrace backend；请使用 --spawn-pure");
-                spawn::cleanup_zygote_patches();
-                std::process::exit(1);
-            }
             #[cfg(not(feature = "noptrace"))]
-            spawn::spawn_resume_then_inject(package, spawn_timeout, &string_overrides)
+            {
+                spawn::spawn_resume_then_inject(package, spawn_timeout, &string_overrides)
+            }
+            #[cfg(feature = "noptrace")]
+            unreachable!("noptrace build requires --spawn-pure for --spawn")
         };
         match spawn_result {
             Ok((pid, result)) => (Some(pid), result),
@@ -246,59 +244,60 @@ fn main() {
                 std::process::exit(1);
             }
         }
-    } else if let Some(so_pattern) = &args.watch_so {
-        #[cfg(feature = "noptrace")]
-        {
-            let _ = so_pattern;
-            log_error!("当前为 noptrace 构建，--watch-so 需要 ptrace 注入 backend");
-            std::process::exit(1);
-        }
-        #[cfg(not(feature = "noptrace"))]
-        {
-            // 使用 eBPF 监听 SO 加载
-            if let Err(e) = crate::selinux::patch_selinux() {
-                log_warn!("SELinux patch 失败（非致命）: {}", e);
-            }
-            match watch_and_inject(so_pattern, args.timeout, &string_overrides) {
-                Ok(result) => (Some(result.target_pid), result),
-                Err(e) => {
-                    log_error!("注入失败: {}", e);
-                    std::process::exit(1);
-                }
-            }
-        }
-    } else if let Some(pid) = resolved_pid {
-        #[cfg(feature = "noptrace")]
-        {
-            let _ = pid;
-            log_error!("当前为 noptrace 构建，--pid/--name 需要 ptrace 注入 backend；请使用 --spawn-pure");
-            std::process::exit(1);
-        }
-        #[cfg(not(feature = "noptrace"))]
-        {
-            // 直接附加到指定 PID（来自 --pid 或 --name 解析结果）
-            // 注入前 patch SELinux policy，确保目标进程能读写 memfd
-            if let Err(e) = crate::selinux::patch_selinux() {
-                log_warn!("SELinux patch 失败（非致命）: {}", e);
-            }
-            match inject_via_bootstrapper(pid, &string_overrides) {
-                Ok(result) => (Some(pid), result),
-                Err(e) => {
-                    log_error!("注入失败: {}", e);
-                    std::process::exit(1);
-                }
-            }
-        }
     } else {
-        log_error!("必须指定 --pid、--name、--watch-so、--spawn 或 --server");
-        std::process::exit(1);
+        #[cfg(not(feature = "noptrace"))]
+        {
+            if let Some(so_pattern) = &args.watch_so {
+                // 使用 eBPF 监听 SO 加载
+                if let Err(e) = crate::selinux::patch_selinux() {
+                    log_warn!("SELinux patch 失败（非致命）: {}", e);
+                }
+                match watch_and_inject(so_pattern, args.timeout, &string_overrides) {
+                    Ok(result) => (Some(result.target_pid), result),
+                    Err(e) => {
+                        log_error!("注入失败: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            } else if let Some(pid) = resolved_pid {
+                // 直接附加到指定 PID（来自 --pid 或 --name 解析结果）
+                // 注入前 patch SELinux policy，确保目标进程能读写 memfd
+                if let Err(e) = crate::selinux::patch_selinux() {
+                    log_warn!("SELinux patch 失败（非致命）: {}", e);
+                }
+                match inject_via_bootstrapper(pid, &string_overrides) {
+                    Ok(result) => (Some(pid), result),
+                    Err(e) => {
+                        log_error!("注入失败: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                log_error!("必须指定 --pid、--name、--watch-so、--spawn 或 --server");
+                std::process::exit(1);
+            }
+        }
+        #[cfg(feature = "noptrace")]
+        {
+            log_error!("必须指定 --spawn <package> --spawn-pure");
+            std::process::exit(1);
+        }
     };
 
     // 创建 legacy session (id=0)
+    #[cfg(not(feature = "noptrace"))]
     let label = if let Some(ref pkg) = args.spawn {
         pkg.clone()
     } else if let Some(ref name) = args.name {
         name.clone()
+    } else if let Some(pid) = target_pid {
+        format!("PID:{}", pid)
+    } else {
+        "unknown".to_string()
+    };
+    #[cfg(feature = "noptrace")]
+    let label = if let Some(ref pkg) = args.spawn {
+        pkg.clone()
     } else if let Some(pid) = target_pid {
         format!("PID:{}", pid)
     } else {

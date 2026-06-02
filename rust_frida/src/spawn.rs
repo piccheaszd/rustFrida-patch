@@ -32,12 +32,18 @@ use crate::{log_error, log_info, log_step, log_success, log_verbose, log_warn};
 const ZYMBIOTE_ELF: &[u8] = include_bytes!("../../zymbiote/build/zymbiote.elf");
 #[cfg(feature = "noptrace")]
 const ZYMBIOTE_ELF: &[u8] = include_bytes!("../../zymbiote/build/zymbiote-pure.elf");
+#[cfg(feature = "noptrace")]
+const ZYMBIOTE_RESTORE_ELF: &[u8] = include_bytes!("../../zymbiote/build/zymbiote-restore.elf");
 
 /// ACK 字节
 const ACK_BYTE: u8 = 0x42;
-#[cfg(feature = "noptrace")]
-const SELF_RESTORE_BYTE: u8 = 0x43;
 const PURE_STAGE1_BYTE: u8 = 0x50;
+#[cfg(feature = "noptrace")]
+const RESTORE_STATUS_MAGIC: u32 = 0x52534652; // "RFSR"
+#[cfg(feature = "noptrace")]
+const RESTORE_STATUS_OK: u32 = 0;
+#[cfg(feature = "noptrace")]
+const RESTORE_PAYLOAD_BIT: u32 = 0x0000_0001;
 const SPAWN_REPL_READY_MIN_WAIT: Duration = Duration::from_millis(750);
 const SPAWN_REPL_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const SPAWN_REPL_READY_POLL: Duration = Duration::from_millis(100);
@@ -68,6 +74,40 @@ struct PureStage1Header {
     reloc_count: u64,
 }
 
+#[repr(C)]
+#[cfg(feature = "noptrace")]
+#[derive(Clone, Copy, Default)]
+struct RestoreStage1Context {
+    ctrlfds: [i32; 2],
+    resume_flag: u64,
+    stage0_done_flag: u64,
+    payload_base: u64,
+    payload_size: u64,
+    payload_backup: u64,
+    payload_protection: u64,
+    page_size: u64,
+    payload_context_offset: u64,
+    setargv0_slot: u64,
+    setargv0_original: u64,
+    setargv0_protection: u64,
+    setcontext_got_slot: u64,
+    setcontext_original: u64,
+    setcontext_got_protection: u64,
+    capset_got_slot: u64,
+    capset_original: u64,
+    capset_got_protection: u64,
+}
+
+#[repr(C)]
+#[cfg(feature = "noptrace")]
+#[derive(Clone, Copy, Default)]
+struct RestoreStage1Status {
+    magic: u32,
+    status: u32,
+    restored: u32,
+    failed: u32,
+}
+
 /// Zygote patch 信息（用于退出时还原）
 #[derive(Clone)]
 struct ZygotePatch {
@@ -77,6 +117,7 @@ struct ZygotePatch {
     payload_backup: Vec<u8>,
     payload_protection: u64,
     page_size: u64,
+    payload_context_offset: u64,
     /// payload 的 backing 文件路径和偏移（用于 COW 场景下读取真正的原始数据）
     #[allow(dead_code)]
     payload_path: String,
@@ -98,9 +139,11 @@ static ZYGOTE_PATCHES: OnceLock<Mutex<Vec<ZygotePatch>>> = OnceLock::new();
 static SERVER_SOCKET_PATH: OnceLock<String> = OnceLock::new();
 static SPAWN_REQUESTS: OnceLock<Mutex<HashMap<String, Arc<SpawnNotifier>>>> = OnceLock::new();
 /// 属性 profile 目录（由 --profile 设置，None = 禁用）
+#[cfg(not(feature = "noptrace"))]
 static PROP_PROFILE_DIR: OnceLock<Option<String>> = OnceLock::new();
 
 /// 设置属性 profile 目录（在 spawn_and_inject 之前调用）
+#[cfg(not(feature = "noptrace"))]
 pub(crate) fn set_prop_profile(profile_dir: Option<String>) {
     let _ = PROP_PROFILE_DIR.set(profile_dir);
 }
@@ -169,19 +212,19 @@ fn cleanup_orphan_spawn_connections() {
         map.drain().collect()
     };
 
-    for (orphan_pid, (mut stream, ppid)) in orphan_entries {
+    for (orphan_pid, (stream, ppid)) in orphan_entries {
         log_warn!("清理超时孤儿连接: pid={}", orphan_pid);
         #[cfg(feature = "noptrace")]
         {
-            let _ = stream.write_all(&[SELF_RESTORE_BYTE]);
-            drain_until_eof(&mut stream, std::time::Duration::from_secs(5));
-            drop(stream);
-            let _ = ppid;
+            if let Err(e) = request_child_side_restore(orphan_pid, ppid, stream, std::time::Duration::from_secs(5)) {
+                log_warn!("{}", e);
+            }
             continue;
         }
 
         #[cfg(not(feature = "noptrace"))]
         {
+            let mut stream = stream;
             // 发 ACK 恢复子进程，避免永远挂起
             let _ = stream.write_all(&[ACK_BYTE]);
             // 等 EOF → 等 SIGSTOP → 还原 → SIGCONT（同步执行，
@@ -464,11 +507,305 @@ fn push_reloc(relocs: &mut Vec<u32>, offset: usize) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(feature = "noptrace")]
+fn executable_load_segment<'a>(elf_bytes: &'a [u8], label: &str) -> Result<&'a [u8], String> {
+    let elf = goblin::elf::Elf::parse(elf_bytes).map_err(|e| format!("解析 {} ELF 失败: {}", label, e))?;
+    let text_seg = elf
+        .program_headers
+        .iter()
+        .find(|ph| {
+            ph.p_type == goblin::elf::program_header::PT_LOAD && (ph.p_flags & goblin::elf::program_header::PF_X) != 0
+        })
+        .ok_or_else(|| format!("{} ELF 中未找到可执行 LOAD 段", label))?;
+
+    let seg_file_offset = text_seg.p_offset as usize;
+    let seg_file_size = text_seg.p_filesz as usize;
+    if seg_file_offset + seg_file_size > elf_bytes.len() {
+        return Err(format!(
+            "{} 可执行段越界: offset={} size={} elf_len={}",
+            label,
+            seg_file_offset,
+            seg_file_size,
+            elf_bytes.len()
+        ));
+    }
+
+    Ok(&elf_bytes[seg_file_offset..seg_file_offset + seg_file_size])
+}
+
 fn take_active_connection(pid: u32) -> Result<(std::os::unix::net::UnixStream, u32), String> {
     let conns = ACTIVE_CONNECTIONS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = conns.lock().unwrap();
     map.remove(&pid)
         .ok_or_else(|| format!("未找到子进程 {} 的活跃 zymbiote 连接", pid))
+}
+
+#[cfg(feature = "noptrace")]
+fn zygote_patch_for_ppid(ppid: u32) -> Option<ZygotePatch> {
+    let patches_lock = ZYGOTE_PATCHES.get()?;
+    let patches = patches_lock.lock().ok()?;
+    patches.iter().find(|patch| patch.pid == ppid).cloned()
+}
+
+#[cfg(feature = "noptrace")]
+fn zymbiote_payload_layout() -> Result<(usize, u64), String> {
+    let elf = goblin::elf::Elf::parse(ZYMBIOTE_ELF).map_err(|e| format!("解析 zymbiote ELF 失败: {}", e))?;
+    let text_seg = elf
+        .program_headers
+        .iter()
+        .find(|ph| {
+            ph.p_type == goblin::elf::program_header::PT_LOAD && (ph.p_flags & goblin::elf::program_header::PF_X) != 0
+        })
+        .ok_or_else(|| "zymbiote ELF 中未找到可执行 LOAD 段".to_string())?;
+
+    let seg_file_size = text_seg.p_filesz as usize;
+    let seg_vm_address = text_seg.p_vaddr;
+    let find_symbol_offset = |name: &str| -> Result<u64, String> {
+        if let Some(sym) = elf
+            .dynsyms
+            .iter()
+            .find(|sym| elf.dynstrtab.get_at(sym.st_name).is_some_and(|n| n == name))
+        {
+            return Ok(sym.st_value - seg_vm_address);
+        }
+        elf.syms
+            .iter()
+            .find(|sym| elf.strtab.get_at(sym.st_name).is_some_and(|n| n == name))
+            .map(|sym| sym.st_value - seg_vm_address)
+            .ok_or_else(|| format!("zymbiote ELF 中未找到符号 {}", name))
+    };
+
+    Ok((seg_file_size, find_symbol_offset("zymbiote")?))
+}
+
+#[cfg(feature = "noptrace")]
+fn synthesize_child_restore_cleanup(pid: u32, ppid: u32) -> Result<ZygotePatch, String> {
+    let maps = parse_proc_maps(pid)?;
+    let loc = find_payload_location(&maps)?;
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    if page_size == 0 || (page_size & (page_size - 1)) != 0 {
+        return Err(format!("非法 page_size: {}", page_size));
+    }
+
+    let (payload_size, payload_context_offset) = zymbiote_payload_layout()?;
+    if payload_size == 0 || payload_size as u64 > page_size {
+        return Err(format!(
+            "无法重建 child restore cleanup: payload size={} page_size={}",
+            payload_size, page_size
+        ));
+    }
+    let write_end = loc
+        .base
+        .checked_add(payload_size as u64)
+        .ok_or_else(|| format!("payload 写入范围溢出: base=0x{:x} len={}", loc.base, payload_size))?;
+    if write_end > loc.vma_end {
+        return Err(format!(
+            "payload 写入范围越过 child VMA: base=0x{:x} len={} end=0x{:x} vma=[0x{:x},0x{:x})",
+            loc.base, payload_size, write_end, loc.vma_start, loc.vma_end
+        ));
+    }
+
+    let payload_backup = read_backing_file_data(&loc.path, loc.file_offset, payload_size)?;
+    Ok(ZygotePatch {
+        pid: ppid,
+        payload_base: loc.base,
+        payload_backup,
+        payload_protection: loc.prot,
+        page_size,
+        payload_context_offset,
+        payload_path: loc.path,
+        payload_file_offset: loc.file_offset,
+        setargv0_slot: None,
+        setargv0_protection: 0,
+        setcontext_got: None,
+        setcontext_got_protection: 0,
+        capset_got: None,
+        capset_got_protection: 0,
+    })
+}
+
+#[cfg(feature = "noptrace")]
+fn read_restore_stage1_status(
+    stream: &mut std::os::unix::net::UnixStream,
+    timeout: std::time::Duration,
+) -> Result<RestoreStage1Status, String> {
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| format!("设置 restore stage-1 status timeout 失败: {}", e))?;
+    let mut buf = [0u8; std::mem::size_of::<RestoreStage1Status>()];
+    stream
+        .read_exact(&mut buf)
+        .map_err(|e| format!("读取 restore stage-1 status 失败: {}", e))?;
+
+    let status = RestoreStage1Status {
+        magic: u32::from_ne_bytes(buf[0..4].try_into().unwrap()),
+        status: u32::from_ne_bytes(buf[4..8].try_into().unwrap()),
+        restored: u32::from_ne_bytes(buf[8..12].try_into().unwrap()),
+        failed: u32::from_ne_bytes(buf[12..16].try_into().unwrap()),
+    };
+    if status.magic != RESTORE_STATUS_MAGIC {
+        return Err(format!(
+            "restore stage-1 status magic 错误: got=0x{:08x} want=0x{:08x}",
+            status.magic, RESTORE_STATUS_MAGIC
+        ));
+    }
+    if status.status != RESTORE_STATUS_OK || (status.restored & RESTORE_PAYLOAD_BIT) == 0 || status.failed != 0 {
+        return Err(format!(
+            "restore stage-1 未完整恢复: status={} restored=0x{:x} failed=0x{:x}",
+            status.status, status.restored, status.failed
+        ));
+    }
+    Ok(status)
+}
+
+#[cfg(feature = "noptrace")]
+fn send_restore_stage1(stream: &mut std::os::unix::net::UnixStream, cleanup: &ZygotePatch) -> Result<(), String> {
+    if cleanup.payload_backup.is_empty() {
+        return Err("restore stage-1 缺少 payload backup".to_string());
+    }
+
+    let restore_code = executable_load_segment(ZYMBIOTE_RESTORE_ELF, "zymbiote restore")?;
+    let page_size = 4096usize;
+    let code_size = align_up_usize(restore_code.len(), page_size);
+    let mut image = vec![0u8; code_size];
+    image[..restore_code.len()].copy_from_slice(restore_code);
+
+    let ctx_offset = append_zeroed::<RestoreStage1Context>(&mut image);
+    let resume_flag_offset = append_bytes(&mut image, &[0u8; 8], 8);
+    let stage0_done_flag_offset = append_bytes(&mut image, &[0u8; 8], 8);
+    let cleanup_backup_offset = append_bytes(&mut image, &cleanup.payload_backup, 16);
+
+    let mut ctx = RestoreStage1Context {
+        ctrlfds: [-1, -1],
+        resume_flag: resume_flag_offset as u64,
+        stage0_done_flag: stage0_done_flag_offset as u64,
+        payload_base: cleanup.payload_base,
+        payload_size: cleanup.payload_backup.len() as u64,
+        payload_backup: cleanup_backup_offset as u64,
+        payload_protection: cleanup.payload_protection,
+        page_size: cleanup.page_size,
+        payload_context_offset: cleanup.payload_context_offset,
+        ..Default::default()
+    };
+    if let Some((slot, backup)) = cleanup.setargv0_slot {
+        ctx.setargv0_slot = slot;
+        ctx.setargv0_original = u64::from_ne_bytes(backup);
+        ctx.setargv0_protection = cleanup.setargv0_protection;
+    }
+    if let Some((slot, backup)) = cleanup.setcontext_got {
+        ctx.setcontext_got_slot = slot;
+        ctx.setcontext_original = u64::from_ne_bytes(backup);
+        ctx.setcontext_got_protection = cleanup.setcontext_got_protection;
+    }
+    if let Some((slot, backup)) = cleanup.capset_got {
+        ctx.capset_got_slot = slot;
+        ctx.capset_original = u64::from_ne_bytes(backup);
+        ctx.capset_got_protection = cleanup.capset_got_protection;
+    }
+    write_value_at(&mut image, ctx_offset, &ctx);
+
+    let mut relocs = Vec::new();
+    push_reloc(
+        &mut relocs,
+        ctx_offset + std::mem::offset_of!(RestoreStage1Context, resume_flag),
+    )?;
+    push_reloc(
+        &mut relocs,
+        ctx_offset + std::mem::offset_of!(RestoreStage1Context, stage0_done_flag),
+    )?;
+    push_reloc(
+        &mut relocs,
+        ctx_offset + std::mem::offset_of!(RestoreStage1Context, payload_backup),
+    )?;
+
+    let image_size = align_up_usize(image.len(), page_size);
+    image.resize(image_size, 0);
+
+    let header = PureStage1Header {
+        image_size: image.len() as u64,
+        code_size: code_size as u64,
+        ctx_offset: ctx_offset as u64,
+        resume_flag_offset: resume_flag_offset as u64,
+        stage0_done_flag_offset: stage0_done_flag_offset as u64,
+        reloc_count: relocs.len() as u64,
+    };
+    let header_bytes = unsafe {
+        std::slice::from_raw_parts(
+            &header as *const PureStage1Header as *const u8,
+            std::mem::size_of::<PureStage1Header>(),
+        )
+    };
+
+    stream
+        .write_all(&[PURE_STAGE1_BYTE])
+        .and_then(|_| stream.write_all(header_bytes))
+        .and_then(|_| stream.write_all(&image))
+        .and_then(|_| {
+            for reloc in &relocs {
+                stream.write_all(&reloc.to_ne_bytes())?;
+            }
+            Ok(())
+        })
+        .map_err(|e| format!("发送 restore stage-1 失败: {}", e))
+}
+
+#[cfg(feature = "noptrace")]
+fn request_child_side_restore(
+    pid: u32,
+    ppid: u32,
+    mut stream: std::os::unix::net::UnixStream,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    let cleanup = match zygote_patch_for_ppid(ppid) {
+        Some(cleanup) => cleanup,
+        None => {
+            log_warn!(
+                "未找到 ppid={} 对应的 zygote patch，尝试从 child {} maps/backing file 重建 restore cleanup",
+                ppid,
+                pid
+            );
+            match synthesize_child_restore_cleanup(pid, ppid) {
+                Ok(cleanup) => {
+                    log_verbose!(
+                        "已为未匹配子进程 {} 重建 restore cleanup: payload=0x{:x} size={} ctx_off=0x{:x}",
+                        pid,
+                        cleanup.payload_base,
+                        cleanup.payload_backup.len(),
+                        cleanup.payload_context_offset
+                    );
+                    cleanup
+                }
+                Err(e) => {
+                    drop(stream);
+                    return Err(format!(
+                        "无法安全恢复未匹配子进程 {}: {}；已拒绝 hook-only fallback，payload 页可能保持脏状态",
+                        pid, e
+                    ));
+                }
+            }
+        }
+    };
+
+    match send_restore_stage1(&mut stream, &cleanup) {
+        Ok(()) => {
+            let status = read_restore_stage1_status(&mut stream, timeout)?;
+            drain_until_eof(&mut stream, std::time::Duration::from_millis(100));
+            drop(stream);
+            log_verbose!(
+                "未匹配子进程 {} restore stage-1 已确认恢复 payload/hook: restored=0x{:x}",
+                pid,
+                status.restored
+            );
+            Ok(())
+        }
+        Err(e) => {
+            drop(stream);
+            Err(format!(
+                "向未匹配子进程 {} 下发 restore stage-1 失败: {}，payload 页可能未恢复",
+                pid, e
+            ))
+        }
+    }
 }
 
 fn send_pure_stage1(
@@ -723,6 +1060,7 @@ pub(crate) fn ensure_zymbiote_loaded() -> Result<(), String> {
 
     if !already_initialized {
         // 修补 SELinux 策略，允许子进程连接 abstract socket
+        #[cfg(not(feature = "noptrace"))]
         if let Err(e) = crate::selinux::patch_selinux() {
             log_warn!("SELinux 策略修补失败: {}（继续尝试注入）", e);
         }
@@ -1028,21 +1366,18 @@ fn handle_zymbiote_connection(mut stream: std::os::unix::net::UnixStream) -> Res
 
 /// 对未匹配 spawn 请求的子进程执行完整 resume 流程
 /// 与 Frida connection.resume() 一致：ACK → 等 EOF → wait SIGSTOP → revert → SIGCONT
-fn do_resume_unmatched(pid: u32, ppid: u32, mut stream: std::os::unix::net::UnixStream) {
+fn do_resume_unmatched(pid: u32, ppid: u32, stream: std::os::unix::net::UnixStream) {
     #[cfg(feature = "noptrace")]
     {
-        if stream.write_all(&[SELF_RESTORE_BYTE]).is_err() {
-            return;
+        if let Err(e) = request_child_side_restore(pid, ppid, stream, std::time::Duration::from_secs(10)) {
+            log_warn!("{}", e);
         }
-        drain_until_eof(&mut stream, std::time::Duration::from_secs(10));
-        drop(stream);
-        log_verbose!("未匹配子进程 {} 已请求 child 侧恢复 hook", pid);
-        let _ = ppid;
         return;
     }
 
     #[cfg(not(feature = "noptrace"))]
     {
+        let mut stream = stream;
         // 1. 发送 ACK
         if stream.write_all(&[ACK_BYTE]).is_err() {
             return;
@@ -1943,9 +2278,6 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
     let capset_got = {
         #[cfg(feature = "noptrace")]
         {
-            if PROP_PROFILE_DIR.get().and_then(|v| v.as_ref()).is_some() {
-                log_warn!("noptrace pure-only stage-0 已裁剪属性 profile hook，本次忽略 --profile 注入");
-            }
             None
         }
 
@@ -2075,6 +2407,7 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
         payload_backup,
         payload_protection: loc.prot,
         page_size: page_size as u64,
+        payload_context_offset: ctx_base_in_payload as u64,
         payload_path: loc.path,
         payload_file_offset: loc.file_offset,
         setargv0_slot,
@@ -2633,6 +2966,9 @@ fn build_payload(
     } else {
         0u64
     };
+    #[cfg(feature = "noptrace")]
+    log_verbose!("build_payload: prop_remap=0 (noptrace pure stage-0)");
+    #[cfg(not(feature = "noptrace"))]
     log_verbose!(
         "build_payload: prop_remap={} (PROP_PROFILE_DIR={:?})",
         prop_remap,
@@ -2704,7 +3040,7 @@ fn cleanup_pending_connections() {
 
     log_info!("正在恢复 {} 个挂起的子进程...", entries.len());
 
-    for (pid, (mut stream, ppid)) in entries {
+    for (pid, (stream, ppid)) in entries {
         log_verbose!("恢复挂起的子进程 {} (ppid={})...", pid, ppid);
 
         // 检查子进程是否仍存在
@@ -2716,15 +3052,15 @@ fn cleanup_pending_connections() {
 
         #[cfg(feature = "noptrace")]
         {
-            if stream.write_all(&[SELF_RESTORE_BYTE]).is_ok() {
-                drain_until_eof(&mut stream, std::time::Duration::from_secs(2));
+            if let Err(e) = request_child_side_restore(pid, ppid, stream, std::time::Duration::from_secs(2)) {
+                log_warn!("{}", e);
             }
-            drop(stream);
             continue;
         }
 
         #[cfg(not(feature = "noptrace"))]
         {
+            let mut stream = stream;
             // 1. 发送 ACK 解除子进程阻塞
             if stream.write_all(&[ACK_BYTE]).is_err() {
                 // 连接已断开，子进程可能已退出，仍尝试 SIGCONT
@@ -2838,6 +3174,7 @@ pub(crate) fn cleanup_zygote_patches() {
     patches.clear();
 
     // 还原 SELinux 状态
+    #[cfg(not(feature = "noptrace"))]
     crate::selinux::restore_selinux();
 }
 

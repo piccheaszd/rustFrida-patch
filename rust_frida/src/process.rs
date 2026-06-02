@@ -21,6 +21,7 @@ use std::process;
 #[cfg(not(feature = "noptrace"))]
 use std::time::{Duration, Instant};
 
+#[cfg(not(feature = "noptrace"))]
 use crate::log_warn;
 #[cfg(not(feature = "noptrace"))]
 use crate::types::{UserFpRegs, UserRegs};
@@ -66,6 +67,7 @@ pub(crate) fn get_lib_base(pid: Option<i32>, lib_name: &str) -> Result<usize, St
     Err(format!("未找到进程 {} 的{}加载地址", pid.unwrap_or(-1), lib_name))
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn find_map_line_for_addr(pid: i32, addr: u64) -> Option<String> {
     let maps_path = format!("/proc/{}/maps", pid);
     let mut file = File::open(&maps_path).ok()?;
@@ -1059,6 +1061,7 @@ pub(crate) fn wait_until_stopped(pid: u32) -> Result<(), String> {
 
 /// 通过读 /proc/*/cmdline 按进程名查找 PID。
 /// 精确匹配（含末路径组件）；多匹配列出并返回错误。
+#[cfg(not(feature = "noptrace"))]
 pub(crate) fn find_pid_by_name(name: &str) -> Result<i32, String> {
     use std::fs;
 

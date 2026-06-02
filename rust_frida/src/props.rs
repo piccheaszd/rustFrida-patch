@@ -103,7 +103,10 @@ pub(crate) fn dump_props(profile_name: &str) -> Result<(), String> {
 
     log_success!("Profile '{}' 已保存到 {}", profile_name, profile_dir);
     log_info!("  用 --set-prop {} <key=value> 修改属性", profile_name);
+    #[cfg(not(feature = "noptrace"))]
     log_info!("  用 --spawn <pkg> --profile {} 应用", profile_name);
+    #[cfg(feature = "noptrace")]
+    log_info!("  noptrace pure 构建只支持编辑属性 profile，不支持自动应用到 pure spawn");
 
     Ok(())
 }
@@ -441,6 +444,7 @@ fn rebuild_prop_area_preserving_offsets(original: &[u8], alive: &[(String, Strin
 ///
 /// 在 spawn_and_inject 之前调用。zymbiote 在 fork 的子进程中
 /// 读取 .active 自动 mount bind + remap。
+#[cfg(not(feature = "noptrace"))]
 pub(crate) fn prep_prop_profile(profile_name: &str) -> Result<String, String> {
     let profile_dir = format!("{}/{}", PROP_PROFILES_DIR, profile_name);
 

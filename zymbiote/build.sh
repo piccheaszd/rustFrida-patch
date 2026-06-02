@@ -42,5 +42,10 @@ $NDK_CC "${COMMON_FLAGS[@]}" \
     -o build/zymbiote-pure.elf \
     zymbiote_pure.c
 
+$NDK_CC "${COMMON_FLAGS[@]}" \
+    -Oz \
+    -o build/zymbiote-restore.elf \
+    zymbiote_restore.c
+
 echo "编译完成:"
-ls -la build/zymbiote.elf build/zymbiote-pure.elf
+ls -la build/zymbiote.elf build/zymbiote-pure.elf build/zymbiote-restore.elf
