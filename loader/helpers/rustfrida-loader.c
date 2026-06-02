@@ -183,6 +183,21 @@ typedef struct {
   void * agent_entrypoint_impl;
   void * agent_current_thread_eval_impl;
   uint64_t spawn_resume_flag;
+  uint64_t spawn_stage0_done_flag;
+  uint64_t spawn_cleanup_payload_base;
+  uint64_t spawn_cleanup_payload_size;
+  uint64_t spawn_cleanup_payload_backup;
+  uint64_t spawn_cleanup_payload_protection;
+  uint64_t spawn_cleanup_page_size;
+  uint64_t spawn_cleanup_setargv0_slot;
+  uint64_t spawn_cleanup_setargv0_original;
+  uint64_t spawn_cleanup_setargv0_protection;
+  uint64_t spawn_cleanup_setcontext_got_slot;
+  uint64_t spawn_cleanup_setcontext_original;
+  uint64_t spawn_cleanup_setcontext_got_protection;
+  uint64_t spawn_cleanup_capset_got_slot;
+  uint64_t spawn_cleanup_capset_original;
+  uint64_t spawn_cleanup_capset_got_protection;
 } RustFridaLoaderContext;
 
 /*
@@ -330,6 +345,12 @@ static void rustfrida_entry_signal_handler (int sig, siginfo_t * info, void * uc
 static bool rustfrida_raw_install_entry_signal_handler (int sig);
 
 static void frida_main_raw (void * user_data);
+static void rustfrida_spawn_cleanup_raw (void * user_data);
+static void rustfrida_start_spawn_cleanup (RustFridaLoaderContext * ctx);
+static void rustfrida_restore_spawn_cleanup (RustFridaLoaderContext * ctx);
+static bool rustfrida_restore_cleanup_memory (uint64_t address, const void * backup, uint64_t size,
+    uint64_t protection, uint64_t page_size, bool executable);
+static bool rustfrida_restore_cleanup_slot (uint64_t slot, uint64_t value, uint64_t protection, uint64_t page_size);
 static void * frida_raw_mmap (void * addr, size_t length, int prot, int flags, int fd, off_t offset);
 static int frida_raw_munmap (void * addr, size_t length);
 static int frida_raw_close (int fd);
@@ -473,6 +494,100 @@ static void
 frida_main_raw (void * user_data)
 {
   (void) frida_main (user_data);
+}
+
+static void
+rustfrida_spawn_cleanup_raw (void * user_data)
+{
+  RustFridaLoaderContext * ctx = user_data;
+  volatile uint64_t * stage0_done_flag;
+
+  stage0_done_flag = (volatile uint64_t *) (uintptr_t) ctx->spawn_stage0_done_flag;
+  if (stage0_done_flag == NULL)
+    return;
+
+  while (*stage0_done_flag == 0)
+    frida_sleep_ms (2);
+
+  frida_sleep_ms (1);
+  rustfrida_restore_spawn_cleanup (ctx);
+}
+
+static void
+rustfrida_start_spawn_cleanup (RustFridaLoaderContext * ctx)
+{
+  const size_t stack_size = 64 * 1024;
+  const size_t flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM;
+  void * stack;
+  void * stack_top;
+
+  if (ctx->spawn_stage0_done_flag == 0 || ctx->spawn_cleanup_payload_base == 0 ||
+      ctx->spawn_cleanup_payload_backup == 0 || ctx->spawn_cleanup_payload_size == 0)
+    return;
+
+  stack = frida_raw_mmap (NULL, stack_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (stack == MAP_FAILED)
+    return;
+
+  stack_top = (void *) (((uintptr_t) stack + stack_size) & ~(uintptr_t) 15);
+  (void) frida_clone_thread (flags, stack_top, rustfrida_spawn_cleanup_raw, ctx);
+}
+
+static void
+rustfrida_restore_spawn_cleanup (RustFridaLoaderContext * ctx)
+{
+  uint64_t page_size = ctx->spawn_cleanup_page_size != 0 ? ctx->spawn_cleanup_page_size : 4096;
+
+  (void) rustfrida_restore_cleanup_memory (ctx->spawn_cleanup_payload_base,
+      (const void *) (uintptr_t) ctx->spawn_cleanup_payload_backup,
+      ctx->spawn_cleanup_payload_size, ctx->spawn_cleanup_payload_protection, page_size, true);
+
+  (void) rustfrida_restore_cleanup_slot (ctx->spawn_cleanup_setargv0_slot,
+      ctx->spawn_cleanup_setargv0_original, ctx->spawn_cleanup_setargv0_protection, page_size);
+  (void) rustfrida_restore_cleanup_slot (ctx->spawn_cleanup_setcontext_got_slot,
+      ctx->spawn_cleanup_setcontext_original, ctx->spawn_cleanup_setcontext_got_protection, page_size);
+  (void) rustfrida_restore_cleanup_slot (ctx->spawn_cleanup_capset_got_slot,
+      ctx->spawn_cleanup_capset_original, ctx->spawn_cleanup_capset_got_protection, page_size);
+}
+
+static bool
+rustfrida_restore_cleanup_memory (uint64_t address, const void * backup, uint64_t size,
+    uint64_t protection, uint64_t page_size, bool executable)
+{
+  uintptr_t page_start, page_end;
+  uint64_t write_protection;
+
+  if (address == 0 || backup == NULL || size == 0)
+    return false;
+  if (page_size == 0 || (page_size & (page_size - 1)) != 0)
+    page_size = 4096;
+  if (protection == 0)
+    protection = executable ? (PROT_READ | PROT_EXEC) : PROT_READ;
+
+  page_start = ((uintptr_t) address) & ~((uintptr_t) page_size - 1);
+  page_end = (((uintptr_t) address + (uintptr_t) size + (uintptr_t) page_size - 1) &
+      ~((uintptr_t) page_size - 1));
+  write_protection = protection | PROT_WRITE;
+  if (write_protection == 0)
+    write_protection = PROT_READ | PROT_WRITE;
+
+  if (frida_syscall_3 (__NR_mprotect, page_start, page_end - page_start, write_protection) != 0)
+    return false;
+
+  frida_memcpy ((void *) (uintptr_t) address, backup, (size_t) size);
+  if (executable)
+    rustfrida_clear_cache ((char *) (uintptr_t) address, (char *) (uintptr_t) (address + size));
+
+  return frida_syscall_3 (__NR_mprotect, page_start, page_end - page_start, protection) == 0;
+}
+
+static bool
+rustfrida_restore_cleanup_slot (uint64_t slot, uint64_t value, uint64_t protection, uint64_t page_size)
+{
+  if (slot == 0)
+    return false;
+
+  return rustfrida_restore_cleanup_memory (slot, &value, sizeof (value), protection, page_size, false);
 }
 
 static void *
@@ -2696,6 +2811,8 @@ frida_main (void * user_data)
     frida_sleep_ms (3000);
     rustfrida_send_agent_log (agent_ctrlfd, "[loader] hold done\n", libc);
   }
+
+  rustfrida_start_spawn_cleanup (ctx);
 
   /* Construct AgentArgs on stack and call hello_entry */
   {

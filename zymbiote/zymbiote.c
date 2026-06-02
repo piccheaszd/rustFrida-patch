@@ -56,6 +56,14 @@ struct _ZymbioteContext
     uint64_t setargv0_slot;         /* child 自恢复: setArgV0 指针槽 */
     uint64_t setargv0_original;     /* child 自恢复: setArgV0 原值 */
     uint64_t child_hooks_restored;  /* 非零 = child 侧 hook 指针已恢复 */
+    uint64_t page_size;             /* mprotect 对齐用页大小 */
+    uint64_t setargv0_protection;   /* child 自恢复: setArgV0 槽所在页原始保护 */
+    uint64_t setcontext_got_slot;   /* child 自恢复: setcontext GOT 槽 */
+    uint64_t setcontext_original;   /* child 自恢复: setcontext GOT 原值 */
+    uint64_t setcontext_got_protection; /* child 自恢复: setcontext GOT 页原始保护 */
+    uint64_t capset_got_slot;       /* child 自恢复: capset GOT 槽 */
+    uint64_t capset_original;       /* child 自恢复: capset GOT 原值 */
+    uint64_t capset_got_protection; /* child 自恢复: capset GOT 页原始保护 */
 };
 
 /* 全局上下文实例（运行时由 Rust 侧通过 /proc/pid/mem 填充） */
@@ -81,6 +89,7 @@ static ssize_t rustfrida_recv(int sockfd, void *buf, size_t len, int flags);
 static bool rustfrida_recv_all(int sockfd, void *buf, size_t len);
 static bool rustfrida_receive_and_run_stage1(int sockfd);
 static void rustfrida_restore_child_hooks(void);
+static void rustfrida_restore_u64_slot(uint64_t slot, uint64_t value, uint64_t protection);
 
 /* ========== ARM64 raw syscall ========== */
 /* 不依赖 libc，直接 svc #0 */
@@ -113,6 +122,7 @@ typedef struct
     uint64_t code_size;
     uint64_t ctx_offset;
     uint64_t resume_flag_offset;
+    uint64_t stage0_done_flag_offset;
     uint64_t reloc_count;
 } RustFridaPureStage1Header;
 
@@ -157,7 +167,9 @@ rustfrida_receive_and_run_stage1(int sockfd)
     char *mapping;
     int *ctrlfds;
     volatile uint64_t *resume_flag;
+    volatile uint64_t *stage0_done_flag;
     void (*loader_entry)(void *);
+    bool resumed;
 
     if (!rustfrida_recv_all(sockfd, &h, sizeof(h)))
         return false;
@@ -166,6 +178,7 @@ rustfrida_receive_and_run_stage1(int sockfd)
         h.code_size == 0 || h.code_size > h.image_size ||
         h.ctx_offset + 8u > h.image_size ||
         h.resume_flag_offset + 8u > h.image_size ||
+        h.stage0_done_flag_offset + 8u > h.image_size ||
         h.reloc_count > 64u)
         return false;
 
@@ -196,11 +209,15 @@ rustfrida_receive_and_run_stage1(int sockfd)
     ctrlfds[1] = sockfd;
     resume_flag = (volatile uint64_t *)(mapping + h.resume_flag_offset);
     *resume_flag = 0;
+    stage0_done_flag = (volatile uint64_t *)(mapping + h.stage0_done_flag_offset);
+    *stage0_done_flag = 0;
 
     loader_entry = (void (*)(void *))mapping;
     loader_entry(mapping + h.ctx_offset);
 
-    return rustfrida_sleep_until_resume(resume_flag);
+    resumed = rustfrida_sleep_until_resume(resume_flag);
+    *stage0_done_flag = 1;
+    return resumed;
 }
 
 /* ========== prop spoofing 辅助函数 ========== */
@@ -764,10 +781,11 @@ rustfrida_wait_for_permission_to_resume(const char *package_name, bool *revert_n
 
         if (rx == RUSTFRIDA_PURE_STAGE1)
         {
+            zymbiote.pure_spawn_done = 1;
+
             if (!rustfrida_receive_and_run_stage1(fd))
                 goto beach;
 
-            zymbiote.pure_spawn_done = 1;
             fd = -1; /* stage-1/agent owns the socket now */
             goto beach;
         }
@@ -794,8 +812,51 @@ rustfrida_restore_child_hooks(void)
 
     zymbiote.child_hooks_restored = 1;
 
-    if (zymbiote.setargv0_slot != 0)
-        *(uint64_t *)(uintptr_t)zymbiote.setargv0_slot = zymbiote.setargv0_original;
+    rustfrida_restore_u64_slot(zymbiote.setargv0_slot,
+                               zymbiote.setargv0_original,
+                               zymbiote.setargv0_protection);
+
+    rustfrida_restore_u64_slot(zymbiote.setcontext_got_slot,
+                               zymbiote.setcontext_original,
+                               zymbiote.setcontext_got_protection);
+
+    rustfrida_restore_u64_slot(zymbiote.capset_got_slot,
+                               zymbiote.capset_original,
+                               zymbiote.capset_got_protection);
+}
+
+static void
+rustfrida_restore_u64_slot(uint64_t slot, uint64_t value, uint64_t protection)
+{
+    bool temporarily_writable = false;
+
+    if (slot == 0)
+        return;
+
+    if (protection != 0 && (protection & PROT_WRITE) == 0)
+    {
+        size_t page_size = (zymbiote.page_size != 0) ? (size_t)zymbiote.page_size : 4096u;
+        uintptr_t page_start = ((uintptr_t)slot) & ~((uintptr_t)page_size - 1u);
+        uintptr_t slot_end = (uintptr_t)slot + sizeof(uint64_t);
+        uintptr_t page_end = (slot_end + page_size - 1u) & ~((uintptr_t)page_size - 1u);
+        size_t span = page_end - page_start;
+
+        if (zymbiote.mprotect((void *)page_start, span, (int)(protection | PROT_WRITE)) != 0)
+            return;
+
+        temporarily_writable = true;
+    }
+
+    *(uint64_t *)(uintptr_t)slot = value;
+
+    if (temporarily_writable)
+    {
+        size_t page_size = (zymbiote.page_size != 0) ? (size_t)zymbiote.page_size : 4096u;
+        uintptr_t page_start = ((uintptr_t)slot) & ~((uintptr_t)page_size - 1u);
+        uintptr_t slot_end = (uintptr_t)slot + sizeof(uint64_t);
+        uintptr_t page_end = (slot_end + page_size - 1u) & ~((uintptr_t)page_size - 1u);
+        zymbiote.mprotect((void *)page_start, page_end - page_start, (int)protection);
+    }
 }
 
 /* ========== 停止并从 setArgV0 返回 ========== */

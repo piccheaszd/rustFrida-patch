@@ -22,7 +22,7 @@ git submodule update --init --recursive
 当前有两种主程序构建，二者都会输出名为 `rustfrida` 的 Android arm64 二进制：
 
 - 默认构建：带 ptrace backend，支持 PID/name attach、`--watch-so`、server、trace、普通 spawn 和 pure spawn。
-- `noptrace` 构建：编译期移除 ptrace 注入/远程调用/trace 后端，只保留属性命令和 `--spawn --spawn-pure` 自加载路径。
+- `noptrace` 构建：编译期移除 ptrace 注入/远程调用/trace 后端，只保留属性命令和 `--spawn --spawn-pure` 自加载路径；pure spawn 使用单独的精简 zymbiote stage-0。
 
 最终产物 `rustfrida` 通过 `include_bytes!` 内嵌 loader blob 和 agent SO。agent 与 host 的 feature 必须匹配，`rust_frida/build.rs` 会读取 `libagent.features`，发现 stale 或 `noptrace` 不一致时直接报错并给出需要重跑的 `cargo build -p agent ...` 命令。
 
@@ -66,6 +66,12 @@ cargo build -p rust_frida --release --no-default-features --features noptrace
 
 `noptrace` 版仍然内嵌同一个 loader blob，但 host 不会在目标 App 子进程中调用 `inject_via_bootstrapper()`，也不会读写子进程寄存器。host 只通过 zymbiote socket 传输 stage-1 loader、agent SO 和 pre-resume 脚本。
 
+修改 `zymbiote/` 后需要重新生成两个 zymbiote ELF；默认构建嵌入 `zymbiote.elf`，`noptrace` 构建嵌入 `zymbiote-pure.elf`：
+
+```bash
+./zymbiote/build.sh
+```
+
 两套构建会覆盖同一路径。需要同时保留时，在第二套构建后手动改名：
 
 ```bash
@@ -81,12 +87,12 @@ cp target/aarch64-linux-android/release/rustfrida target/aarch64-linux-android/r
 - agent memfd 会按 ELF LOAD 段的 `p_memsz` 进行 padding，loader 将完整段映射为文件支撑 VMA，避免单独匿名 BSS 尾段。
 - 自解析 linker 只索引必要平台模块，并继续使用本分支传入的 resolver host module bases，避免在加固 app 中扫描所有 app `.so`。
 - 当前 loader 同时兼容 `DEBUG`/`LOG` 诊断消息；协议值保持一致，避免破坏旧 host/loader 握手。
-- `--spawn-pure` 是 no-ptrace 子进程路径：zygote 里的 stage-0 payload 只负责阻塞子进程、接收 stage-1 loader 并跳转，loader 在 App 子进程内自链接 agent。
-- zymbiote stage-0 保持小载荷：不内置 ELF linker、QuickJS 或 hook engine；当前 payload 小于一页。
+- `--spawn-pure` 是 no-ptrace 子进程路径：`noptrace` 构建嵌入独立的 pure-only zymbiote stage-0，只负责阻塞子进程、接收 stage-1 loader、跳转，以及未匹配 child 的 hook slot 自恢复；loader 在 App 子进程内自链接 agent。
+- pure-only zymbiote stage-0 不内置 ELF linker、QuickJS、hook engine、属性 remap 或 capset mount hook；当前 executable payload 约 2.3KB，小于一页但仍会覆盖真实 `libstagefright.so` 尾页代码。
 - `noptrace` 构建只扫描和 patch `zygote64`，不再处理 32-bit zygote / usap；因此只支持 arm64 目标 App。
 - pure spawn 的 pre-resume 脚本统一通过 agent socket 发送；Java 主线程 eval 的 remote-agent 分支在 `noptrace` 下不可用。
 - `hello_entry()` 入口最前面安装 native early hook；不等待 JS、Java 初始化或 log writer。
-- child 侧会自行恢复继承到的 `setArgV0` 指针状态并直接回原流程；zygote 侧 patch 在 host 退出时统一清理。
+- target pure child 会把 zygote payload 备份和 hook 槽原值随 stage-1 一起下发；loader 在 agent entry 前启动 raw clone 清理线程，等 stage-0 退出 resume 等待后优先恢复 payload 页，再恢复 `setArgV0`/`setcontext` 槽。未匹配 child 仍走 stage-0 self-restore 只恢复 hook 槽；zygote 侧 patch 在 host 退出时统一清理。
 - 普通 `--spawn package` 默认走 late spawn：先恢复子进程，等待主线程回到 Looper idle 后再按 PID attach。这个模式不保证早期 hook，但更适合交互式 REPL。
 - `--spawn -l script.js` 默认走 early spawn：在 zygote/setcontext 阻塞窗口里注入并加载脚本，脚本完成后再恢复子进程，用于抢 `Application.onCreate` / `RegisterNatives` 等早期逻辑。
 - `--spawn-early` 可强制无脚本时也走 early spawn；这是诊断/特殊场景用法，稳定性弱于 late。
@@ -201,14 +207,13 @@ adb shell su -c 'chmod 755 /data/local/tmp/rf-noptrace'
 # 只支持 arm64 pure spawn；必须带 --spawn-pure
 ./rf-noptrace --spawn com.example.app --spawn-pure
 ./rf-noptrace --spawn com.example.app --spawn-pure -l /data/local/tmp/early.js
-./rf-noptrace --spawn com.example.app --spawn-pure --profile default
 
 # 属性快照/伪装命令仍可独立使用
 ./rf-noptrace --dump-props default
 ./rf-noptrace --set-prop default ro.debuggable=0
 ```
 
-`noptrace` 构建不包含 `--pid`、`--name`、`--watch-so`、`--server`、trace 命令和 process remote-call 后端。需要这些能力时使用默认 ptrace 版。
+`noptrace` 构建不包含 `--pid`、`--name`、`--watch-so`、`--server`、trace 命令和 process remote-call 后端。当前 pure-only stage-0 也不包含属性 profile 注入 hook，`--profile` 在 pure spawn 下会被忽略；需要这些能力时使用默认 ptrace 版。
 
 ### no-ptrace 验证
 

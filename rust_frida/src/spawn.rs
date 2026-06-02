@@ -28,7 +28,10 @@ use crate::types::{FridaLibcApi, RustFridaLoaderContext};
 use crate::{log_error, log_info, log_step, log_success, log_verbose, log_warn};
 
 /// 嵌入编译好的 zymbiote ELF
+#[cfg(not(feature = "noptrace"))]
 const ZYMBIOTE_ELF: &[u8] = include_bytes!("../../zymbiote/build/zymbiote.elf");
+#[cfg(feature = "noptrace")]
+const ZYMBIOTE_ELF: &[u8] = include_bytes!("../../zymbiote/build/zymbiote-pure.elf");
 
 /// ACK 字节
 const ACK_BYTE: u8 = 0x42;
@@ -61,15 +64,19 @@ struct PureStage1Header {
     code_size: u64,
     ctx_offset: u64,
     resume_flag_offset: u64,
+    stage0_done_flag_offset: u64,
     reloc_count: u64,
 }
 
 /// Zygote patch 信息（用于退出时还原）
+#[derive(Clone)]
 struct ZygotePatch {
     pid: u32,
     /// payload 写入位置和原始数据
     payload_base: u64,
     payload_backup: Vec<u8>,
+    payload_protection: u64,
+    page_size: u64,
     /// payload 的 backing 文件路径和偏移（用于 COW 场景下读取真正的原始数据）
     #[allow(dead_code)]
     payload_path: String,
@@ -77,10 +84,13 @@ struct ZygotePatch {
     payload_file_offset: u64,
     /// setArgV0 指针位置和原始值（None = 三层扫描均 miss，走 setcontext-only 降级）
     setargv0_slot: Option<(u64, [u8; 8])>,
+    setargv0_protection: u64,
     /// setcontext GOT slot（可选）
     setcontext_got: Option<(u64, [u8; 8])>,
+    setcontext_got_protection: u64,
     /// capset GOT slot（可选，用于属性 profile mount）
     capset_got: Option<(u64, [u8; 8])>,
+    capset_got_protection: u64,
 }
 
 /// 全局状态
@@ -214,6 +224,54 @@ const CTX_PURE_SPAWN_DONE: usize = 224;
 const CTX_SETARGV0_SLOT: usize = 232;
 const CTX_SETARGV0_ORIGINAL: usize = 240;
 const CTX_CHILD_HOOKS_RESTORED: usize = 248;
+const CTX_PAGE_SIZE: usize = 256;
+const CTX_SETARGV0_PROTECTION: usize = 264;
+const CTX_SETCONTEXT_GOT_SLOT: usize = 272;
+const CTX_SETCONTEXT_ORIGINAL: usize = 280;
+const CTX_SETCONTEXT_GOT_PROTECTION: usize = 288;
+const CTX_CAPSET_GOT_SLOT: usize = 296;
+const CTX_CAPSET_ORIGINAL: usize = 304;
+const CTX_CAPSET_GOT_PROTECTION: usize = 312;
+
+fn map_protection_bits(entry: &MapEntry) -> u64 {
+    let mut prot = 0u64;
+    if entry.is_readable() {
+        prot |= libc::PROT_READ as u64;
+    }
+    if entry.is_writable() {
+        prot |= libc::PROT_WRITE as u64;
+    }
+    if entry.is_executable() {
+        prot |= libc::PROT_EXEC as u64;
+    }
+    prot
+}
+
+fn protection_for_addr(maps: &[MapEntry], addr: u64) -> u64 {
+    maps.iter()
+        .find(|entry| addr >= entry.start && addr < entry.end)
+        .map(map_protection_bits)
+        .unwrap_or(0)
+}
+
+fn got_restore_protection(maps: &[MapEntry], addr: u64) -> u64 {
+    let prot = protection_for_addr(maps, addr);
+    let without_write = prot & !(libc::PROT_WRITE as u64);
+    if without_write != 0 {
+        without_write
+    } else {
+        libc::PROT_READ as u64
+    }
+}
+
+fn system_page_size() -> usize {
+    let raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if raw > 0 {
+        raw as usize
+    } else {
+        4096
+    }
+}
 /// 读取 stream 直到 EOF 或错误（用于等待子进程关闭 socket）
 fn drain_until_eof(stream: &mut std::os::unix::net::UnixStream, timeout: std::time::Duration) {
     stream.set_read_timeout(Some(timeout)).ok();
@@ -416,6 +474,7 @@ fn take_active_connection(pid: u32) -> Result<(std::os::unix::net::UnixStream, u
 fn send_pure_stage1(
     stream: &mut std::os::unix::net::UnixStream,
     string_overrides: &HashMap<String, String>,
+    cleanup: Option<&ZygotePatch>,
 ) -> Result<(), String> {
     let entrypoint = build_agent_entrypoint()?;
     let agent_data = build_pure_loader_agent_data()?;
@@ -435,6 +494,7 @@ fn send_pure_stage1(
     let api_offset = append_zeroed::<FridaLibcApi>(&mut image);
     let table_offset = append_bytes(&mut image, &[0u8; 16 * 5], 8);
     let resume_flag_offset = append_bytes(&mut image, &[0u8; 8], 8);
+    let stage0_done_flag_offset = append_bytes(&mut image, &[0u8; 8], 8);
     let entrypoint_offset = append_bytes(&mut image, &entrypoint, 1);
     let agent_data_offset = append_bytes(&mut image, &agent_data, 1);
     let current_eval_offset = append_bytes(&mut image, &current_eval, 1);
@@ -443,8 +503,12 @@ fn send_pure_stage1(
     let dlsym_err_offset = append_bytes(&mut image, &dlsym_err, 1);
     let cmdline_offset = append_bytes(&mut image, &cmdline, 1);
     let output_path_offset = append_bytes(&mut image, &output_path, 1);
+    let cleanup_backup_offset = cleanup
+        .filter(|patch| !patch.payload_backup.is_empty())
+        .map(|patch| append_bytes(&mut image, &patch.payload_backup, 16))
+        .unwrap_or(0);
 
-    let ctx = RustFridaLoaderContext {
+    let mut ctx = RustFridaLoaderContext {
         ctrlfds: [-1, -1],
         agent_entrypoint: entrypoint_offset as u64,
         agent_data: agent_data_offset as u64,
@@ -453,8 +517,31 @@ fn send_pure_stage1(
         string_table_addr: table_offset as u64,
         agent_current_thread_eval: current_eval_offset as u64,
         spawn_resume_flag: resume_flag_offset as u64,
+        spawn_stage0_done_flag: stage0_done_flag_offset as u64,
         ..Default::default()
     };
+    if let Some(patch) = cleanup {
+        ctx.spawn_cleanup_payload_base = patch.payload_base;
+        ctx.spawn_cleanup_payload_size = patch.payload_backup.len() as u64;
+        ctx.spawn_cleanup_payload_backup = cleanup_backup_offset as u64;
+        ctx.spawn_cleanup_payload_protection = patch.payload_protection;
+        ctx.spawn_cleanup_page_size = patch.page_size;
+        if let Some((slot, backup)) = patch.setargv0_slot {
+            ctx.spawn_cleanup_setargv0_slot = slot;
+            ctx.spawn_cleanup_setargv0_original = u64::from_ne_bytes(backup);
+            ctx.spawn_cleanup_setargv0_protection = patch.setargv0_protection;
+        }
+        if let Some((slot, backup)) = patch.setcontext_got {
+            ctx.spawn_cleanup_setcontext_got_slot = slot;
+            ctx.spawn_cleanup_setcontext_original = u64::from_ne_bytes(backup);
+            ctx.spawn_cleanup_setcontext_got_protection = patch.setcontext_got_protection;
+        }
+        if let Some((slot, backup)) = patch.capset_got {
+            ctx.spawn_cleanup_capset_got_slot = slot;
+            ctx.spawn_cleanup_capset_original = u64::from_ne_bytes(backup);
+            ctx.spawn_cleanup_capset_got_protection = patch.capset_got_protection;
+        }
+    }
     write_value_at(&mut image, ctx_offset, &ctx);
 
     let table_entries = [
@@ -495,6 +582,16 @@ fn send_pure_stage1(
         &mut relocs,
         ctx_offset + std::mem::offset_of!(RustFridaLoaderContext, spawn_resume_flag),
     )?;
+    push_reloc(
+        &mut relocs,
+        ctx_offset + std::mem::offset_of!(RustFridaLoaderContext, spawn_stage0_done_flag),
+    )?;
+    if cleanup_backup_offset != 0 {
+        push_reloc(
+            &mut relocs,
+            ctx_offset + std::mem::offset_of!(RustFridaLoaderContext, spawn_cleanup_payload_backup),
+        )?;
+    }
     for idx in 0..5 {
         push_reloc(&mut relocs, table_offset + idx * 16)?;
     }
@@ -507,6 +604,7 @@ fn send_pure_stage1(
         code_size: code_size as u64,
         ctx_offset: ctx_offset as u64,
         resume_flag_offset: resume_flag_offset as u64,
+        stage0_done_flag_offset: stage0_done_flag_offset as u64,
         reloc_count: relocs.len() as u64,
     };
     let header_bytes = unsafe {
@@ -538,10 +636,23 @@ pub(crate) fn spawn_pure(
 
     let hello = spawn_and_wait_hello(package, timeout_secs)?;
     let pid = hello.pid as i32;
-    let (mut stream, _ppid) = take_active_connection(hello.pid)?;
+    let (mut stream, ppid) = take_active_connection(hello.pid)?;
+    let cleanup = {
+        let patches_lock = ZYGOTE_PATCHES
+            .get()
+            .ok_or_else(|| "ZYGOTE_PATCHES 未初始化，无法构造 pure spawn 清理描述".to_string())?;
+        let patches = patches_lock.lock().unwrap();
+        patches.iter().find(|patch| patch.pid == ppid).cloned()
+    };
+    if cleanup.is_none() {
+        log_warn!(
+            "未找到 ppid={} 对应的 zygote patch，pure child 无法执行 stage-1 延迟清理",
+            ppid
+        );
+    }
 
     log_info!("正在向子进程 {} 下发 stage-1 loader...", pid);
-    send_pure_stage1(&mut stream, string_overrides)?;
+    send_pure_stage1(&mut stream, string_overrides, cleanup.as_ref())?;
     let ctrl_fd = stream.into_raw_fd();
     let injection = run_loader_handshake_pure(ctrl_fd, pid)?;
 
@@ -1622,6 +1733,7 @@ fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
 /// 向单个 zygote 进程注入 zymbiote
 fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
     let maps = parse_proc_maps(pid)?;
+    let page_size = system_page_size();
 
     // 1. 找到 payload 写入位置（libstagefright.so 的 R+X 段末尾页）
     let loc = find_payload_location(&maps)?;
@@ -1661,7 +1773,7 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
         payload_data,
         replacement_setargv0_addr,
         replacement_setcontext_addr,
-        replacement_prctl_addr,
+        replacement_capset_addr,
         ctx_base_in_payload,
     ) = build_payload(
         socket_name,
@@ -1670,11 +1782,11 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
         &libc_funcs,
         setargv0_addr,
         setcontext_info.as_ref().map(|(addr, _)| *addr),
+        page_size as u64,
     )?;
     log_verbose!("Payload 构建完成: {} bytes", payload_data.len());
 
     // 验证 payload 不超过一页（payload 占用目标段的末尾一页）
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
     if payload_data.len() > page_size {
         return Err(format!(
             "payload 大小 ({} bytes) 超过页面大小 ({} bytes)",
@@ -1802,6 +1914,10 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
         // 降级模式：block_in_setcontext 已置 1，阻塞由 setcontext GOT 替换承担
         None
     };
+    let setargv0_protection = setargv0_slot
+        .as_ref()
+        .map(|(addr, _)| protection_for_addr(&maps, *addr))
+        .unwrap_or(0);
 
     // 10. 准备 setcontext GOT 备份（可选）
     //     与 Frida 一致：already-patched 时 GOT 中可能是旧的替换值，
@@ -1819,27 +1935,48 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
     } else {
         None
     };
+    let setcontext_got_protection = setcontext_got
+        .as_ref()
+        .map(|(got, _)| got_restore_protection(&maps, *got))
+        .unwrap_or(0);
 
-    // 11. 属性伪装: 准备 capset GOT 备份（仅指定 --profile 时）
-    //     capset hook 在 cap drop 前执行 mount --bind
-    let capset_got = if PROP_PROFILE_DIR.get().and_then(|v| v.as_ref()).is_some() {
-        let got = find_got_entry_for_import(&maps, "libandroid_runtime.so", "capset");
-        if let Some(got) = got {
-            let backup = if already_patched {
-                libc_funcs.capset.to_ne_bytes()
-            } else {
-                let mut buf = [0u8; 8];
-                mem.pread_exact(&mut buf, got)?;
-                buf
-            };
-            Some((got, backup))
-        } else {
-            log_warn!("未找到 capset GOT，属性 mount 将不可用");
+    let capset_got = {
+        #[cfg(feature = "noptrace")]
+        {
+            if PROP_PROFILE_DIR.get().and_then(|v| v.as_ref()).is_some() {
+                log_warn!("noptrace pure-only stage-0 已裁剪属性 profile hook，本次忽略 --profile 注入");
+            }
             None
         }
-    } else {
-        None
+
+        #[cfg(not(feature = "noptrace"))]
+        {
+            // 属性伪装: 准备 capset GOT 备份（仅指定 --profile 时）
+            // capset hook 在 cap drop 前执行 mount --bind
+            if PROP_PROFILE_DIR.get().and_then(|v| v.as_ref()).is_some() {
+                let got = find_got_entry_for_import(&maps, "libandroid_runtime.so", "capset");
+                if let Some(got) = got {
+                    let backup = if already_patched {
+                        libc_funcs.capset.to_ne_bytes()
+                    } else {
+                        let mut buf = [0u8; 8];
+                        mem.pread_exact(&mut buf, got)?;
+                        buf
+                    };
+                    Some((got, backup))
+                } else {
+                    log_warn!("未找到 capset GOT，属性 mount 将不可用");
+                    None
+                }
+            } else {
+                None
+            }
+        }
     };
+    let capset_got_protection = capset_got
+        .as_ref()
+        .map(|(got, _)| got_restore_protection(&maps, *got))
+        .unwrap_or(0);
 
     if let Some((addr, backup)) = &setargv0_slot {
         write_ctx_u64(&mut payload_data, ctx_base_in_payload, CTX_SETARGV0_SLOT, *addr)?;
@@ -1848,6 +1985,44 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
             ctx_base_in_payload,
             CTX_SETARGV0_ORIGINAL,
             u64::from_ne_bytes(*backup),
+        )?;
+        write_ctx_u64(
+            &mut payload_data,
+            ctx_base_in_payload,
+            CTX_SETARGV0_PROTECTION,
+            setargv0_protection,
+        )?;
+    }
+
+    if let Some((got, backup)) = &setcontext_got {
+        write_ctx_u64(&mut payload_data, ctx_base_in_payload, CTX_SETCONTEXT_GOT_SLOT, *got)?;
+        write_ctx_u64(
+            &mut payload_data,
+            ctx_base_in_payload,
+            CTX_SETCONTEXT_ORIGINAL,
+            u64::from_ne_bytes(*backup),
+        )?;
+        write_ctx_u64(
+            &mut payload_data,
+            ctx_base_in_payload,
+            CTX_SETCONTEXT_GOT_PROTECTION,
+            setcontext_got_protection,
+        )?;
+    }
+
+    if let Some((got, backup)) = &capset_got {
+        write_ctx_u64(&mut payload_data, ctx_base_in_payload, CTX_CAPSET_GOT_SLOT, *got)?;
+        write_ctx_u64(
+            &mut payload_data,
+            ctx_base_in_payload,
+            CTX_CAPSET_ORIGINAL,
+            u64::from_ne_bytes(*backup),
+        )?;
+        write_ctx_u64(
+            &mut payload_data,
+            ctx_base_in_payload,
+            CTX_CAPSET_GOT_PROTECTION,
+            capset_got_protection,
         )?;
     }
     // 12. 写入 payload
@@ -1882,7 +2057,10 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
 
     // 15. 替换 capset GOT（可选）
     if let Some((got, _)) = &capset_got {
-        mem.pwrite_all(&replacement_prctl_addr.to_ne_bytes(), *got)?;
+        if replacement_capset_addr == 0 {
+            return Err("capset GOT 需要替换，但 zymbiote payload 未导出 capset replacement".to_string());
+        }
+        mem.pwrite_all(&replacement_capset_addr.to_ne_bytes(), *got)?;
         log_verbose!("capset GOT 已替换: 0x{:x}", got);
     }
 
@@ -1895,11 +2073,16 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
         pid,
         payload_base: loc.base,
         payload_backup,
+        payload_protection: loc.prot,
+        page_size: page_size as u64,
         payload_path: loc.path,
         payload_file_offset: loc.file_offset,
         setargv0_slot,
+        setargv0_protection,
         setcontext_got,
+        setcontext_got_protection,
         capset_got,
+        capset_got_protection,
     })
 }
 
@@ -2040,6 +2223,7 @@ struct LibcFunctions {
     recv: u64,
     close: u64,
     raise: u64,
+    #[cfg(not(feature = "noptrace"))]
     capset: u64,
 }
 
@@ -2077,6 +2261,7 @@ fn resolve_libc_functions(maps: &[MapEntry]) -> Result<LibcFunctions, String> {
         recv: resolve("recv")?,
         close: resolve("close")?,
         raise: resolve("raise")?,
+        #[cfg(not(feature = "noptrace"))]
         capset: resolve("capset")?,
     })
 }
@@ -2319,7 +2504,7 @@ fn find_setargv0_pointer_in_heap(
 /// 构建 zymbiote payload：解析 ELF，填充上下文
 /// 与 Frida 一致：使用可执行 LOAD 段（而非 section）提取 payload，
 /// 用 segment vm_address 计算符号偏移。不做 GOT 重定位（ARM64 PC-relative 寻址）。
-/// 返回: (payload, replacement_setargv0, replacement_setcontext, replacement_prctl, ctx_base_in_payload)
+/// 返回: (payload, replacement_setargv0, replacement_setcontext, replacement_capset, ctx_base_in_payload)
 fn build_payload(
     socket_name: &str,
     payload_base: u64,
@@ -2327,6 +2512,7 @@ fn build_payload(
     libc_funcs: &LibcFunctions,
     original_setargv0: u64,
     original_setcontext: Option<u64>,
+    page_size: u64,
 ) -> Result<(Vec<u8>, u64, u64, u64, usize), String> {
     // 解析 zymbiote ELF
     let elf = goblin::elf::Elf::parse(ZYMBIOTE_ELF).map_err(|e| format!("解析 zymbiote ELF 失败: {}", e))?;
@@ -2385,13 +2571,19 @@ fn build_payload(
 
     let replacement_setargv0_offset = find_symbol_offset("rustfrida_zymbiote_replacement_setargv0")?;
     let replacement_setcontext_offset = find_symbol_offset("rustfrida_zymbiote_replacement_setcontext")?;
-    let replacement_prctl_offset = find_symbol_offset("rustfrida_zymbiote_replacement_capset")?;
+    let replacement_capset_offset = if cfg!(feature = "noptrace") {
+        None
+    } else {
+        Some(find_symbol_offset("rustfrida_zymbiote_replacement_capset")?)
+    };
     let zymbiote_offset = find_symbol_offset("zymbiote")?;
 
     // 绝对地址 = payload_base + 段内偏移
     let replacement_setargv0_addr = payload_base + replacement_setargv0_offset;
     let replacement_setcontext_addr = payload_base + replacement_setcontext_offset;
-    let replacement_prctl_addr = payload_base + replacement_prctl_offset;
+    let replacement_capset_addr = replacement_capset_offset
+        .map(|offset| payload_base + offset)
+        .unwrap_or(0);
     let ctx_base = zymbiote_offset as usize;
     log_verbose!(
         "ZymbioteContext: ctx_base=0x{:x}, payload_len=0x{:x}",
@@ -2433,6 +2625,9 @@ fn build_payload(
     write_u64(ctx, CTX_CLOSE - CTX_SOCKET_PATH, libc_funcs.close);
     write_u64(ctx, CTX_RAISE - CTX_SOCKET_PATH, libc_funcs.raise);
     // prop_remap: 有 profile 时启用
+    #[cfg(feature = "noptrace")]
+    let prop_remap = 0u64;
+    #[cfg(not(feature = "noptrace"))]
     let prop_remap = if PROP_PROFILE_DIR.get().and_then(|v| v.as_ref()).is_some() {
         1u64
     } else {
@@ -2450,6 +2645,14 @@ fn build_payload(
     write_u64(ctx, CTX_SETARGV0_SLOT - CTX_SOCKET_PATH, 0);
     write_u64(ctx, CTX_SETARGV0_ORIGINAL - CTX_SOCKET_PATH, 0);
     write_u64(ctx, CTX_CHILD_HOOKS_RESTORED - CTX_SOCKET_PATH, 0);
+    write_u64(ctx, CTX_PAGE_SIZE - CTX_SOCKET_PATH, page_size);
+    write_u64(ctx, CTX_SETARGV0_PROTECTION - CTX_SOCKET_PATH, 0);
+    write_u64(ctx, CTX_SETCONTEXT_GOT_SLOT - CTX_SOCKET_PATH, 0);
+    write_u64(ctx, CTX_SETCONTEXT_ORIGINAL - CTX_SOCKET_PATH, 0);
+    write_u64(ctx, CTX_SETCONTEXT_GOT_PROTECTION - CTX_SOCKET_PATH, 0);
+    write_u64(ctx, CTX_CAPSET_GOT_SLOT - CTX_SOCKET_PATH, 0);
+    write_u64(ctx, CTX_CAPSET_ORIGINAL - CTX_SOCKET_PATH, 0);
+    write_u64(ctx, CTX_CAPSET_GOT_PROTECTION - CTX_SOCKET_PATH, 0);
     // 无需 GOT 重定位：zymbiote 用 -shared -nostdlib 构建，
     // ARM64 ADRP+ADD 为 PC-relative 寻址，代码和数据在同一段内，
     // 移动到新地址后相对偏移不变。实测 .got 为空且无动态重定位。
@@ -2458,7 +2661,7 @@ fn build_payload(
         payload,
         replacement_setargv0_addr,
         replacement_setcontext_addr,
-        replacement_prctl_addr,
+        replacement_capset_addr,
         ctx_base,
     ))
 }

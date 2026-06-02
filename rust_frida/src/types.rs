@@ -140,6 +140,21 @@ pub(crate) struct RustFridaLoaderContext {
     pub(crate) agent_entrypoint_impl: u64,          // fn ptr (runtime, zeroed)
     pub(crate) agent_current_thread_eval_impl: u64, // fn ptr (runtime, zeroed)
     pub(crate) spawn_resume_flag: u64,              // pure spawn: *mut u64, 0 for ptrace backend
+    pub(crate) spawn_stage0_done_flag: u64,         // pure spawn: *mut u64, set by zymbiote after resume wait exits
+    pub(crate) spawn_cleanup_payload_base: u64,
+    pub(crate) spawn_cleanup_payload_size: u64,
+    pub(crate) spawn_cleanup_payload_backup: u64,
+    pub(crate) spawn_cleanup_payload_protection: u64,
+    pub(crate) spawn_cleanup_page_size: u64,
+    pub(crate) spawn_cleanup_setargv0_slot: u64,
+    pub(crate) spawn_cleanup_setargv0_original: u64,
+    pub(crate) spawn_cleanup_setargv0_protection: u64,
+    pub(crate) spawn_cleanup_setcontext_got_slot: u64,
+    pub(crate) spawn_cleanup_setcontext_original: u64,
+    pub(crate) spawn_cleanup_setcontext_got_protection: u64,
+    pub(crate) spawn_cleanup_capset_got_slot: u64,
+    pub(crate) spawn_cleanup_capset_original: u64,
+    pub(crate) spawn_cleanup_capset_got_protection: u64,
 }
 
 impl Default for RustFridaLoaderContext {

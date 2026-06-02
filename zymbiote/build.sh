@@ -22,16 +22,25 @@ echo "使用 NDK clang: $NDK_CC"
 
 mkdir -p build
 
-$NDK_CC -shared -nostdlib \
+COMMON_FLAGS=(
+    -shared -nostdlib
     -Wl,-T,helper.lds \
     -fvisibility=hidden \
     -fno-function-sections \
     -fno-data-sections \
     -fno-asynchronous-unwind-tables \
     -mbranch-protection=bti \
-    -Os \
+    -Os
+)
+
+$NDK_CC "${COMMON_FLAGS[@]}" \
     -o build/zymbiote.elf \
     zymbiote.c
 
-echo "编译完成: build/zymbiote.elf"
-ls -la build/zymbiote.elf
+$NDK_CC "${COMMON_FLAGS[@]}" \
+    -Oz \
+    -o build/zymbiote-pure.elf \
+    zymbiote_pure.c
+
+echo "编译完成:"
+ls -la build/zymbiote.elf build/zymbiote-pure.elf

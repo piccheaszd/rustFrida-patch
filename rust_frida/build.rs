@@ -32,6 +32,8 @@ fn main() {
     println!("cargo::rerun-if-changed={}", agent_feature_marker.display());
     println!("cargo::rerun-if-changed=../loader/build/bootstrapper.bin");
     println!("cargo::rerun-if-changed=../loader/build/rustfrida-loader.bin");
+    println!("cargo::rerun-if-changed=../zymbiote/build/zymbiote.elf");
+    println!("cargo::rerun-if-changed=../zymbiote/build/zymbiote-pure.elf");
 
     let loader_build_script = workspace_root.join("loader").join("build_helpers.py");
     let loader_helpers = workspace_root.join("loader").join("helpers");
