@@ -40,6 +40,65 @@ fn auto_load_delay() -> Duration {
         .unwrap_or_default()
 }
 
+fn bochk_native_audit_command() -> Option<&'static str> {
+    let value = std::env::var("RF_BOCHK_AUDIT").ok()?;
+    match value.as_str() {
+        "0" => None,
+        value if value.eq_ignore_ascii_case("false") => None,
+        "runtime" => Some("nativeaudit bochk-runtime"),
+        "resolve" => Some("nativeaudit bochk-resolve"),
+        "read-maps" | "maps-read" => Some("nativeaudit bochk-read-maps"),
+        "maps-dump" | "dump-maps" => Some("nativeaudit bochk-maps-dump"),
+        "read-status" | "status-read" => Some("nativeaudit bochk-read-status"),
+        "read-stat" | "stat-read" => Some("nativeaudit bochk-read-stat"),
+        "bytes-getpid" | "bytes-resolve" | "bytes-nohook" => Some("nativeaudit bochk-bytes-getpid"),
+        "bytes-noop" | "bytes-getpid-hook" => Some("nativeaudit bochk-bytes-noop"),
+        "bytes-noop-wx" | "bytes-getpid-wx" | "wx-bytes-noop" | "wx-bytes-getpid" => {
+            Some("nativeaudit bochk-bytes-noop-wx")
+        }
+        "bytes-cold" | "bytes-memmem" => Some("nativeaudit bochk-bytes-cold"),
+        "bytes-cold-wx" | "bytes-memmem-wx" | "wx-bytes-cold" | "wx-bytes-memmem" => {
+            Some("nativeaudit bochk-bytes-cold-wx")
+        }
+        "bytes-cold2" | "bytes-ether" | "bytes-ether-ntoa-r" => Some("nativeaudit bochk-bytes-cold2"),
+        "bytes-cold2-wx" | "bytes-ether-wx" | "wx-bytes-cold2" | "bytes-ether-ntoa-r-wx" => {
+            Some("nativeaudit bochk-bytes-cold2-wx")
+        }
+        "bytes-cold2-wx-maponly" | "bytes-ether-wx-maponly" | "wx-bytes-cold2-maponly" => {
+            Some("nativeaudit bochk-bytes-cold2-wx-maponly")
+        }
+        "bytes-cold2-wx-fast" | "bytes-ether-wx-fast" | "wx-bytes-cold2-fast" => {
+            Some("nativeaudit bochk-bytes-cold2-wx-fast")
+        }
+        "bytes-cold2-wx-patchonly" | "bytes-ether-wx-patchonly" | "wx-bytes-cold2-patchonly" => {
+            Some("nativeaudit bochk-bytes-cold2-wx-patchonly")
+        }
+        "noop" | "getpid" => Some("nativeaudit bochk-noop"),
+        "noop-wx" | "getpid-wx" | "wx-noop" | "wx-getpid" => Some("nativeaudit bochk-noop-wx"),
+        "cold" | "memmem" => Some("nativeaudit bochk-cold"),
+        "cold-wx" | "memmem-wx" | "wx-cold" | "wx-memmem" => Some("nativeaudit bochk-cold-wx"),
+        "cold-dump" | "memmem-dump" => Some("nativeaudit bochk-cold-dump"),
+        "cold-wx-dump" | "memmem-wx-dump" | "wx-cold-dump" | "wx-memmem-dump" => Some("nativeaudit bochk-cold-wx-dump"),
+        "cold2" | "ether" | "ether-ntoa-r" => Some("nativeaudit bochk-cold2"),
+        "cold2-wx" | "ether-wx" | "wx-cold2" | "ether-ntoa-r-wx" => Some("nativeaudit bochk-cold2-wx"),
+        "prctl" => Some("nativeaudit bochk-prctl"),
+        "prctl-wx" | "wx-prctl" => Some("nativeaudit bochk-prctl-wx"),
+        "prctl-silent" => Some("nativeaudit bochk-prctl-silent"),
+        "prctl-wx-silent" | "wx-prctl-silent" => Some("nativeaudit bochk-prctl-wx-silent"),
+        "open" | "proc" => Some("nativeaudit bochk-open"),
+        "open-wx" | "proc-wx" | "wx-open" | "wx-proc" => Some("nativeaudit bochk-open-wx"),
+        "open-silent" | "proc-silent" => Some("nativeaudit bochk-open-silent"),
+        "open-wx-silent" | "proc-wx-silent" | "wx-open-silent" | "wx-proc-silent" => {
+            Some("nativeaudit bochk-open-wx-silent")
+        }
+        "open-only-wx" | "wx-open-only" => Some("nativeaudit bochk-open-only-wx"),
+        "openat-only-wx" | "wx-openat-only" => Some("nativeaudit bochk-openat-only-wx"),
+        "wx" | "wxshadow" | "all-wx" | "bochk-wx" => Some("nativeaudit bochk-wx"),
+        "1" | "true" | "all" | "bochk" => Some("nativeaudit bochk"),
+        _ => Some("nativeaudit bochk"),
+    }
+}
+
 use crate::logger::{DIM, RESET};
 use args::{Args, QuickJsProfile};
 use clap::Parser;
@@ -402,6 +461,19 @@ fn main() {
                 log_info!("收到终止信号，正在清理...");
                 spawn::cleanup_zygote_patches();
                 std::process::exit(1);
+            }
+            if let Some(command) = bochk_native_audit_command() {
+                log_info!("RF_BOCHK_AUDIT: pre-resume 安装 BOCHK native audit ({})", command);
+                session.eval_state.clear();
+                if let Err(e) = send_command(sender, command) {
+                    log_error!("native audit 命令发送失败: {}", e);
+                } else {
+                    match session.eval_state.recv_timeout(Duration::from_secs(5)) {
+                        Some(Ok(msg)) => log_info!("{}", msg),
+                        Some(Err(e)) => log_error!("{}", e),
+                        None => log_warn!("等待 native audit 安装结果超时"),
+                    }
+                }
             }
             if let Some(script_path) = &args.load_script {
                 log_info!("子进程暂停中，准备加载脚本");

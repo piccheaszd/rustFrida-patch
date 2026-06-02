@@ -17,6 +17,8 @@ mod crash_handler;
 mod exec_mem;
 mod gumlibc;
 mod linker;
+#[cfg(feature = "quickjs")]
+mod native_audit;
 mod pthread_shim;
 mod raw_thread;
 pub mod recompiler;
@@ -730,6 +732,24 @@ fn process_cmd(command: &str) {
                     Err(e) => send_eval_err(&format!("artinit failed: {}", e)),
                 }
             });
+        }
+        #[cfg(feature = "quickjs")]
+        Some("nativeaudit") => {
+            let profile = command.split_whitespace().nth(1).unwrap_or("");
+            let install_profile = match profile {
+                "bochk" => Some("all"),
+                "bochk-wx" => Some("all-wx"),
+                value => value.strip_prefix("bochk-"),
+            };
+            match install_profile {
+                Some(install_profile) => match native_audit::install_bochk_audit(install_profile) {
+                    Ok(msg) => send_eval_ok(&msg),
+                    Err(e) => send_eval_err(&format!("nativeaudit {} failed: {}", profile, e)),
+                },
+                None => send_eval_err(
+                    "nativeaudit requires profile: bochk|bochk-wx|bochk-runtime|bochk-resolve|bochk-read-maps|bochk-bytes-noop-wx|bochk-bytes-cold2-wx|bochk-noop-wx|bochk-prctl-wx-silent|bochk-open-wx-silent|bochk-open-only-wx|bochk-openat-only-wx",
+                ),
+            }
         }
         #[cfg(feature = "quickjs")]
         Some("jsinit") => dispatch_js_task("jsinit", init_js_and_respond),
