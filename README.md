@@ -125,6 +125,9 @@ printf 'jseval 1+1\nexit\n' | adb shell su -c '/data/local/tmp/rf-noptrace --spa
 
 已在 Android 14 arm64 设备上验证 `com.coloros.note` 和 `com.bochk.app.aos` 的 pure spawn；`com.bochk.app.aos` 可在 pre-resume 脚本里监听 `RegisterNatives`，也验证过 `Hook.WXSHADOW` patch。
 
+BOCHK 的 `noptrace` / WXSHADOW 分阶段探测记录和今晚复测顺序见
+[`docs/bochk-noptrace-test-notes.md`](docs/bochk-noptrace-test-notes.md)。
+
 ### noptrace 测试矩阵
 
 | 类别 | 当前状态 | 验证目标 |
@@ -133,8 +136,8 @@ printf 'jseval 1+1\nexit\n' | adb shell su -c '/data/local/tmp/rf-noptrace --spa
 | 多进程 App | 部分覆盖；仍需专门枚举 secondary process | 未匹配 child 通过 restore-only stage-1 恢复 payload 页和 hook 槽，不留下 `libstagefright.so` 尾页覆盖 |
 | 含 `:remote` / `:push` 的 App | 待专测 | 只消费目标进程 hello，非目标进程恢复后继续运行 |
 | 有 self-ptrace watchdog 的 App | 待专测 | host/App 侧没有 `ptrace` syscall，watchdog 不因注入触发 |
-| 早期 `JNI_OnLoad` 检测 App | 已用 `com.bochk.app.aos` 的 `RegisterNatives` pre-resume hook 做 smoke，仍需专项样本 | native early hook 在 JS/Java/log writer 前安装 |
-| 大量 SO 加载 App | `com.bochk.app.aos` 部分覆盖 | loader/agent 自链接稳定，脚本能在大量 dlopen 场景下保持连接 |
+| 早期 `JNI_OnLoad` 检测 App | 已用 `com.bochk.app.aos` 的 `RegisterNatives` pre-resume hook 做 smoke；BOCHK 后续 native 检测链路仍在拆分 | native early hook 在 JS/Java/log writer 前安装 |
+| 大量 SO 加载 App | `com.bochk.app.aos` 部分覆盖；已确认 libc inline hook 会触发检测，WXSHADOW 仍需继续拆分信号源 | loader/agent 自链接稳定，脚本能在大量 dlopen 场景下保持连接 |
 | WebView-heavy App | 待专测 | WebView 初始化和多进程 sandbox 不触发未恢复 payload 页执行 |
 | 厂商 ROM | ColorOS / Android 14 已测；MIUI / OneUI / HarmonyOS Android 分支（NEXT 前）待测 | zygote64 布局、`libstagefright.so` host 页选择、SELinux/tracefs 验证能力 |
 | no-ptrace 证明 | tracefs raw syscall 在当前 ColorOS 设备上受 SELinux 限制，无法写入 `sys_enter_ptrace` filter | 用 eBPF tracepoint/kprobe 或可写 tracefs 验证 `sys_enter_ptrace(id==117)` 无 rustfrida/App 命中 |
