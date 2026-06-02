@@ -16,20 +16,18 @@ fn main() {
         ""
     };
     let agent_build_flag = format!("{}{}", release_flag, agent_feature_flag);
-    let agent_so = workspace_root
-        .join("target")
-        .join(&target)
-        .join(profile_dir)
-        .join("libagent.so");
-    let agent_feature_marker = workspace_root
-        .join("target")
-        .join(&target)
-        .join(profile_dir)
-        .join("libagent.features");
+    let target_profile_dir = workspace_root.join("target").join(&target).join(profile_dir);
+    let built_agent_so = target_profile_dir.join("libagent.so");
+    let built_agent_feature_marker = target_profile_dir.join("libagent.features");
+    let agent_variant = if noptrace { "noptrace" } else { "ptrace" };
+    let agent_so = target_profile_dir.join(format!("libagent.{}.so", agent_variant));
+    let agent_feature_marker = target_profile_dir.join(format!("libagent.{}.features", agent_variant));
 
     // 当 agent.so 变化时重新编译 host（include_bytes! 缓存问题）
     println!("cargo::rerun-if-changed={}", agent_so.display());
     println!("cargo::rerun-if-changed={}", agent_feature_marker.display());
+    println!("cargo::rerun-if-changed={}", built_agent_so.display());
+    println!("cargo::rerun-if-changed={}", built_agent_feature_marker.display());
     println!("cargo::rerun-if-changed=../loader/build/bootstrapper.bin");
     println!("cargo::rerun-if-changed=../loader/build/rustfrida-loader.bin");
     println!("cargo::rerun-if-changed=../zymbiote/build/zymbiote.elf");
@@ -76,44 +74,17 @@ fn main() {
         &mut newest_agent_input,
     );
 
-    match std::fs::metadata(&agent_so).and_then(|meta| meta.modified()) {
-        Ok(agent_mtime) if agent_mtime >= newest_agent_input => {}
-        Ok(_) => {
-            panic!(
-                "embedded agent is stale: run `cargo build -p agent{}` before building rust_frida",
-                agent_build_flag
-            );
-        }
-        Err(e) => {
-            panic!(
-                "missing embedded agent {}: {}. Run `cargo build -p agent{}` first",
-                agent_so.display(),
-                e,
-                agent_build_flag
-            );
-        }
-    }
-
     let expected_agent_feature = if noptrace { "noptrace=1" } else { "noptrace=0" };
-    match std::fs::read_to_string(&agent_feature_marker) {
-        Ok(features) if features.lines().any(|line| line.trim() == expected_agent_feature) => {}
-        Ok(features) => {
-            panic!(
-                "embedded agent feature mismatch: expected {}, got {:?}. Run `cargo build -p agent{}` first",
-                expected_agent_feature,
-                features.trim(),
-                agent_build_flag
-            );
-        }
-        Err(e) => {
-            panic!(
-                "missing embedded agent feature marker {}: {}. Run `cargo build -p agent{}` first",
-                agent_feature_marker.display(),
-                e,
-                agent_build_flag
-            );
-        }
-    }
+    ensure_agent_variant(
+        &built_agent_so,
+        &built_agent_feature_marker,
+        &agent_so,
+        &agent_feature_marker,
+        newest_agent_input,
+        expected_agent_feature,
+        &agent_build_flag,
+    );
+    println!("cargo:rustc-env=AGENT_SO_PATH={}", agent_so.display());
 
     if std::env::var_os("CARGO_FEATURE_QBDI").is_some() {
         let helper_path = format!(
@@ -146,6 +117,87 @@ fn ensure_generated_blob(blob: &Path, newest_input: SystemTime, command: &str) {
             );
         }
     }
+}
+
+fn ensure_agent_variant(
+    built_agent_so: &Path,
+    built_marker: &Path,
+    embedded_agent_so: &Path,
+    embedded_marker: &Path,
+    newest_input: SystemTime,
+    expected_feature: &str,
+    agent_build_flag: &str,
+) {
+    if embedded_agent_is_current(embedded_agent_so, embedded_marker, newest_input, expected_feature) {
+        return;
+    }
+
+    let built_mtime = match std::fs::metadata(built_agent_so).and_then(|meta| meta.modified()) {
+        Ok(mtime) => mtime,
+        Err(e) => {
+            panic!(
+                "missing built agent {}: {}. Run `cargo build -p agent{}` first",
+                built_agent_so.display(),
+                e,
+                agent_build_flag
+            );
+        }
+    };
+
+    if built_mtime < newest_input {
+        panic!(
+            "built agent is stale: run `cargo build -p agent{}` before building rust_frida",
+            agent_build_flag
+        );
+    }
+
+    let built_features = std::fs::read_to_string(built_marker).unwrap_or_else(|e| {
+        panic!(
+            "missing built agent feature marker {}: {}. Run `cargo build -p agent{}` first",
+            built_marker.display(),
+            e,
+            agent_build_flag
+        )
+    });
+    if !feature_marker_matches(&built_features, expected_feature) {
+        panic!(
+            "built agent feature mismatch: expected {}, got {:?}. Run `cargo build -p agent{}` first",
+            expected_feature,
+            built_features.trim(),
+            agent_build_flag
+        );
+    }
+
+    if let Some(parent) = embedded_agent_so.parent() {
+        std::fs::create_dir_all(parent).unwrap_or_else(|e| panic!("create {} failed: {}", parent.display(), e));
+    }
+    std::fs::copy(built_agent_so, embedded_agent_so).unwrap_or_else(|e| {
+        panic!(
+            "copy agent {} -> {} failed: {}",
+            built_agent_so.display(),
+            embedded_agent_so.display(),
+            e
+        )
+    });
+    std::fs::write(embedded_marker, format!("{}\n", expected_feature))
+        .unwrap_or_else(|e| panic!("write {} failed: {}", embedded_marker.display(), e));
+}
+
+fn embedded_agent_is_current(agent_so: &Path, marker: &Path, newest_input: SystemTime, expected_feature: &str) -> bool {
+    let Ok(agent_mtime) = std::fs::metadata(agent_so).and_then(|meta| meta.modified()) else {
+        return false;
+    };
+    if agent_mtime < newest_input {
+        return false;
+    }
+    let Ok(features) = std::fs::read_to_string(marker) else {
+        return false;
+    };
+    feature_marker_matches(&features, expected_feature)
+}
+
+fn feature_marker_matches(features: &str, expected_feature: &str) -> bool {
+    features.lines().any(|line| line.trim() == expected_feature)
 }
 
 fn watch_inputs(path: &Path, newest: &mut SystemTime) {

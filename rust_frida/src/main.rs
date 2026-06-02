@@ -3,6 +3,7 @@
 mod args;
 mod communication;
 mod http_rpc;
+mod identity;
 mod injection;
 mod logger;
 mod proc_mem;
@@ -202,6 +203,11 @@ fn main() {
         }
     }
 
+    let spawn_identity = args.spawn.as_ref().map(|target| {
+        let (package, process_name) = spawn::resolve_spawn_identity(target);
+        identity::SpawnIdentitySpec::new(package, process_name)
+    });
+
     // Spawn mode split:
     // - `--spawn -l script.js` defaults to pre-resume injection so early hooks can
     //   be installed before Application.onCreate()/RegisterNatives.
@@ -354,6 +360,10 @@ fn main() {
     }
     let sender = session.get_sender().unwrap();
 
+    if let (Some(pid), Some(spec)) = (target_pid, spawn_identity.as_ref()) {
+        identity::audit_target("agent-connected", pid, spec);
+    }
+
     // 传递 verbose 标志给 agent
     if args.verbose {
         let _ = send_command(sender, "__set_verbose__");
@@ -416,6 +426,11 @@ fn main() {
                 spawn::wait_for_repl_ready(pid);
             }
         }
+    }
+
+    if let (Some(pid), Some(spec)) = (target_pid, spawn_identity.clone()) {
+        identity::audit_target("post-resume", pid, &spec);
+        identity::start_spawn_identity_watcher(pid, spec);
     }
 
     // Non-spawn and late spawn: --load-script runs after attach because the process

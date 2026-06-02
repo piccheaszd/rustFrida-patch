@@ -1542,6 +1542,11 @@ fn resolve_spawn_target(target: &str) -> SpawnTarget {
     }
 }
 
+pub(crate) fn resolve_spawn_identity(target: &str) -> (String, String) {
+    let target = resolve_spawn_target(target);
+    (target.package, target.process_name)
+}
+
 fn resolve_launch_process_name(package: &str) -> Option<String> {
     let component = resolve_launch_activity(package);
     if let Some(ref comp) = component {
