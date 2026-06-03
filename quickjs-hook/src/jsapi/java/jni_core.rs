@@ -969,15 +969,12 @@ pub(super) fn raw_clone_executor_jni_scope_active() -> bool {
     false
 }
 
-/// 从 JNI_STATE 获取 Runtime 地址 (JavaVMExt.runtime_ at offset 8)
+/// 获取 Runtime 地址 (JavaVMExt.runtime_ at offset 8)。
+///
+/// raw clone pre-resume 阶段允许读取 JavaVM/Runtime 元数据，但仍禁止
+/// AttachCurrentThread/JNIEnv 初始化。
 pub(super) unsafe fn get_runtime_addr() -> Option<u64> {
-    let vm_ptr = {
-        let guard = JNI_STATE.lock().unwrap_or_else(|e| e.into_inner());
-        match guard.as_ref() {
-            Some(state) => state.vm,
-            None => return None,
-        }
-    };
+    let vm_ptr = get_or_init_vm().ok()?;
     let runtime_raw = *((vm_ptr as usize + 8) as *const u64);
     let runtime = runtime_raw & PAC_STRIP_MASK;
     if runtime == 0 {

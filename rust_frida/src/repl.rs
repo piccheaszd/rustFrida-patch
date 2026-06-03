@@ -21,6 +21,7 @@ pub(crate) const EVAL_JAVA_TIMEOUT_SECS: u64 = 60;
 pub(crate) const LOAD_DEFAULT_TIMEOUT_SECS: u64 = 5;
 pub(crate) const LOAD_JAVA_TIMEOUT_SECS: u64 = 60;
 pub(crate) const LOAD_STOP_WORKER_TIMEOUT_SECS: u64 = 2;
+pub(crate) const LOAD_PRE_RESUME_JAVA_TIMEOUT_SECS: u64 = 30;
 pub(crate) const JAVA_EXECUTOR_BOOTSTRAP_TIMEOUT_SECS: u64 = 35;
 pub(crate) const JAVA_STEALTH_TIMEOUT_SECS: u64 = 1;
 pub(crate) const JSCLEAN_SOFT_TIMEOUT_SECS: u64 = 1;
@@ -197,7 +198,7 @@ pub(crate) fn rewrite_jseval_for_agent(line: &str) -> Option<String> {
 
 pub(crate) enum PreResumeLoad {
     Loaded,
-    DeferredEval,
+    DeferredEvalCompleted,
 }
 
 fn is_ident_byte(b: u8) -> bool {
@@ -597,7 +598,8 @@ fn load_script_file_with_mode(
     preconfigure_java_stealth_if_declared(session, &script)?;
 
     let uses_java_api = script_uses_java_api(&script);
-    if uses_java_api && stop_worker_after_load && !session.java_worker_ready.load(std::sync::atomic::Ordering::Acquire) {
+    if uses_java_api && stop_worker_after_load && !session.java_worker_ready.load(std::sync::atomic::Ordering::Acquire)
+    {
         log_info!("检测到 pre-resume Java 脚本，先发送到 raw clone TLS JS worker 执行");
     } else if uses_java_api {
         log_info!("检测到 Java 脚本，发送到 Java worker 执行");
@@ -610,7 +612,24 @@ fn load_script_file_with_mode(
         if stop_worker_after_load && !session.java_worker_ready.load(std::sync::atomic::Ordering::Acquire) {
             send_command(sender, format!("loadjs_init [{}]\n{}", filename, script))
                 .map_err(|e| format!("发送 pre-resume Java 脚本到 raw clone TLS JS worker 失败: {}", e))?;
-            return Ok(PreResumeLoad::DeferredEval);
+            match session
+                .eval_state
+                .recv_timeout(std::time::Duration::from_secs(LOAD_PRE_RESUME_JAVA_TIMEOUT_SECS))
+            {
+                None => {
+                    return Err(format!(
+                        "pre-resume Java 脚本执行超时({}s)，未恢复子进程以避免错过早期 Java hook",
+                        LOAD_PRE_RESUME_JAVA_TIMEOUT_SECS
+                    ))
+                }
+                Some(Err(e)) => return Err(format!("pre-resume Java 脚本执行失败: {}", e)),
+                Some(Ok(out)) => {
+                    if !out.is_empty() {
+                        println!("{GREEN}=> {out}{RESET}");
+                    }
+                    return Ok(PreResumeLoad::DeferredEvalCompleted);
+                }
+            }
         }
         ensure_java_worker_ready(session)?;
         crate::process::thaw_cgroup_freezer(session.pid.load(std::sync::atomic::Ordering::Acquire));

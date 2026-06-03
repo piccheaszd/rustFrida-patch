@@ -39,10 +39,9 @@ use nix::unistd::Pid;
 use process::{attach_to_process, call_target_function, find_pid_by_name};
 use repl::{
     ensure_java_worker_ready_after_resume, load_script_file, load_script_file_pre_resume, print_eval_result,
-    print_help, rewrite_jseval_for_agent, run_js_repl, script_uses_java_api,
-    try_jseval_on_main_thread_if_java_or_dsl, try_loadjs_on_main_thread_if_java,
-    try_managedcounter_on_main_thread, CommandCompleter, PreResumeLoad, EVAL_DEFAULT_TIMEOUT_SECS,
-    EVAL_JAVA_TIMEOUT_SECS, EVAL_RECOMP_TIMEOUT_SECS, LOAD_JAVA_TIMEOUT_SECS,
+    print_help, rewrite_jseval_for_agent, run_js_repl, script_uses_java_api, try_jseval_on_main_thread_if_java_or_dsl,
+    try_loadjs_on_main_thread_if_java, try_managedcounter_on_main_thread, CommandCompleter, PreResumeLoad,
+    EVAL_DEFAULT_TIMEOUT_SECS, EVAL_JAVA_TIMEOUT_SECS, EVAL_RECOMP_TIMEOUT_SECS,
 };
 use rustyline::error::ReadlineError;
 use rustyline::Editor;
@@ -364,25 +363,27 @@ fn main() {
                 spawn::cleanup_zygote_patches();
                 std::process::exit(1);
             }
-            let mut deferred_pre_resume_eval = false;
             if let Some(script_path) = &args.load_script {
                 log_info!("子进程暂停中，准备加载脚本");
                 match load_script_file_pre_resume(&session, script_path) {
                     Ok(PreResumeLoad::Loaded) => {}
-                    Ok(PreResumeLoad::DeferredEval) => deferred_pre_resume_eval = true,
-                    Err(e) => log_error!("{}", e),
+                    Ok(PreResumeLoad::DeferredEvalCompleted) => {}
+                    Err(e) => {
+                        log_error!("{}", e);
+                        spawn::abort_pending_children_and_cleanup_zygote_patches();
+                        std::process::exit(1);
+                    }
                 }
             }
             // resume: hook 已就位，恢复子进程
             if let Err(e) = spawn::resume_child(pid as u32) {
                 log_error!("恢复子进程失败: {}", e);
             }
-            if deferred_pre_resume_eval {
-                log_info!("子进程已恢复，等待 Java 脚本执行完成");
-                print_eval_result(&session, LOAD_JAVA_TIMEOUT_SECS);
-            }
             if let Err(e) = ensure_java_worker_ready_after_resume(&session) {
-                log_warn!("Java worker 启动失败，后续 Java 操作将继续依赖 raw clone executor: {}", e);
+                log_warn!(
+                    "Java worker 启动失败，后续 Java 操作将继续依赖 raw clone executor: {}",
+                    e
+                );
             }
         }
     }

@@ -334,6 +334,9 @@ impl JSEngine {
     /// has finished, so callbacks can reference helpers declared later in the
     /// same loadjs payload.
     pub fn flush_java_ready_callbacks(&self) -> Result<(), String> {
+        if is_raw_clone_js_thread() {
+            return Ok(());
+        }
         let value = self.context.eval(
             "if (globalThis.Java && typeof Java._flushReadyCallbacks === 'function') Java._flushReadyCallbacks();",
             "<java_ready_flush>",

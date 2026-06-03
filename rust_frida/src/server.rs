@@ -26,13 +26,19 @@ use crate::repl::{
     print_eval_result, print_help, rewrite_jseval_for_agent, run_js_repl, script_uses_java_api,
     try_jseval_on_main_thread_if_java_or_dsl, try_loadjs_on_main_thread_if_java, try_managedcounter_on_main_thread,
     EVAL_DEFAULT_TIMEOUT_SECS, EVAL_JAVA_TIMEOUT_SECS, EVAL_RECOMP_TIMEOUT_SECS, LOAD_DEFAULT_TIMEOUT_SECS,
-    LOAD_JAVA_TIMEOUT_SECS, LOAD_STOP_WORKER_TIMEOUT_SECS,
+    LOAD_JAVA_TIMEOUT_SECS, LOAD_PRE_RESUME_JAVA_TIMEOUT_SECS, LOAD_STOP_WORKER_TIMEOUT_SECS,
 };
 use crate::session::{Session, SessionManager};
 use crate::spawn;
 use crate::{log_error, log_info, log_success, log_warn};
 
 const SESSION_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScriptLoadState {
+    Loaded,
+    Failed,
+}
 
 // ────────────────────────── Server 命令补全 ──────────────────────────
 
@@ -134,27 +140,27 @@ fn parse_script_flag(parts: &[&str]) -> (Vec<String>, Option<String>) {
 }
 
 /// 在目标进程暂停期间加载脚本（用于 spawn 模式）
-fn load_script_on_session(session: &Session, script_path: &str, stop_worker_after_load: bool) -> bool {
+fn load_script_on_session(session: &Session, script_path: &str, stop_worker_after_load: bool) -> ScriptLoadState {
     if session.get_sender().is_none() {
         log_error!("[#{}] agent 未连接，无法加载脚本", session.id);
-        return false;
+        return ScriptLoadState::Failed;
     }
     let script = match std::fs::read_to_string(script_path) {
         Ok(s) => s,
         Err(e) => {
             log_error!("[#{}] 读取脚本 '{}' 失败: {}", session.id, script_path, e);
-            return false;
+            return ScriptLoadState::Failed;
         }
     };
 
     if script.is_empty() {
         log_info!("[#{}] 脚本为空，跳过加载: {}", session.id, script_path);
-        return false;
+        return ScriptLoadState::Loaded;
     }
 
     if let Err(e) = preconfigure_java_stealth_if_declared(session, &script) {
         log_error!("[#{}] {}", session.id, e);
-        return false;
+        return ScriptLoadState::Failed;
     }
 
     let uses_java_api = script_uses_java_api(&script);
@@ -209,7 +215,29 @@ fn load_script_on_session(session: &Session, script_path: &str, stop_worker_afte
     match load_result {
         Ok(()) => {
             if deferred_pre_resume_java {
-                return true;
+                match session
+                    .eval_state
+                    .recv_timeout(std::time::Duration::from_secs(LOAD_PRE_RESUME_JAVA_TIMEOUT_SECS))
+                {
+                    None => {
+                        log_error!(
+                            "[#{}] pre-resume Java 脚本执行超时({}s)，未恢复子进程以避免错过早期 Java hook",
+                            session.id,
+                            LOAD_PRE_RESUME_JAVA_TIMEOUT_SECS
+                        );
+                        return ScriptLoadState::Failed;
+                    }
+                    Some(Err(e)) => {
+                        log_error!("[#{}] pre-resume Java 脚本执行失败: {}", session.id, e);
+                        return ScriptLoadState::Failed;
+                    }
+                    Some(Ok(out)) => {
+                        if !out.is_empty() {
+                            log_success!("[#{}] => {}", session.id, out);
+                        }
+                    }
+                }
+                return ScriptLoadState::Loaded;
             }
             match session
                 .eval_state
@@ -220,18 +248,18 @@ fn load_script_on_session(session: &Session, script_path: &str, stop_worker_afte
                 } else {
                     LOAD_DEFAULT_TIMEOUT_SECS
                 })) {
-            None => log_warn!("[#{}] 脚本加载超时", session.id),
-            Some(Err(e)) => log_error!("[#{}] 脚本执行失败: {}", session.id, e),
-            Some(Ok(out)) => {
-                if !out.is_empty() {
-                    log_success!("[#{}] => {}", session.id, out);
+                None => log_warn!("[#{}] 脚本加载超时", session.id),
+                Some(Err(e)) => log_error!("[#{}] 脚本执行失败: {}", session.id, e),
+                Some(Ok(out)) => {
+                    if !out.is_empty() {
+                        log_success!("[#{}] => {}", session.id, out);
+                    }
                 }
-            }
             }
         }
         Err(e) => log_error!("[#{}] 主线程加载脚本失败: {}", session.id, e),
     }
-    false
+    ScriptLoadState::Loaded
 }
 
 /// 发送 shutdown 并等待 agent 断连
@@ -290,28 +318,17 @@ fn do_spawn(
                     }
 
                     // 在子进程暂停期间加载脚本
-                    let deferred_pre_resume_eval = script
-                        .as_ref()
-                        .is_some_and(|script_path| load_script_on_session(&session, script_path, true));
+                    if let Some(ref script_path) = script {
+                        if load_script_on_session(&session, script_path, true) == ScriptLoadState::Failed {
+                            session.failed.store(true, Ordering::Release);
+                            spawn::abort_pending_children_and_cleanup_zygote_patches();
+                            return;
+                        }
+                    }
 
                     // resume 子进程
                     if let Err(e) = spawn::resume_child(pid as u32) {
                         log_error!("[#{}] 恢复子进程失败: {}", sid, e);
-                    }
-                    if deferred_pre_resume_eval {
-                        log_info!("[#{}] 子进程已恢复，等待 Java 脚本执行完成", sid);
-                        match session
-                            .eval_state
-                            .recv_timeout(std::time::Duration::from_secs(LOAD_JAVA_TIMEOUT_SECS))
-                        {
-                            None => log_warn!("[#{}] Java 脚本执行超时", sid),
-                            Some(Err(e)) => log_error!("[#{}] Java 脚本执行失败: {}", sid, e),
-                            Some(Ok(out)) => {
-                                if !out.is_empty() {
-                                    log_success!("[#{}] => {}", sid, out);
-                                }
-                            }
-                        }
                     }
                     if let Err(e) = ensure_java_worker_ready_after_resume(&session) {
                         log_warn!(
@@ -364,7 +381,10 @@ fn do_attach(
 
                     // 非 spawn 模式：先连接再加载脚本
                     if let Some(ref script_path) = script {
-                        load_script_on_session(&session, script_path, false);
+                        if load_script_on_session(&session, script_path, false) == ScriptLoadState::Failed {
+                            session.failed.store(true, Ordering::Release);
+                            return;
+                        }
                     }
 
                     log_success!("[#{}] {} 已就绪 (PID: {})", sid, label, pid);

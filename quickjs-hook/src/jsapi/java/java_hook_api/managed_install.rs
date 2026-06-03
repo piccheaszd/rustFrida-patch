@@ -10,7 +10,6 @@ use std::sync::{Mutex, OnceLock};
 use super::super::art_controller::{ensure_art_controller_initialized, refresh_walkstack_sigsegv_guard};
 use super::super::art_method::*;
 use super::super::callback::*;
-use super::super::java_fast_api::{compile_art_method_to_quick, RequestedCompileKind};
 use super::super::jni_core::*;
 use super::super::reflect::{decode_method_id, find_class_safe, get_app_classloader_local_ref};
 use super::install_support::{
@@ -901,42 +900,12 @@ unsafe fn install_managed_method_helper(
     let data_off = spec.data_offset;
     let original_access_flags = std::ptr::read_volatile((art_method as usize + spec.access_flags_offset) as *const u32);
     let original_data = std::ptr::read_volatile((art_method as usize + data_off) as *const u64);
-    let mut original_entry_point = read_entry_point(art_method, ep_offset);
+    let original_entry_point = read_entry_point(art_method, ep_offset);
     let bridge = find_art_bridge_functions(env, ep_offset);
 
-    if is_art_quick_entrypoint(original_entry_point, bridge) {
-        let compile = compile_art_method_to_quick(env, art_method, ep_offset, bridge, RequestedCompileKind::Auto);
-        output_message(&format!(
-            "[managedHook] compile original {}.{}{}: success={} compiled={} before={:#x} after={:#x} {}",
-            class_name,
-            method_name,
-            actual_sig,
-            compile.success,
-            compile.compiled,
-            compile.before,
-            compile.after,
-            compile.message
-        ));
-        original_entry_point = read_entry_point(art_method, ep_offset);
-    }
     let original_is_shared_entrypoint = is_art_quick_entrypoint(original_entry_point, bridge);
 
     let helper_spec = get_art_method_spec(env, helper_art_method);
-    let helper_compile = compile_art_method_to_quick(
-        env,
-        helper_art_method,
-        helper_spec.entry_point_offset,
-        bridge,
-        RequestedCompileKind::Auto,
-    );
-    output_message(&format!(
-        "[managedHook] compile helper: success={} compiled={} before={:#x} after={:#x} {}",
-        helper_compile.success,
-        helper_compile.compiled,
-        helper_compile.before,
-        helper_compile.after,
-        helper_compile.message
-    ));
     let helper_entry_point = read_entry_point(helper_art_method, helper_spec.entry_point_offset);
     if is_art_quick_entrypoint(helper_entry_point, bridge) {
         output_message(&format!(
@@ -1102,24 +1071,9 @@ unsafe fn install_count_orig_fast_path(
     let data_off = spec.data_offset;
     let original_access_flags = std::ptr::read_volatile((art_method as usize + spec.access_flags_offset) as *const u32);
     let original_data = std::ptr::read_volatile((art_method as usize + data_off) as *const u64);
-    let mut original_entry_point = read_entry_point(art_method, ep_offset);
+    let original_entry_point = read_entry_point(art_method, ep_offset);
     let bridge = find_art_bridge_functions(env, ep_offset);
 
-    if is_art_quick_entrypoint(original_entry_point, bridge) {
-        let compile = compile_art_method_to_quick(env, art_method, ep_offset, bridge, RequestedCompileKind::Auto);
-        output_message(&format!(
-            "[managedHook] compile original {}.{}{} for count-orig: success={} compiled={} before={:#x} after={:#x} {}",
-            class_name,
-            method_name,
-            actual_sig,
-            compile.success,
-            compile.compiled,
-            compile.before,
-            compile.after,
-            compile.message
-        ));
-        original_entry_point = read_entry_point(art_method, ep_offset);
-    }
     let original_is_shared_entrypoint = is_art_quick_entrypoint(original_entry_point, bridge);
 
     let class_global_ref = create_class_global_ref(env, class_name)?;

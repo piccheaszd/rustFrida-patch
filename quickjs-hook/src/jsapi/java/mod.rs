@@ -896,6 +896,26 @@ unsafe extern "C" fn js_is_classloader_ready(
     JSValue::bool(is_classloader_ready()).raw()
 }
 
+/// JS CFunction: Java._isRawCloneJsThread() — 当前 JS 是否运行在 raw clone TLS worker。
+unsafe extern "C" fn js_is_raw_clone_js_thread(
+    _ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    JSValue::bool(crate::is_raw_clone_js_thread()).raw()
+}
+
+/// JS CFunction: Java._cutRawCloneExecutorHook() — pre-resume 失败路径切掉 executor hook。
+unsafe extern "C" fn js_cut_raw_clone_executor_hook(
+    _ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    JSValue::bool(callback::cut_raw_clone_executor_loop_hook()).raw()
+}
+
 /// JS CFunction: Java._reprobeClassLoader() — 主动重新探测 ClassLoader
 unsafe extern "C" fn js_reprobe_classloader(
     ctx: *mut ffi::JSContext,
@@ -1421,8 +1441,16 @@ unsafe fn install_java_api(ctx_ptr: *mut ffi::JSContext) -> Result<ffi::JSValue,
         callback::js_install_raw_clone_executor_hook,
         0,
     );
+    add_cfunction_to_object(
+        ctx_ptr,
+        java_obj,
+        "_cutRawCloneExecutorHook",
+        js_cut_raw_clone_executor_hook,
+        0,
+    );
     add_cfunction_to_object(ctx_ptr, java_obj, "_updateClassLoader", js_update_classloader, 1);
     add_cfunction_to_object(ctx_ptr, java_obj, "_isClassLoaderReady", js_is_classloader_ready, 0);
+    add_cfunction_to_object(ctx_ptr, java_obj, "_isRawCloneJsThread", js_is_raw_clone_js_thread, 0);
     add_cfunction_to_object(ctx_ptr, java_obj, "_reprobeClassLoader", js_reprobe_classloader, 0);
     add_cfunction_to_object(
         ctx_ptr,

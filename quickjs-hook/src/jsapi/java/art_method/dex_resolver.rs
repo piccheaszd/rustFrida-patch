@@ -325,7 +325,7 @@ fn scan_framework_class_mirror_for_name(class_name: &str) -> Option<u64> {
 
     let descriptor = class_name_to_descriptor(class_name);
     let started = std::time::Instant::now();
-    const SCAN_BUDGET: std::time::Duration = std::time::Duration::from_millis(60);
+    const SCAN_BUDGET: std::time::Duration = std::time::Duration::from_millis(1500);
 
     let Some(image) = find_framework_dex_image_for_descriptor(&descriptor, started, SCAN_BUDGET) else {
         remember_raw_class_mirror_scan_miss(class_name);
@@ -338,40 +338,68 @@ fn scan_framework_class_mirror_for_name(class_name: &str) -> Option<u64> {
 
     let Some((class_def_idx, class_idx)) = image.class_def_and_type_idx_by_descriptor(&descriptor) else {
         remember_raw_class_mirror_scan_miss(class_name);
+        output_verbose(&format!(
+            "[dex resolver] raw clone framework class mirror scan miss for {}: class_def unavailable in dex {:#x}",
+            class_name, image.base
+        ));
         return None;
     };
 
-    let mut regions = enumerate_framework_class_regions();
+    let regions = enumerate_framework_class_regions();
     if regions.is_empty() {
         remember_raw_class_mirror_scan_miss(class_name);
+        output_verbose(&format!(
+            "[dex resolver] raw clone framework class mirror scan miss for {}: no boot class regions",
+            class_name
+        ));
         return None;
     }
-    normalize_class_scan_regions(&mut regions);
+    output_verbose(&format!(
+        "[dex resolver] raw clone framework class mirror scan {}: dex={:#x} class_def_idx={} type_idx={} regions={}",
+        class_name,
+        image.base,
+        class_def_idx,
+        class_idx,
+        regions.len()
+    ));
 
-    const CANDIDATE_STEP: u64 = 8;
     const MAX_CANDIDATES: usize = 2;
 
     let mut candidates = Vec::new();
     let mut checked = 0usize;
     'outer: for region in &regions {
-        let mut addr = (region.start + (CANDIDATE_STEP - 1)) & !(CANDIDATE_STEP - 1);
-        while addr + 0x40 <= region.end {
+        let mut field_addr = region.start;
+        while field_addr + 8 <= region.end {
             checked += 1;
-            if started.elapsed() >= SCAN_BUDGET {
+            if (checked & 0xfff) == 0 && started.elapsed() >= SCAN_BUDGET {
                 output_verbose(&format!(
-                    "[dex resolver] raw clone class mirror scan timeout for {} after {} candidates",
+                    "[dex resolver] raw clone class mirror scan timeout for {} after {} words",
                     class_name, checked
                 ));
                 break 'outer;
             }
 
-            if class_mirror_candidate_matches(addr, class_def_idx, class_idx) {
-                candidates.push(addr);
-                if candidates.len() >= MAX_CANDIDATES {
-                    break 'outer;
+            let candidate_class_def = unsafe { std::ptr::read_unaligned(field_addr as *const u32) };
+            if candidate_class_def == class_def_idx {
+                let candidate_type = unsafe { std::ptr::read_unaligned((field_addr + 4) as *const u32) };
+                if candidate_type == class_idx {
+                    for object_offset in (0..0x100u64).step_by(4) {
+                        let Some(class_obj) = field_addr.checked_sub(object_offset) else {
+                            continue;
+                        };
+                        if (class_obj & 0x7) != 0 || class_obj < region.start || class_obj + 0x40 > region.end {
+                            continue;
+                        }
+                        if class_mirror_candidate_matches(class_obj, &image, class_def_idx, class_idx) {
+                            candidates.push(class_obj);
+                            if candidates.len() >= MAX_CANDIDATES {
+                                break 'outer;
+                            }
+                        }
+                    }
                 }
             }
-            addr += CANDIDATE_STEP;
+            field_addr += 4;
         }
     }
 
@@ -380,7 +408,7 @@ fn scan_framework_class_mirror_for_name(class_name: &str) -> Option<u64> {
         [] => {
             remember_raw_class_mirror_scan_miss(class_name);
             output_verbose(&format!(
-                "[dex resolver] raw clone framework class mirror scan miss for {} (checked {})",
+                "[dex resolver] raw clone framework class mirror scan miss for {} (checked {} words)",
                 class_name, checked
             ));
             None
@@ -410,50 +438,66 @@ fn find_framework_dex_image_for_descriptor(
         return None;
     };
 
-    let mut checked_pages = 0usize;
+    let mut map_entries: Vec<(u8, u64, u64, &str)> = Vec::new();
     for line in maps.lines() {
-        if started.elapsed() >= budget {
-            RAW_FRAMEWORK_DEX_SCAN_DISABLED.store(true, std::sync::atomic::Ordering::Release);
-            output_verbose(&format!(
-                "[dex resolver] raw clone framework dex image scan timeout for {} after {} pages; disabled for this process",
-                descriptor, checked_pages
-            ));
-            return None;
-        }
         let Some((start, end, perms, path)) = parse_maps_line_for_class_scan(line) else {
             continue;
         };
         if !perms.starts_with('r') || end <= start || !is_framework_dex_region_name(path) {
             continue;
         }
-        let mut addr = (start + 0xfff) & !0xfff;
-        while addr + DEX_HEADER_SIZE as u64 <= end {
-            checked_pages += 1;
+        map_entries.push((framework_dex_region_priority(path, descriptor), start, end, path));
+    }
+    map_entries.sort_by_key(|(priority, start, _, _)| (*priority, *start));
+
+    let mut checked_candidates = 0usize;
+    const DEX_SCAN_WINDOW: u64 = 256 * 1024;
+    for (_priority, start, end, _path) in map_entries {
+        if started.elapsed() >= budget {
+            output_verbose(&format!(
+                "[dex resolver] raw clone framework dex image scan timeout for {} after {} candidates",
+                descriptor, checked_candidates
+            ));
+            return None;
+        }
+        let mut addr = start;
+        let scan_end = end.min(start.saturating_add(DEX_SCAN_WINDOW));
+        while addr + DEX_HEADER_SIZE as u64 <= scan_end {
             if started.elapsed() >= budget {
-                RAW_FRAMEWORK_DEX_SCAN_DISABLED.store(true, std::sync::atomic::Ordering::Release);
                 output_verbose(&format!(
-                    "[dex resolver] raw clone framework dex image scan timeout for {} after {} pages; disabled for this process",
-                    descriptor, checked_pages
+                    "[dex resolver] raw clone framework dex image scan timeout for {} after {} candidates",
+                    descriptor, checked_candidates
                 ));
                 return None;
             }
-            let magic = if super::safe_mem::is_readable(addr, 4) {
-                unsafe { std::slice::from_raw_parts(addr as *const u8, 4) }
+
+            let word = if super::safe_mem::is_readable(addr, 4) {
+                unsafe { super::safe_mem::safe_read_u32(addr) }
             } else {
-                &[]
+                0
             };
-            if magic == DEX_MAGIC_DEX {
+            if word == u32::from_le_bytes(*DEX_MAGIC_DEX) {
+                checked_candidates += 1;
                 if let Some(image) = DexImage::from_base(addr) {
-                    if image.class_idx_by_descriptor(descriptor).is_some() {
+                    if image.class_def_and_type_idx_by_descriptor(descriptor).is_some() {
                         output_verbose(&format!(
                             "[dex resolver] raw clone framework dex image hit {} -> base={:#x}",
                             descriptor, image.base
                         ));
                         return Some(image);
                     }
+                    break;
                 }
+            } else if word == u32::from_le_bytes(*DEX_MAGIC_CDEX) {
+                checked_candidates += 1;
+                output_verbose(&format!(
+                    "[dex resolver] raw clone framework dex image candidate {} -> compact dex at {:#x}; cdex parsing not implemented yet",
+                    descriptor, addr
+                ));
+                break;
             }
-            addr += 0x1000;
+
+            addr += 4;
         }
     }
 
@@ -474,9 +518,11 @@ fn enumerate_framework_class_regions() -> Vec<ClassMirrorScanRegion> {
             continue;
         }
         if is_framework_class_region_name(path) {
-            regions.push(ClassMirrorScanRegion { start, end });
+            regions.push((framework_class_region_priority(path), ClassMirrorScanRegion { start, end }));
         }
     }
+    regions.sort_by_key(|(priority, region)| (*priority, region.start));
+    let regions = regions.into_iter().map(|(_, region)| region).collect();
     regions
 }
 
@@ -515,8 +561,23 @@ fn is_framework_class_region_name(path: &str) -> bool {
             && path.ends_with(".art"))
 }
 
+fn framework_class_region_priority(path: &str) -> u8 {
+    if path.contains("boot-framework.art") {
+        0
+    } else if path.contains("boot.art") {
+        1
+    } else if path.contains("boot-core-libart.art") {
+        2
+    } else {
+        3
+    }
+}
+
 fn is_framework_dex_region_name(path: &str) -> bool {
     if path.is_empty() {
+        return false;
+    }
+    if !path.ends_with(".jar") {
         return false;
     }
     path.starts_with("/system/framework/")
@@ -524,49 +585,34 @@ fn is_framework_dex_region_name(path: &str) -> bool {
         || path.starts_with("/product/framework/")
         || path.starts_with("/vendor/framework/")
         || path.starts_with("/apex/")
-        || path.starts_with("[anon:dalvik-/system/framework/")
-        || path.starts_with("[anon:dalvik-/apex/")
-        || path.starts_with("/data/dalvik-cache/")
-        || path.starts_with("/data/misc/apexdata/")
 }
 
-fn normalize_class_scan_regions(regions: &mut Vec<ClassMirrorScanRegion>) {
-    regions.sort_by_key(|r| (r.start, r.end));
-    let mut out: Vec<ClassMirrorScanRegion> = Vec::with_capacity(regions.len());
-    for region in regions.iter().copied() {
-        if region.end <= region.start {
-            continue;
-        }
-        if let Some(last) = out.last_mut() {
-            if region.start <= last.end {
-                if region.end > last.end {
-                    last.end = region.end;
-                }
-                continue;
-            }
-        }
-        out.push(region);
+fn framework_dex_region_priority(path: &str, descriptor: &str) -> u8 {
+    if descriptor.starts_with("Landroid/") && path.ends_with("/framework.jar") {
+        0
+    } else if (descriptor.starts_with("Ljava/") || descriptor.starts_with("Ljavax/")) && path.ends_with("/core-oj.jar") {
+        0
+    } else if path.ends_with("/framework.jar") {
+        1
+    } else if path.ends_with("/core-oj.jar") || path.ends_with("/core-libart.jar") {
+        2
+    } else {
+        3
     }
-    *regions = out;
 }
 
-fn class_mirror_candidate_matches(class_obj: u64, class_def_idx: u32, class_idx: u32) -> bool {
+fn class_mirror_candidate_matches(class_obj: u64, image: &DexImage, class_def_idx: u32, class_idx: u32) -> bool {
     if class_obj < 0x1000 || !super::safe_mem::is_readable(class_obj, 0x40) {
         return false;
     }
 
-    const MAX_CLASS_SCAN: usize = 0x100;
-    for offset in (0..MAX_CLASS_SCAN).step_by(4) {
-        if !super::safe_mem::is_readable(class_obj + offset as u64, 8) {
-            continue;
-        }
-        let candidate_class_def = unsafe { super::safe_mem::safe_read_u32(class_obj + offset as u64) };
-        let candidate_type = unsafe { super::safe_mem::safe_read_u32(class_obj + offset as u64 + 4) };
-        if candidate_class_def == class_def_idx && candidate_type == class_idx {
-            return true;
-        }
+    let Some(candidate_image) = dex_image_from_class_with_logging(class_obj, false) else {
+        return false;
+    };
+    if candidate_image.base != image.base {
+        return false;
     }
-    false
+    image.class_object_matches_descriptor_by_indices(class_obj, class_def_idx, class_idx)
 }
 
 fn resolve_super_class_mirror(class_obj: u64, expected_descriptor: &str) -> Option<u64> {
@@ -1431,6 +1477,83 @@ impl DexImage {
             || self.class_object_has_declared_field_index(class_obj, expected_descriptor)
     }
 
+    fn class_object_matches_descriptor_by_indices(&self, class_obj: u64, class_def_idx: u32, type_idx: u32) -> bool {
+        if self.class_object_has_adjacent_class_def_and_type_idx(class_obj, class_def_idx, type_idx) {
+            return true;
+        }
+        self.class_object_has_class_def_idx(class_obj, class_def_idx)
+            && (self.class_object_has_type_idx(class_obj, type_idx)
+                || self.class_object_has_declared_method_index_by_class_def(class_obj, class_def_idx)
+                || self.class_object_has_declared_field_index_by_class_def(class_obj, class_def_idx))
+    }
+
+    fn class_object_has_adjacent_class_def_and_type_idx(&self, class_obj: u64, class_def_idx: u32, type_idx: u32) -> bool {
+        const MAX_CLASS_SCAN: usize = 0x100;
+        for offset in (0..MAX_CLASS_SCAN).step_by(4) {
+            if !super::safe_mem::is_readable(class_obj + offset as u64, 8) {
+                continue;
+            }
+            let candidate_class_def = unsafe { super::safe_mem::safe_read_u32(class_obj + offset as u64) };
+            let candidate_type = unsafe { super::safe_mem::safe_read_u32(class_obj + offset as u64 + 4) };
+            if candidate_class_def == class_def_idx && candidate_type == type_idx {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn class_object_has_class_def_idx(&self, class_obj: u64, class_def_idx: u32) -> bool {
+        const MAX_CLASS_SCAN: usize = 0x100;
+        let Some(class_defs_size) = self.read_u32(0x60) else {
+            return false;
+        };
+        if class_def_idx >= class_defs_size {
+            return false;
+        }
+        for offset in (0..MAX_CLASS_SCAN).step_by(4) {
+            if !super::safe_mem::is_readable(class_obj + offset as u64, 4) {
+                continue;
+            }
+            if unsafe { super::safe_mem::safe_read_u32(class_obj + offset as u64) } == class_def_idx {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn class_object_has_type_idx(&self, class_obj: u64, type_idx: u32) -> bool {
+        const MAX_CLASS_SCAN: usize = 0x100;
+        let Some(type_ids_size) = self.read_u32(0x40) else {
+            return false;
+        };
+        if type_idx >= type_ids_size {
+            return false;
+        }
+        for offset in (0..MAX_CLASS_SCAN).step_by(4) {
+            if !super::safe_mem::is_readable(class_obj + offset as u64, 4) {
+                continue;
+            }
+            if unsafe { super::safe_mem::safe_read_u32(class_obj + offset as u64) } == type_idx {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn class_object_has_declared_method_index_by_class_def(&self, class_obj: u64, class_def_idx: u32) -> bool {
+        let Some(class_descriptor) = self.class_descriptor_by_class_def_idx(class_def_idx) else {
+            return false;
+        };
+        self.class_object_has_declared_method_index(class_obj, &class_descriptor)
+    }
+
+    fn class_object_has_declared_field_index_by_class_def(&self, class_obj: u64, class_def_idx: u32) -> bool {
+        let Some(class_descriptor) = self.class_descriptor_by_class_def_idx(class_def_idx) else {
+            return false;
+        };
+        self.class_object_has_declared_field_index(class_obj, &class_descriptor)
+    }
+
     fn class_object_descriptor_matches(&self, class_obj: u64, expected_descriptor: &str) -> bool {
         self.class_object_descriptors(class_obj)
             .into_iter()
@@ -1614,6 +1737,17 @@ impl DexImage {
         }
 
         None
+    }
+
+    fn class_descriptor_by_class_def_idx(&self, class_def_idx: u32) -> Option<String> {
+        let class_defs_size = self.read_u32(0x60)?;
+        let class_defs_off = self.read_u32(0x64)?;
+        if class_def_idx >= class_defs_size {
+            return None;
+        }
+        let class_def = class_defs_off as u64 + class_def_idx as u64 * 32;
+        let class_idx = self.read_u32(class_def)?;
+        self.type_descriptor(class_idx)
     }
 
     fn class_data_off_by_class_idx(&self, class_idx: u32) -> Option<u32> {

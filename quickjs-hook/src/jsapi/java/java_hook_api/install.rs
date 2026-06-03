@@ -126,12 +126,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
     };
 
     let (art_method, is_static) = if raw_clone {
-        match resolve_method_via_executor(
-            class_name.clone(),
-            method_name.clone(),
-            actual_sig.clone(),
-            force_static,
-        ) {
+        match resolve_art_method(env, &class_name, &method_name, &actual_sig, force_static) {
             Ok(r) => r,
             Err(msg) => return throw_internal_error(ctx, msg),
         }

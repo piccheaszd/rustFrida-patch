@@ -872,7 +872,9 @@ pub(crate) unsafe fn install_raw_clone_executor_loop_hook(env: JniEnv) -> bool {
     }
 
     let mut installed = install_message_queue_executor_hook(env);
-    installed |= install_handler_dispatch_executor_hook(env);
+    if !env.is_null() {
+        installed |= install_handler_dispatch_executor_hook(env);
+    }
     installed
 }
 

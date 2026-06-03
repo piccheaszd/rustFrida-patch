@@ -2213,9 +2213,16 @@ fn write_u64(buf: &mut [u8], offset: usize, value: u64) {
     }
 }
 
-/// 恢复所有挂起的子进程连接（发 ACK → 等 EOF → 等 SIGSTOP → 还原 → SIGCONT）
-/// 与 Frida close() 一致：退出前先恢复所有 gated connections，防止子进程永远卡在 recv(ACK)
-fn cleanup_pending_connections() {
+#[derive(Clone, Copy)]
+enum PendingConnectionCleanup {
+    Resume,
+    KillAfterRevert,
+}
+
+/// 处理所有挂起的子进程连接。
+/// 正常退出走 Resume，避免 child 永远卡在 recv(ACK)；
+/// pre-resume Java hook 失败走 KillAfterRevert，避免放行后错过早期 hook。
+fn cleanup_pending_connections(mode: PendingConnectionCleanup) {
     let conns = match ACTIVE_CONNECTIONS.get() {
         Some(lock) => lock,
         None => return,
@@ -2233,22 +2240,33 @@ fn cleanup_pending_connections() {
         return;
     }
 
-    log_info!("正在恢复 {} 个挂起的子进程...", entries.len());
+    match mode {
+        PendingConnectionCleanup::Resume => log_info!("正在恢复 {} 个挂起的子进程...", entries.len()),
+        PendingConnectionCleanup::KillAfterRevert => log_info!("正在终止 {} 个未放行的子进程...", entries.len()),
+    }
 
     for (pid, (mut stream, ppid)) in entries {
-        log_verbose!("恢复挂起的子进程 {} (ppid={})...", pid, ppid);
+        match mode {
+            PendingConnectionCleanup::Resume => log_verbose!("恢复挂起的子进程 {} (ppid={})...", pid, ppid),
+            PendingConnectionCleanup::KillAfterRevert => {
+                log_verbose!("终止未放行的子进程 {} (ppid={})...", pid, ppid)
+            }
+        }
 
         // 检查子进程是否仍存在
         if !std::path::Path::new(&format!("/proc/{}", pid)).exists() {
-            log_verbose!("子进程 {} 已不存在，跳过恢复", pid);
+            log_verbose!("子进程 {} 已不存在，跳过处理", pid);
             drop(stream);
             continue;
         }
 
         // 1. 发送 ACK 解除子进程阻塞
         if stream.write_all(&[ACK_BYTE]).is_err() {
-            // 连接已断开，子进程可能已退出，仍尝试 SIGCONT
-            unsafe { libc::kill(pid as i32, libc::SIGCONT) };
+            // 连接已断开，子进程可能已退出；按清理模式处理剩余进程。
+            match mode {
+                PendingConnectionCleanup::Resume => unsafe { libc::kill(pid as i32, libc::SIGCONT) },
+                PendingConnectionCleanup::KillAfterRevert => unsafe { libc::kill(pid as i32, libc::SIGKILL) },
+            };
             continue;
         }
 
@@ -2260,13 +2278,14 @@ fn cleanup_pending_connections() {
         if wait_until_stopped(pid).is_ok() {
             let _ = revert_child_patch_by_ppid(pid, ppid);
         }
-        unsafe { libc::kill(pid as i32, libc::SIGCONT) };
+        match mode {
+            PendingConnectionCleanup::Resume => unsafe { libc::kill(pid as i32, libc::SIGCONT) },
+            PendingConnectionCleanup::KillAfterRevert => unsafe { libc::kill(pid as i32, libc::SIGKILL) },
+        };
     }
 }
 
-/// 退出时还原所有 Zygote patch（幂等：多次调用只执行一次）
-/// 与 Frida close() 顺序一致：先恢复挂起的子进程，再还原 Zygote patch
-pub(crate) fn cleanup_zygote_patches() {
+fn cleanup_zygote_patches_with_pending_mode(mode: PendingConnectionCleanup) {
     CLEANUP_STARTED.store(true, Ordering::SeqCst);
 
     // 幂等保护：所有调用路径（正常退出 + 信号处理）共享此检查
@@ -2276,7 +2295,7 @@ pub(crate) fn cleanup_zygote_patches() {
 
     // 1. 先恢复所有挂起的子进程连接（与 Frida close() 顺序一致）
     //    必须在还原 Zygote 之前执行：子进程持有 COW 副本，需要独立还原
-    cleanup_pending_connections();
+    cleanup_pending_connections(mode);
 
     // 2. 再还原 Zygote patch
     let patches = match ZYGOTE_PATCHES.get() {
@@ -2358,6 +2377,17 @@ pub(crate) fn cleanup_zygote_patches() {
 
     // 还原 SELinux 状态
     crate::selinux::restore_selinux();
+}
+
+/// 退出时还原所有 Zygote patch（幂等：多次调用只执行一次）
+/// 与 Frida close() 顺序一致：先恢复挂起的子进程，再还原 Zygote patch
+pub(crate) fn cleanup_zygote_patches() {
+    cleanup_zygote_patches_with_pending_mode(PendingConnectionCleanup::Resume);
+}
+
+/// pre-resume Java hook 失败时使用：还原 child patch 后终止 child，避免放行错过早期 hook。
+pub(crate) fn abort_pending_children_and_cleanup_zygote_patches() {
+    cleanup_zygote_patches_with_pending_mode(PendingConnectionCleanup::KillAfterRevert);
 }
 
 /// 是否已执行过清理（幂等保护，cleanup_zygote_patches 内部使用）

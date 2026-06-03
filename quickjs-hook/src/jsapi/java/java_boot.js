@@ -1414,21 +1414,25 @@
                     }
                     return cache._new;
                 }
-                // 静态字段检查（per-class 缓存，仅首次走 C 调用）
-                if (staticFieldWrappers[prop]) return staticFieldWrappers[prop];
-                var meta = _resolveFieldMeta(cls, prop, 0);
-                if (meta && meta.st) {
-                    var fw;
-                    if (_hasMethod(cls, prop)) {
-                        if (!wrappers[prop]) {
-                            wrappers[prop] = _bindMethodWrapper(new MethodWrapper(cls, prop, null, cache));
+                // 静态字段检查（per-class 缓存，仅首次走 C 调用）。raw clone
+                // pre-resume 阶段不能为了字段消歧等待 Java executor，否则
+                // Java.ready 的 framework gate 可能在装好前就被 resume 越过。
+                if (!_isRawCloneJsThread()) {
+                    if (staticFieldWrappers[prop]) return staticFieldWrappers[prop];
+                    var meta = _resolveFieldMeta(cls, prop, 0);
+                    if (meta && meta.st) {
+                        var fw;
+                        if (_hasMethod(cls, prop)) {
+                            if (!wrappers[prop]) {
+                                wrappers[prop] = _bindMethodWrapper(new MethodWrapper(cls, prop, null, cache));
+                            }
+                            fw = _decorateWithFieldValue(wrappers[prop], staticTarget, meta);
+                        } else {
+                            fw = new FieldWrapper(staticTarget, meta);
                         }
-                        fw = _decorateWithFieldValue(wrappers[prop], staticTarget, meta);
-                    } else {
-                        fw = new FieldWrapper(staticTarget, meta);
+                        staticFieldWrappers[prop] = fw;
+                        return fw;
                     }
-                    staticFieldWrappers[prop] = fw;
-                    return fw;
                 }
                 // 方法
                 if (!wrappers[prop]) {
@@ -1469,13 +1473,32 @@
     var _readyCallbacks = [];
     var _readyFired = false;
     var _readyGateSig = "(Ljava/lang/ClassLoader;Ljava/lang/String;Landroid/content/Context;)Landroid/app/Application;";
+    var _readyCallAppSig = "(Landroid/app/Application;)V";
     var _gateInstalled = false;
+
+    function _isRawCloneJsThread() {
+        try {
+            return Java._isRawCloneJsThread && Java._isRawCloneJsThread();
+        } catch (_) {
+            return false;
+        }
+    }
 
     function _callReadyCallback(fn, index) {
         try {
             fn();
         } catch(e) {
             console.log("[Java.ready] callback #" + index + " error: " + e);
+        }
+    }
+
+    function _fireReadyCallbacks() {
+        if (_readyFired) return;
+        _readyFired = true;
+        var cbs = _readyCallbacks;
+        _readyCallbacks = [];
+        for (var i = 0; i < cbs.length; i++) {
+            _callReadyCallback(cbs[i], i);
         }
     }
 
@@ -1494,20 +1517,42 @@
                     Java._updateClassLoader(clPtr);
                 }
 
-                _readyFired = true;
-                var cbs = _readyCallbacks;
-                _readyCallbacks = [];
-                for (var i = 0; i < cbs.length; i++) {
-                    _callReadyCallback(cbs[i], i);
-                }
+                _fireReadyCallbacks();
 
                 return app;
             };
+            Inst.callApplicationOnCreate.overload(_readyCallAppSig).impl = function(app) {
+                if (app !== null && app !== undefined) {
+                    try {
+                        var cl = app.getClass().getClassLoader();
+                        var clPtr = cl;
+                        if (typeof clPtr === "object" && clPtr.__jptr !== undefined) {
+                            clPtr = clPtr.__jptr;
+                        }
+                        Java._updateClassLoader(clPtr);
+                    } catch (_) {}
+                }
+                _fireReadyCallbacks();
+                return this.$orig(app);
+            };
             _gateInstalled = true;
-        } catch(e) {}
+        } catch(e) {
+            console.log("[Java.ready] gate hook install failed: " + e);
+            if (_isRawCloneJsThread()) {
+                try {
+                    if (Java._cutRawCloneExecutorHook) {
+                        Java._cutRawCloneExecutorHook();
+                    }
+                } catch (_) {}
+                throw e;
+            }
+        }
     };
 
     Java._flushReadyCallbacks = function() {
+        if (_isRawCloneJsThread()) {
+            return;
+        }
         if (!_readyFired && !Java._isClassLoaderReady()) {
             try {
                 if (Java._reprobeClassLoaderOnce && Java._reprobeClassLoaderOnce()) {
@@ -1538,6 +1583,15 @@
             return;
         }
 
+        if (_isRawCloneJsThread()) {
+            var installRawGate = _readyCallbacks.length === 0;
+            _readyCallbacks.push(fn);
+            if (installRawGate) {
+                Java._installGateHook();
+            }
+            return;
+        }
+
         try {
             if (Java._reprobeClassLoaderOnce && Java._reprobeClassLoaderOnce()) {
                 _readyFired = true;
@@ -1546,11 +1600,11 @@
             }
         } catch (_) {}
 
-        if (_readyCallbacks.length === 0) {
+        var installGate = _readyCallbacks.length === 0;
+        _readyCallbacks.push(fn);
+        if (installGate) {
             Java._installGateHook();
         }
-
-        _readyCallbacks.push(fn);
     };
 
     function _getClassLoaders() {
