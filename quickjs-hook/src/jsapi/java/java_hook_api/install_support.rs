@@ -108,15 +108,10 @@ impl Drop for JavaHookInstallGuard {
                     (self.art_method as usize + self.access_flags_offset) as *mut u32,
                     self.original_access_flags,
                 );
-                std::ptr::write_volatile(
-                    (self.art_method as usize + self.data_offset) as *mut u64,
-                    self.original_data,
+                hook_ffi::hook_flush_cache(
+                    (self.art_method as usize + self.access_flags_offset) as *mut std::ffi::c_void,
+                    4,
                 );
-                std::ptr::write_volatile(
-                    (self.art_method as usize + self.entry_point_offset) as *mut u64,
-                    self.original_entry_point,
-                );
-                hook_ffi::hook_flush_cache(self.art_method as *mut std::ffi::c_void, self.entry_point_offset + 8);
             }
 
             if self.redirect_installed {
@@ -288,7 +283,7 @@ pub(super) unsafe fn install_per_method_router_hook(
     env: JniEnv,
     art_method: u64,
     is_native_method: bool,
-    force_standalone_stub: bool,
+    shared_native_art_entry: bool,
     enable_fast_orig: bool,
 ) -> Result<(Option<u64>, u64, bool, Option<u64>), String> {
     if has_independent_code {
@@ -360,7 +355,7 @@ pub(super) unsafe fn install_per_method_router_hook(
             || (resolved_interp != 0 && original_entry_point == resolved_interp)
             || (resolved_res != 0 && original_entry_point == resolved_res);
 
-        if force_standalone_stub || !is_already_routed {
+        if shared_native_art_entry || !is_already_routed {
             if is_native_method {
                 output_verbose(&format!(
                     "[java hook] Step 9: native/shared ART entry kept: ep={:#x}; external ArtMethod entry stub disabled",
@@ -368,17 +363,9 @@ pub(super) unsafe fn install_per_method_router_hook(
                 ));
                 return Ok((None, 0, false, None));
             }
-            if interp_bridge == 0 {
-                return Err(format!(
-                    "shared entry {:#x} requires quick_to_interpreter_bridge; external ArtMethod entry stub disabled",
-                    original_entry_point
-                ));
-            }
-            std::ptr::write_volatile((art_method as usize + ep_offset) as *mut u64, interp_bridge);
-            hook_ffi::hook_flush_cache((art_method as usize + ep_offset) as *mut std::ffi::c_void, 8);
             output_verbose(&format!(
-                "[java hook] Step 9: shared entry downgraded to ART interpreter bridge: ep={:#x} -> {:#x}, forced={}",
-                original_entry_point, interp_bridge, force_standalone_stub
+                "[java hook] Step 9: shared ART entry kept: ep={:#x}; target ArtMethod entry/data unchanged, rely on Layer 1/2 routing",
+                original_entry_point
             ));
             return Ok((None, 0, false, None));
         }

@@ -460,11 +460,17 @@ pub fn cleanup() -> bool {
         return false;
     }
     ENGINE_INITIALIZED.store(false, Ordering::SeqCst);
-    quickjs_hook::recomp::set_cleanup_release_only(true);
-    // Recomp full cleanup is release-only: first stop kernel redirection, then
-    // cut HookEntry/ArtMethod state without writing anonymous recomp mirrors.
-    crate::recompiler::release_all();
-    stage("phase1 release_all_recomp", &mut t);
+    quickjs_hook::recomp::set_cleanup_release_only(false);
+    if quickjs_hook::raw_clone_java_executor_hook_active() {
+        let executor_cut = quickjs_hook::abort_raw_clone_java_executor_for_unload();
+        if !executor_cut || quickjs_hook::raw_clone_java_executor_hook_active() {
+            log_msg("[quickjs] raw-clone Java executor hook still active; destructive cleanup skipped\n".to_string());
+            detach_current_jni_thread();
+            stage("cleanup detach_jni_thread", &mut t);
+            return false;
+        }
+        stage("phase0 cut_raw_clone_executor", &mut t);
+    }
 
     // ============================================================
     // Phase 1: 切断所有 "入口 / 路由" hook，阻止新 thunk 进入。
@@ -502,12 +508,15 @@ pub fn cleanup() -> bool {
     }
 
     // ============================================================
-    // Phase 3: 停止新 recomp 执行，并等待所有线程活动栈离开 hook/recomp 地址。
+    // Phase 3: 切断 walkstack guard，再停止新 recomp 执行，并等待所有线程活动栈离开 hook/recomp 地址。
     //
     // drain=0 只说明没有线程仍在 thunk 中执行；ART quick 栈上仍可能保留
     // generated return PC，后续 Throwable/ANR/GC StackVisitor 还会读到它。
     // 因此必须在拆 walkstack guards 和 munmap 前做全线程栈 safepoint。
     // ============================================================
+    cut_art_controller_walkstack_guards();
+    stage("phase3 cut_art_controller_walkstack_guards", &mut t);
+    quickjs_hook::recomp::set_cleanup_release_only(true);
     crate::recompiler::release_all();
     stage("phase3 release_all_recomp", &mut t);
 
@@ -550,28 +559,6 @@ pub fn cleanup() -> bool {
     // ============================================================
     // Phase 4: 释放资源 + 同步释放 pool/recomp
     // ============================================================
-    cut_art_controller_walkstack_guards();
-    stage("phase4 cut_art_controller_walkstack_guards", &mut t);
-    crate::recompiler::release_all();
-    stage("phase4 release_guard_recomp", &mut t);
-    let mut post_guard_ranges = hook_engine_exec_ranges();
-    let post_guard_recomp_ranges = crate::recompiler::get_retained_ranges();
-    let post_guard_scan_stack = !post_guard_recomp_ranges.is_empty();
-    post_guard_ranges.extend(post_guard_recomp_ranges);
-    let post_guard_clean = if post_guard_scan_stack {
-        crate::safepoint::wait_until_clean(&post_guard_ranges, CLEANUP_SAFEPOINT_BUDGET_MS)
-    } else {
-        crate::safepoint::wait_until_pc_lr_clean(&post_guard_ranges, CLEANUP_SAFEPOINT_BUDGET_MS)
-    };
-    stage("phase4 safepoint_after_guard_cut", &mut t);
-    if !post_guard_clean {
-        log_msg(
-            "[quickjs] post-guard safepoint timeout: keep executable memory mapped; final munmap skipped\n".to_string(),
-        );
-        detach_current_jni_thread();
-        stage("cleanup detach_jni_thread", &mut t);
-        return false;
-    }
     free_art_controller_state();
     stage("phase4 free_art_controller_state", &mut t);
     free_java_hooks();
@@ -685,9 +672,20 @@ pub fn cleanup_for_unload_leak_safe() -> bool {
         return false;
     }
     ENGINE_INITIALIZED.store(false, Ordering::SeqCst);
-    quickjs_hook::recomp::set_cleanup_release_only(true);
-    crate::recompiler::release_all();
-    stage("phase1 release_all_recomp", &mut t);
+    quickjs_hook::recomp::set_cleanup_release_only(false);
+    if quickjs_hook::raw_clone_java_executor_hook_active() {
+        let executor_cut = quickjs_hook::abort_raw_clone_java_executor_for_unload();
+        if !executor_cut || quickjs_hook::raw_clone_java_executor_hook_active() {
+            log_msg(
+                "[quickjs] raw-clone Java executor hook still active; managed-safe unload cleanup skipped\n"
+                    .to_string(),
+            );
+            detach_current_jni_thread();
+            stage("cleanup detach_jni_thread", &mut t);
+            return false;
+        }
+        stage("phase0 cut_raw_clone_executor", &mut t);
+    }
 
     cut_java_hooks();
     stage("phase1 cut_java_hooks", &mut t);
@@ -708,11 +706,11 @@ pub fn cleanup_for_unload_leak_safe() -> bool {
         return false;
     }
 
-    crate::recompiler::release_all();
-    stage("phase3 release_all_recomp", &mut t);
-
     cut_art_controller_walkstack_guards();
     stage("phase3 cut_art_controller_walkstack_guards", &mut t);
+    quickjs_hook::recomp::set_cleanup_release_only(true);
+    crate::recompiler::release_all();
+    stage("phase3 release_all_recomp", &mut t);
     free_art_controller_state();
     stage("phase3 free_art_controller_state", &mut t);
 

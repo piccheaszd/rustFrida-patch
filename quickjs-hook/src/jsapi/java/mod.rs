@@ -1526,24 +1526,20 @@ pub fn register_java_api(ctx: &JSContext) {
 // Java hook 拆卸原子操作 — 供 js_java_unhook 和 cleanup_java_hooks 复用
 // ============================================================================
 
-/// 恢复 ArtMethod 原始字段 (access_flags, data_, entry_point) + flush icache。
+/// 恢复 ArtMethod 原始 flags。
+///
+/// 目标 app/framework ArtMethod 的 entry_point_/data_ 不写外部地址，也不在
+/// cleanup 时用旧快照覆盖 ART 自己后续做出的更新。路由切断通过 code hook /
+/// ART shared entry hook 完成。
 pub(super) unsafe fn restore_art_method_fields(data: &JavaHookData) {
     if let Some(spec) = ART_METHOD_SPEC.get() {
         std::ptr::write_volatile(
             (data.art_method as usize + spec.access_flags_offset) as *mut u32,
             data.original_access_flags,
         );
-        std::ptr::write_volatile(
-            (data.art_method as usize + spec.data_offset) as *mut u64,
-            data.original_data,
-        );
-        std::ptr::write_volatile(
-            (data.art_method as usize + spec.entry_point_offset) as *mut u64,
-            data.original_entry_point,
-        );
         hook_ffi::hook_flush_cache(
-            data.art_method as usize as *mut std::ffi::c_void,
-            spec.entry_point_offset + 8,
+            (data.art_method as usize + spec.access_flags_offset) as *mut std::ffi::c_void,
+            4,
         );
     }
 }
@@ -1551,9 +1547,9 @@ pub(super) unsafe fn restore_art_method_fields(data: &JavaHookData) {
 /// 移除 Layer 3 per-method inline hook + stealth2 revert_slot_patch。
 pub(super) unsafe fn remove_per_method_hook(data: &JavaHookData) {
     if data.quick_trampoline == 0 {
-        // No inline per-method hook was installed. Shared/early-entry methods are routed
-        // through ART trampolines only, and restore_art_method_fields() restores the
-        // original ArtMethod fields.
+        // No inline per-method hook was installed. Shared/early-entry methods are
+        // routed through ART trampolines only; restore_art_method_fields() only
+        // restores the access flags.
         return;
     }
 
@@ -1653,7 +1649,7 @@ pub fn cut_java_hooks() {
                 remove_per_method_hook(data);
                 // registered native 直接 fnPtr hook 也要先切断，避免新调用进 callback
                 remove_native_entry_hook(data);
-                // 恢复 ArtMethod 字段 (Layer 1/2 路由也切断)
+                // 恢复 ArtMethod flags (Layer 1/2 路由也切断)
                 restore_art_method_fields(data);
                 // router 表条目保留 → OAT bypass 对 in-flight 仍生效
                 // router 表清空放到 free 阶段

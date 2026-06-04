@@ -448,11 +448,15 @@ fn cleanup_agent_runtime_for_unload(fast_unload_ok: bool) -> bool {
     let mut safe_to_return = true;
     #[cfg(feature = "quickjs")]
     {
+        if !fast_unload_ok {
+            log_msg_sync(
+                "Java executor hook 未确认切断，跳过目标进程内破坏性清理以避免释放仍可能被 ART 调用的 recomp 页\n"
+                    .to_string(),
+            );
+            return false;
+        }
         if quickjs_loader::is_initialized() {
             safe_to_return = quickjs_loader::cleanup_for_unload_leak_safe();
-        } else if !fast_unload_ok {
-            log_msg_sync("QuickJS 未完全初始化，已跳过目标进程内破坏性清理以避免崩溃\n".to_string());
-            safe_to_return = false;
         }
     }
     if safe_to_return {

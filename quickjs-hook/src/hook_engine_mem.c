@@ -626,6 +626,16 @@ void* hook_mmap_near_range(void* target, size_t alloc_size, int64_t max_range) {
                         gaps[num_gaps].end = ge;
                         gaps[num_gaps].dist = d;
                         num_gaps++;
+                    } else {
+                        int farthest = 0;
+                        for (int k = 1; k < MAX_GAPS; k++) {
+                            if (gaps[k].dist > gaps[farthest].dist) farthest = k;
+                        }
+                        if (d < gaps[farthest].dist) {
+                            gaps[farthest].start = gs;
+                            gaps[farthest].end = ge;
+                            gaps[farthest].dist = d;
+                        }
                     }
                 }
             }
@@ -649,9 +659,10 @@ void* hook_mmap_near_range(void* target, size_t alloc_size, int64_t max_range) {
     #define MAP_FIXED_NOREPLACE 0x100000
     #endif
 
-    /* 单 gap 探测上限：每次步进 alloc_size，64 步 × 64KB = 4MB 覆盖，足够跨过
-     * 隐藏的老 pool。更大的 gap 也会被系统 VMA 切断，不用担心单 gap 过大。 */
-    const int MAX_STEPS_PER_GAP = 64;
+    /* 单 gap 探测上限：按页粒度围绕最近点扫描。不能按 alloc_size 步进；
+     * /proc/self/maps 里可见的空洞可能被隐藏 VMA 或内核保留占掉前几页，
+     * 只试 gap 起点会误判“近址内存不足”。 */
+    const int MAX_STEPS_PER_GAP = 1024;
 
     for (int i = 0; i < num_gaps; i++) {
         uintptr_t gs = gaps[i].start;
@@ -670,7 +681,7 @@ void* hook_mmap_near_range(void* target, size_t alloc_size, int64_t max_range) {
 
         int had_unsupported = 0;
         int steps = 0;
-        /* 以 origin 为中心，按 alloc_size 步长交替向 +/- 方向扫 */
+        /* 以 origin 为中心，按 page_size 步长交替向 +/- 方向扫 */
         for (int step = 0; step < MAX_STEPS_PER_GAP * 2; step++) {
             int64_t off_steps;
             if (step == 0) off_steps = 0;
@@ -679,11 +690,11 @@ void* hook_mmap_near_range(void* target, size_t alloc_size, int64_t max_range) {
 
             uintptr_t cand;
             if (off_steps >= 0) {
-                uintptr_t absoff = (uintptr_t)off_steps * (uintptr_t)alloc_size;
+                uintptr_t absoff = (uintptr_t)off_steps * (uintptr_t)page_size;
                 if (origin > gap_last || absoff > gap_last - origin) continue;
                 cand = origin + absoff;
             } else {
-                uintptr_t absoff = (uintptr_t)(-off_steps) * (uintptr_t)alloc_size;
+                uintptr_t absoff = (uintptr_t)(-off_steps) * (uintptr_t)page_size;
                 if (origin < gs || absoff > origin - gs) continue;
                 cand = origin - absoff;
             }

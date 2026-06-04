@@ -4,6 +4,7 @@
 //!
 //! Layer 1: 共享 stub 路由 (全局, hook 一次)
 //!   hook_install_art_router(quick_generic_jni_trampoline)
+//!   hook_install_art_router(nterp_entry_point)
 //!   hook_install_art_router(quick_to_interpreter_bridge)
 //!   hook_install_art_router(quick_resolution_trampoline)
 //!
@@ -23,7 +24,7 @@ use crate::jsapi::util::{proc_maps_entries, read_proc_self_maps};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use super::art_method::{get_instrumentation_spec, read_entry_point, ArtBridgeFunctions, ART_BRIDGE_FUNCTIONS};
+use super::art_method::{get_instrumentation_spec, ArtBridgeFunctions, ART_BRIDGE_FUNCTIONS};
 use super::art_thread::{get_art_thread_spec, get_managed_stack_spec, ArtThreadSpec, ART_THREAD_SPEC};
 use super::callback::{get_replacement_method, is_replacement_method};
 use super::jni_core::{get_runtime_addr, JniEnv};
@@ -491,6 +492,10 @@ unsafe fn restore_forced_interpret_only() {
 #[allow(dead_code)]
 static JNI_TRAMPOLINE_BYPASS: AtomicU64 = AtomicU64::new(0);
 
+pub(super) fn jni_trampoline_router_installed() -> bool {
+    JNI_TRAMPOLINE_BYPASS.load(Ordering::Acquire) != 0
+}
+
 /// 记录已安装的 artController 全局 hook 信息
 struct ArtControllerState {
     /// Layer 1: 已 hook 的共享 stub 地址 (jni_trampoline, interpreter_bridge, resolution)
@@ -574,26 +579,33 @@ pub(super) fn ensure_art_controller_initialized(
     // Hook 路由依靠:
     //   - Layer 1 (shared stub hooks) + Layer 2 (DoCall) 覆盖 interpreter 路径
     //   - Layer 3 (per-method quickCode hook) 覆盖 compiled 路径 (含 JIT cache)
-    //   - install.rs 中 nterp → interpreter_bridge 降级确保 nterp 方法走 Layer 1
+    //   - stealth=1/2 时 Layer 1 直接覆盖 nterp / interpreter / generic JNI entrypoints
 
     let mut shared_stub_targets = Vec::new();
     let mut do_call_targets = Vec::new();
 
     // --- Layer 1: 共享 stub 路由 hook ---
-    // 跳过 jni_trampoline: spawn 模式下 resume_child 之后才安装 hooks，
-    // 子进程主线程正在高频调用 JNI。inline hook jni_trampoline 的 prologue
-    // 覆写与执行存在竞态 → SIGSEGV。Frida 用 Memory.patchCode() 暂停所有
-    // 线程后 patch，我们目前没有这个机制。
-    // replacement 方法的 quickCode 仍指向 jni_trampoline（不经过 Layer 1），
-    // 路由通过 Layer 2 (DoCall) 和 Layer 3 (per-method hook) 覆盖。
     //
-    // 实测 Layer 1 对 has_independent_code=true 方法 100% 冗余（Layer 3 已截获
-    // compiled caller 的 BL）。保留 Layer 1 作为 deopt / GC FixupStaticTrampolines
-    // 把 entry_point 改回 libart trampoline 的 edge case 安全网。
-    let stubs = [
-        ("quick_to_interpreter_bridge", bridge.quick_to_interpreter_bridge),
-        ("quick_resolution_trampoline", bridge.quick_resolution_trampoline),
-    ];
+    // quick_generic_jni_trampoline 覆盖 native/shared-JNI 方法。normal 模式下仍跳过:
+    // spawn resume 后主线程会高频进 JNI，直接 mprotect/写原 libart prologue 有竞态。
+    // Java.setStealth(1/2) 时才启用，底层走 wxshadow/recomp，不修改目标 ArtMethod
+    // entry_point_/data_ 到外部地址。
+    //
+    // nterp/interpreter/resolution stub 覆盖解释执行、deopt、GC FixupStaticTrampolines
+    // 把 entry_point 保持/改回 libart trampoline 的 edge case。
+    let mut stubs = Vec::new();
+    if stealth_mode() == StealthMode::Normal {
+        output_verbose(
+            "[artController] Layer 1: quick_generic_jni_trampoline skipped in normal mode; enable Java.setStealth(1/2) for shared JNI native routing",
+        );
+    } else {
+        stubs.push(("quick_generic_jni_trampoline", bridge.quick_generic_jni_trampoline));
+    }
+    if bridge.nterp_entry_point != 0 && stealth_mode() != StealthMode::Normal {
+        stubs.push(("nterp_entry_point", bridge.nterp_entry_point));
+    }
+    stubs.push(("quick_to_interpreter_bridge", bridge.quick_to_interpreter_bridge));
+    stubs.push(("quick_resolution_trampoline", bridge.quick_resolution_trampoline));
 
     for (name, addr) in &stubs {
         if *addr == 0 {
@@ -1510,9 +1522,7 @@ unsafe extern "C" fn on_get_oat_quick_method_header(
 /// 同步内容:
 /// 1. declaring_class_ 同步: original → replacement (Fix 1)
 /// 2. accessFlags 修复: kAccCompileDontBother + clear kAccFastInterpreterToInterpreterInvoke
-/// 3. entry_point 验证与恢复 (Fix 2 + existing)
 unsafe fn synchronize_replacement_methods() {
-    use super::art_method::ART_BRIDGE_FUNCTIONS;
     use super::callback::{HookType, JAVA_HOOK_REGISTRY};
     use super::jni_core::{k_acc_compile_dont_bother, ART_METHOD_SPEC, K_ACC_FAST_INTERP_TO_INTERP};
 
@@ -1529,14 +1539,6 @@ unsafe fn synchronize_replacement_methods() {
         Some(s) => s,
         None => return,
     };
-    let ep_offset = spec.entry_point_offset;
-
-    // 获取 nterp 和 interpreter_bridge 地址 (共享 stub 方法的 GC 同步用)
-    let (nterp, interp_bridge) = match ART_BRIDGE_FUNCTIONS.get() {
-        Some(b) => (b.nterp_entry_point, b.quick_to_interpreter_bridge),
-        None => (0, 0),
-    };
-
     for (_, data) in registry.iter() {
         let art_method = data.art_method as usize;
 
@@ -1578,17 +1580,9 @@ unsafe fn synchronize_replacement_methods() {
             std::ptr::write_volatile((art_method + spec.access_flags_offset) as *mut u32, fixed);
         }
 
-        // --- Fix 2 + existing: entry_point 验证与恢复 ---
-        // Target ArtMethod.entry_point_ must never be restored to hook-pool
-        // code. Only keep the original ART/app entry, or degrade nterp to the
-        // ART interpreter bridge.
-        if nterp != 0 && interp_bridge != 0 {
-            let current_ep = read_entry_point(data.art_method, ep_offset);
-            if current_ep == nterp {
-                std::ptr::write_volatile((art_method + ep_offset) as *mut u64, interp_bridge);
-                hook_ffi::hook_flush_cache((art_method + ep_offset) as *mut std::ffi::c_void, 8);
-            }
-        }
+        // Target ArtMethod.entry_point_/data_ are intentionally left untouched.
+        // Shared ART entrypoints are covered by Layer 1/2 hooks; compiled entries
+        // are covered by Layer 3 code hooks.
     }
 }
 
@@ -2244,6 +2238,7 @@ pub fn free_art_controller_state() {
         guard.take()
     };
     if taken.is_some() {
+        JNI_TRAMPOLINE_BYPASS.store(0, Ordering::Release);
         LAST_SEEN_ART_METHOD.store(0, Ordering::Relaxed);
         output_verbose("[artController] 全局 ART hook 状态已释放");
     }

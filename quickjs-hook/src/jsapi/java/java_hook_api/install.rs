@@ -246,7 +246,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
     let is_native_method = (original_access_flags & K_ACC_NATIVE) != 0;
     let is_shared_jni_entry = original_entry_point == bridge.quick_generic_jni_trampoline
         || (bridge.resolved_jni_entrypoint != 0 && original_entry_point == bridge.resolved_jni_entrypoint);
-    let force_standalone_stub = is_native_method && is_shared_jni_entry;
+    let shared_native_art_entry = is_native_method && is_shared_jni_entry;
 
     output_verbose(&format!(
         "[java hook] Step 4: has_independent_code={} native={} shared_jni={} (ep={:#x})",
@@ -323,20 +323,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
         );
     });
 
-    // B2: nterp → interpreter_bridge 降级 (对标 Frida android.js:3747-3750)
-    if bridge.nterp_entry_point != 0 && original_entry_point == bridge.nterp_entry_point {
-        let interp_bridge = bridge.quick_to_interpreter_bridge;
-        if interp_bridge != 0 {
-            std::ptr::write_volatile((art_method as usize + ep_offset) as *mut u64, interp_bridge);
-            hook_ffi::hook_flush_cache((art_method as usize + ep_offset) as *mut std::ffi::c_void, 8);
-            output_verbose(&format!(
-                "[java hook] nterp → interpreter_bridge: {:#x} → {:#x}",
-                original_entry_point, interp_bridge
-            ));
-        }
-    }
-
-    // B3: Layer 3 per-method router hook (对标 Frida ArtQuickCodeInterceptor)。
+    // B2: Layer 3 per-method router hook (对标 Frida ArtQuickCodeInterceptor)。
     // 此时 replacement 尚未加入 art_router 表；若其他线程打到 quickCode，会继续走原始方法，
     // 避免热点方法在半安装窗口进入 JS callback。
     let (per_method_hook_target, quick_trampoline, use_blr, _router_thunk_body) = match install_per_method_router_hook(
@@ -347,7 +334,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
         env,
         art_method,
         is_native_method,
-        force_standalone_stub,
+        shared_native_art_entry,
         enable_fast_orig,
     ) {
         Ok(v) => v,
@@ -372,16 +359,18 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
         }
     });
 
-    // B4: 注册 replacement 到 replacedMethods 映射 (art_router 查表用)
+    // B3: 注册 replacement 到 replacedMethods 映射 (art_router 查表用)
     set_replacement_method(art_method, replacement_addr as u64);
     install_guard.set_replacement_registered();
 
-    // B5: 修改原始 ArtMethod flags (对标 Frida android.js:3732-3741)
+    // B4: 修改原始 ArtMethod flags (对标 Frida android.js:3732-3741)
     // 不设 kAccNative! 仅 deopt + 清除快速路径标志。放到最后，避免半安装状态暴露给其他线程。
     update_original_method_flags_for_hook(art_method, spec.access_flags_offset, original_access_flags);
     install_guard.set_original_method_mutated();
 
+    let jni_trampoline_router_ready = super::super::art_controller::jni_trampoline_router_installed();
     if (original_access_flags & K_ACC_NATIVE) != 0
+        && !jni_trampoline_router_ready
         && original_data != 0
         && is_registered_native_entry_candidate(original_data, bridge)
     {
@@ -436,19 +425,15 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
         }
     } else if (original_access_flags & K_ACC_NATIVE) != 0 {
         output_verbose(&format!(
-            "[java hook] registered native entry skipped: data_={:#x}",
-            original_data
+            "[java hook] registered native entry skipped: data_={:#x}, jni_router={}",
+            original_data, jni_trampoline_router_ready
         ));
     }
 
-    if crate::is_raw_clone_js_thread() {
-        output_verbose(&format!(
-            "[java hook] raw clone: skip post-install field cache for {}",
-            class_name
-        ));
-    } else {
-        cache_fields_for_class(env, &class_name);
-    }
+    output_verbose(&format!(
+        "[java hook] post-install field cache deferred for {}",
+        class_name
+    ));
 
     let strategy = if has_independent_code {
         "compiled+router"
