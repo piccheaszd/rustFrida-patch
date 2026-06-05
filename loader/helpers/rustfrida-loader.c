@@ -153,6 +153,7 @@ typedef struct {
   /* rustFrida extensions */
   uint64_t string_table_addr;  /* Remote StringTable address for agent */
   const char * agent_current_thread_eval;
+  const char * agent_start_java_worker;
   void * libc_base;
   void * linker_base;
 
@@ -161,6 +162,7 @@ typedef struct {
   void * agent_handle;
   void * agent_entrypoint_impl;
   void * agent_current_thread_eval_impl;
+  void * agent_start_java_worker_impl;
   void * loader_stack;
   size_t loader_stack_size;
 } RustFridaLoaderContext;
@@ -584,7 +586,7 @@ static bool
 rustfrida_address_is_executable (ElfW(Addr) address)
 {
   static const char maps_path[] = "/proc/self/maps";
-  char buffer[8192];
+  char buffer[2048];
   char line[512];
   size_t line_len = 0;
   int fd;
@@ -733,7 +735,7 @@ rustfrida_build_symbol_resolver (RustFridaLinkedModule * module, const FridaLibc
     ElfW(Addr) libc_base, ElfW(Addr) linker_base)
 {
   static const char maps_path[] = "/proc/self/maps";
-  char buffer[16384];
+  char buffer[2048];
   char line[512];
   size_t line_len = 0;
   int fd;
@@ -1539,6 +1541,7 @@ frida_main (void * user_data)
     if (ctx->agent_entrypoint_impl == NULL)
       goto dlsym_failed;
     ctx->agent_current_thread_eval_impl = rustfrida_find_export (&agent_module, ctx->agent_current_thread_eval);
+    ctx->agent_start_java_worker_impl = rustfrida_find_export (&agent_module, ctx->agent_start_java_worker);
     frida_send_log (ctrlfd, "worker: exports resolved", libc);
 
     ctx->agent_handle = (void *) agent_module.base;
@@ -1611,6 +1614,7 @@ beach:
         ctx->agent_handle = NULL;
         ctx->agent_entrypoint_impl = NULL;
         ctx->agent_current_thread_eval_impl = NULL;
+        ctx->agent_start_java_worker_impl = NULL;
       }
     }
 

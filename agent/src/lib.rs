@@ -330,6 +330,35 @@ fn start_java_worker_and_respond() {
 }
 
 #[cfg(feature = "quickjs")]
+#[no_mangle]
+pub extern "C" fn rustfrida_start_java_worker_current_thread() -> i32 {
+    let result = std::panic::catch_unwind(|| match quickjs_loader::start_java_worker() {
+        Ok(()) => {
+            send_eval_ok("java-worker-ready");
+            0
+        }
+        Err(e) => {
+            send_eval_err(&format!("java worker start failed: {}", e));
+            -1
+        }
+    });
+
+    result.unwrap_or_else(|_| {
+        send_eval_err("[quickjs] current-thread Java worker start panicked");
+        -1
+    })
+}
+
+#[cfg(feature = "quickjs")]
+fn cut_java_executor_hook_and_respond() {
+    match quickjs_loader::cut_java_executor_hook() {
+        Ok(true) => send_eval_ok("java-executor-cut"),
+        Ok(false) => send_eval_err("java executor hook still active after cut"),
+        Err(e) => send_eval_err(&format!("java executor hook cut failed: {}", e)),
+    }
+}
+
+#[cfg(feature = "quickjs")]
 fn init_js_and_respond() {
     match quickjs_loader::init() {
         Ok(_) => send_eval_ok("initialized"),
@@ -558,6 +587,8 @@ fn process_cmd(command: &str) {
         }
         #[cfg(feature = "quickjs")]
         Some("javaworker_init") => dispatch_js_task(start_java_worker_and_respond),
+        #[cfg(feature = "quickjs")]
+        Some("javaexecutor_cut") => dispatch_js_task(cut_java_executor_hook_and_respond),
         #[cfg(feature = "quickjs")]
         Some("java_loadjs_init") => {
             let rest = command

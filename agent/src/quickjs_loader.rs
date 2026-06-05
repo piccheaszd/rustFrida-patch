@@ -331,6 +331,14 @@ pub fn start_java_worker() -> Result<(), String> {
     Ok(())
 }
 
+pub fn cut_java_executor_hook() -> Result<bool, String> {
+    let cut = quickjs_hook::abort_raw_clone_java_executor_for_unload();
+    if !cut {
+        return Err("raw-clone Java executor hook cut failed".to_string());
+    }
+    Ok(!quickjs_hook::raw_clone_java_executor_hook_active())
+}
+
 pub fn is_java_worker_started() -> bool {
     JAVA_WORKER_STARTED.load(Ordering::Acquire)
 }

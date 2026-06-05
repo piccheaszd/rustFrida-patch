@@ -288,7 +288,11 @@ fn main() {
     if let Some(pid) = target_pid {
         session.pid.store(pid, Ordering::Relaxed);
     }
-    session.set_remote_agent_info(injection.loader_ctx_addr, injection.agent_current_thread_eval_impl);
+    session.set_remote_agent_info(
+        injection.loader_ctx_addr,
+        injection.agent_current_thread_eval_impl,
+        injection.agent_start_java_worker_impl,
+    );
 
     // 启动 socketpair handler（在 host_fd 上读写）
     let _handle = start_socketpair_handler(injection.host_fd, session.clone());
@@ -380,10 +384,7 @@ fn main() {
                 log_error!("恢复子进程失败: {}", e);
             }
             if let Err(e) = ensure_java_worker_ready_after_resume(&session) {
-                log_warn!(
-                    "Java worker 启动失败，后续 Java 操作将继续依赖 raw clone executor: {}",
-                    e
-                );
+                log_warn!("Java worker 启动失败，后续 Java 操作需要重新初始化 worker: {}", e);
             }
         }
     }

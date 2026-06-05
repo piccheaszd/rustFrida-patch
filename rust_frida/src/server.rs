@@ -22,11 +22,12 @@ use crate::communication::{send_command, start_socketpair_handler};
 use crate::injection::inject_via_bootstrapper;
 use crate::process::find_pid_by_name;
 use crate::repl::{
-    ensure_java_worker_ready, ensure_java_worker_ready_after_resume, preconfigure_java_stealth_if_declared,
-    print_eval_result, print_help, rewrite_jseval_for_agent, run_js_repl, script_uses_java_api,
-    try_jseval_on_main_thread_if_java_or_dsl, try_loadjs_on_main_thread_if_java, try_managedcounter_on_main_thread,
-    EVAL_DEFAULT_TIMEOUT_SECS, EVAL_JAVA_TIMEOUT_SECS, EVAL_RECOMP_TIMEOUT_SECS, LOAD_DEFAULT_TIMEOUT_SECS,
-    LOAD_JAVA_TIMEOUT_SECS, LOAD_PRE_RESUME_JAVA_TIMEOUT_SECS, LOAD_STOP_WORKER_TIMEOUT_SECS,
+    cut_pre_resume_java_executor_hook, ensure_java_worker_ready, ensure_java_worker_ready_after_resume,
+    preconfigure_java_stealth_if_declared, print_eval_result, print_help, rewrite_jseval_for_agent, run_js_repl,
+    script_uses_java_api, try_jseval_on_main_thread_if_java_or_dsl, try_loadjs_on_main_thread_if_java,
+    try_managedcounter_on_main_thread, EVAL_DEFAULT_TIMEOUT_SECS, EVAL_JAVA_TIMEOUT_SECS, EVAL_RECOMP_TIMEOUT_SECS,
+    LOAD_DEFAULT_TIMEOUT_SECS, LOAD_JAVA_TIMEOUT_SECS, LOAD_PRE_RESUME_JAVA_TIMEOUT_SECS,
+    LOAD_STOP_WORKER_TIMEOUT_SECS,
 };
 use crate::session::{Session, SessionManager};
 use crate::spawn;
@@ -237,6 +238,10 @@ fn load_script_on_session(session: &Session, script_path: &str, stop_worker_afte
                         }
                     }
                 }
+                if let Err(e) = cut_pre_resume_java_executor_hook(session) {
+                    log_error!("[#{}] pre-resume Java executor hook 切断失败: {}", session.id, e);
+                    return ScriptLoadState::Failed;
+                }
                 return ScriptLoadState::Loaded;
             }
             match session
@@ -299,7 +304,11 @@ fn do_spawn(
             match spawn::spawn_and_inject(&package, &string_overrides) {
                 Ok((pid, injection)) => {
                     session.pid.store(pid, Ordering::Relaxed);
-                    session.set_remote_agent_info(injection.loader_ctx_addr, injection.agent_current_thread_eval_impl);
+                    session.set_remote_agent_info(
+                        injection.loader_ctx_addr,
+                        injection.agent_current_thread_eval_impl,
+                        injection.agent_start_java_worker_impl,
+                    );
                     let _handle = start_socketpair_handler(injection.host_fd, session.clone());
 
                     if !session.wait_connected(SESSION_CONNECT_TIMEOUT_SECS) {
@@ -332,7 +341,7 @@ fn do_spawn(
                     }
                     if let Err(e) = ensure_java_worker_ready_after_resume(&session) {
                         log_warn!(
-                            "[#{}] Java worker 启动失败，后续 Java 操作将继续依赖 raw clone executor: {}",
+                            "[#{}] Java worker 启动失败，后续 Java 操作需要重新初始化 worker: {}",
                             sid,
                             e
                         );
@@ -364,7 +373,11 @@ fn do_attach(
             match inject_via_bootstrapper(pid, &string_overrides) {
                 Ok(injection) => {
                     session.pid.store(pid, Ordering::Relaxed);
-                    session.set_remote_agent_info(injection.loader_ctx_addr, injection.agent_current_thread_eval_impl);
+                    session.set_remote_agent_info(
+                        injection.loader_ctx_addr,
+                        injection.agent_current_thread_eval_impl,
+                        injection.agent_start_java_worker_impl,
+                    );
                     let _handle = start_socketpair_handler(injection.host_fd, session.clone());
 
                     if !session.wait_connected(SESSION_CONNECT_TIMEOUT_SECS) {

@@ -7,12 +7,26 @@ use nix::sys::signal::Signal;
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::Pid;
 use std::fs::File;
+use std::io::Read;
 use std::mem::size_of_val;
 use std::path::Path;
 use std::process;
 
 use crate::types::{UserFpRegs, UserRegs};
 use crate::{log_info, log_success, log_verbose, log_warn};
+
+fn read_proc_maps_small_chunks(file: &mut File, path: &str) -> Result<Vec<u8>, String> {
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 2048];
+    loop {
+        let n = file.read(&mut buf).map_err(|e| format!("读取 {} 失败: {}", path, e))?;
+        if n == 0 {
+            break;
+        }
+        raw.extend_from_slice(&buf[..n]);
+    }
+    Ok(raw)
+}
 
 /// 获取指定库的基址
 ///
@@ -31,8 +45,7 @@ pub(crate) fn get_lib_base(pid: Option<i32>, lib_name: &str) -> Result<usize, St
     }
 
     let mut file = File::open(&maps_path).map_err(|e| format!("无法打开maps文件: {}", e))?;
-    let mut raw = Vec::new();
-    std::io::Read::read_to_end(&mut file, &mut raw).map_err(|e| format!("读取maps文件失败: {}", e))?;
+    let raw = read_proc_maps_small_chunks(&mut file, &maps_path)?;
 
     for line in String::from_utf8_lossy(&raw).lines() {
         if line.contains(lib_name) {
@@ -51,8 +64,7 @@ pub(crate) fn get_lib_base(pid: Option<i32>, lib_name: &str) -> Result<usize, St
 fn find_map_line_for_addr(pid: i32, addr: u64) -> Option<String> {
     let maps_path = format!("/proc/{}/maps", pid);
     let mut file = File::open(&maps_path).ok()?;
-    let mut raw = Vec::new();
-    std::io::Read::read_to_end(&mut file, &mut raw).ok()?;
+    let raw = read_proc_maps_small_chunks(&mut file, &maps_path).ok()?;
 
     for line in String::from_utf8_lossy(&raw).lines() {
         let mut parts = line.split_whitespace();
@@ -645,8 +657,7 @@ impl MapEntry {
 pub(crate) fn parse_proc_maps(pid: u32) -> Result<Vec<MapEntry>, String> {
     let maps_path = format!("/proc/{}/maps", pid);
     let mut file = File::open(&maps_path).map_err(|e| format!("无法打开 {}: {}", maps_path, e))?;
-    let mut raw = Vec::new();
-    std::io::Read::read_to_end(&mut file, &mut raw).map_err(|e| format!("读取 {} 失败: {}", maps_path, e))?;
+    let raw = read_proc_maps_small_chunks(&mut file, &maps_path)?;
     let mut entries = Vec::new();
 
     for line in String::from_utf8_lossy(&raw).lines() {

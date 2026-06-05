@@ -16,7 +16,7 @@ use crate::vma_name::set_anon_vma_name_raw;
 use libc::{mprotect, munmap, sysconf, PROT_EXEC, PROT_READ, PROT_WRITE, _SC_PAGESIZE};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Error;
+use std::io::{Error, Read};
 use std::os::unix::fs::FileExt;
 use std::ptr;
 use std::sync::{LazyLock, Mutex};
@@ -182,10 +182,22 @@ fn suspend_poll_entrypoint() -> u64 {
     SUSPEND_POLLS_ENTRYPOINT.load(std::sync::atomic::Ordering::Acquire)
 }
 
+fn read_proc_self_maps() -> Option<String> {
+    let mut file = fs::File::open("/proc/self/maps").ok()?;
+    let mut bytes = Vec::new();
+    let mut buf = [0u8; 2048];
+    loop {
+        let n = file.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buf[..n]);
+    }
+    Some(String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
+}
+
 fn page_permissions(page: usize) -> Option<(bool, bool)> {
-    let Ok(maps) = fs::read_to_string("/proc/self/maps") else {
-        return None;
-    };
+    let maps = read_proc_self_maps()?;
 
     for line in maps.lines() {
         let mut parts = line.split_whitespace();

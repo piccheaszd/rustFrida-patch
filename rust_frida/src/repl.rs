@@ -22,9 +22,37 @@ pub(crate) const LOAD_DEFAULT_TIMEOUT_SECS: u64 = 5;
 pub(crate) const LOAD_JAVA_TIMEOUT_SECS: u64 = 60;
 pub(crate) const LOAD_STOP_WORKER_TIMEOUT_SECS: u64 = 2;
 pub(crate) const LOAD_PRE_RESUME_JAVA_TIMEOUT_SECS: u64 = 30;
-pub(crate) const JAVA_EXECUTOR_BOOTSTRAP_TIMEOUT_SECS: u64 = 35;
 pub(crate) const JAVA_STEALTH_TIMEOUT_SECS: u64 = 1;
 pub(crate) const JSCLEAN_SOFT_TIMEOUT_SECS: u64 = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PostResumeJavaWorkerMode {
+    Skip,
+    Full,
+}
+
+impl PostResumeJavaWorkerMode {
+    pub(crate) fn from_env() -> Result<Self, String> {
+        if let Ok(raw) = std::env::var("RF_POST_RESUME_JAVA_WORKER_MODE") {
+            return Self::parse(&raw);
+        }
+        let skip = std::env::var("RF_SKIP_POST_RESUME_JAVA_WORKER")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        Ok(if skip { Self::Skip } else { Self::Full })
+    }
+
+    fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "full" | "start" | "worker" => Ok(Self::Full),
+            "skip" | "none" | "off" => Ok(Self::Skip),
+            _ => Err(format!(
+                "未知 RF_POST_RESUME_JAVA_WORKER_MODE='{}'，可用值: skip|full",
+                raw
+            )),
+        }
+    }
+}
 
 fn script_filename(script_path: &str) -> String {
     std::path::Path::new(script_path)
@@ -59,34 +87,58 @@ pub(crate) fn ensure_java_worker_ready(session: &Session) -> Result<(), String> 
     if session.java_worker_ready.load(std::sync::atomic::Ordering::Acquire) {
         return Ok(());
     }
-    let sender = session.get_sender().ok_or("agent 未连接")?;
+    let _sender = session.get_sender().ok_or("agent 未连接")?;
     session.eval_state.clear();
     crate::process::thaw_cgroup_freezer(session.pid.load(std::sync::atomic::Ordering::Acquire));
-    send_command(sender, "javaworker_init").map_err(|e| format!("发送 Java worker 初始化失败: {}", e))?;
+    crate::remote_agent::start_java_worker_on_current_thread(session)
+        .map_err(|e| format!("Java worker 当前线程初始化失败: {}", e))?;
+
+    match session.eval_state.recv_timeout(std::time::Duration::from_secs(2)) {
+        Some(Ok(_)) => {}
+        Some(Err(e)) => return Err(format!("Java worker 初始化失败: {}", e)),
+        None => log_warn!("Java worker 当前线程入口已返回 ready，但未收到 agent ready 回包"),
+    }
+    session
+        .java_worker_ready
+        .store(true, std::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
+pub(crate) fn cut_pre_resume_java_executor_hook(session: &Session) -> Result<(), String> {
+    let sender = session.get_sender().ok_or("agent 未连接")?;
+    session.eval_state.clear();
+    send_command(sender, "javaexecutor_cut").map_err(|e| format!("发送 Java executor cut 失败: {}", e))?;
     match session
         .eval_state
-        .recv_timeout(std::time::Duration::from_secs(JAVA_EXECUTOR_BOOTSTRAP_TIMEOUT_SECS))
+        .recv_timeout(std::time::Duration::from_secs(JAVA_STEALTH_TIMEOUT_SECS))
     {
-        Some(Ok(_)) => {
-            session
-                .java_worker_ready
-                .store(true, std::sync::atomic::Ordering::Release);
-            Ok(())
-        }
-        Some(Err(e)) => Err(format!("Java worker 初始化失败: {}", e)),
-        None => Err(format!(
-            "等待 Java worker 初始化超时({}s)",
-            JAVA_EXECUTOR_BOOTSTRAP_TIMEOUT_SECS
-        )),
+        Some(Ok(_)) => Ok(()),
+        Some(Err(e)) => Err(format!("Java executor cut 失败: {}", e)),
+        None => Err(format!("等待 Java executor cut 超时({}s)", JAVA_STEALTH_TIMEOUT_SECS)),
     }
 }
 
 pub(crate) fn ensure_java_worker_ready_after_resume(session: &Session) -> Result<(), String> {
-    if session.java_worker_ready.load(std::sync::atomic::Ordering::Acquire) {
-        return Ok(());
+    run_post_resume_java_worker_mode(session, PostResumeJavaWorkerMode::from_env()?)
+}
+
+pub(crate) fn run_post_resume_java_worker_mode(
+    session: &Session,
+    mode: PostResumeJavaWorkerMode,
+) -> Result<(), String> {
+    match mode {
+        PostResumeJavaWorkerMode::Skip => {
+            log_warn!("RF_POST_RESUME_JAVA_WORKER_MODE=skip，跳过 spawn 恢复后的 Java worker 启动");
+            Ok(())
+        }
+        PostResumeJavaWorkerMode::Full => {
+            if session.java_worker_ready.load(std::sync::atomic::Ordering::Acquire) {
+                return Ok(());
+            }
+            log_info!("spawn 已恢复，启动 Java worker 作为后续 Java 操作执行线程");
+            ensure_java_worker_ready(session)
+        }
     }
-    log_info!("spawn 已恢复，启动 Java worker 作为后续 Java 操作执行线程");
-    ensure_java_worker_ready(session)
 }
 
 pub(crate) fn try_loadjs_on_main_thread_if_java(session: &Session, line: &str) -> Result<bool, String> {
@@ -627,6 +679,7 @@ fn load_script_file_with_mode(
                     if !out.is_empty() {
                         println!("{GREEN}=> {out}{RESET}");
                     }
+                    cut_pre_resume_java_executor_hook(session)?;
                     return Ok(PreResumeLoad::DeferredEvalCompleted);
                 }
             }

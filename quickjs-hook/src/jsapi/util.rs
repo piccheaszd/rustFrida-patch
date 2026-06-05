@@ -2,6 +2,7 @@
 
 use crate::ffi;
 use std::ffi::CString;
+use std::io::Read;
 
 /// QuickJS CFunction 签名类型
 pub(crate) type JSCFn = unsafe extern "C" fn(
@@ -59,7 +60,16 @@ impl ProcMapEntry<'_> {
 /// 读取 /proc/self/maps 并返回内容字符串。
 /// 使用 `String::from_utf8` 快速路径，仅在内容包含非 UTF-8 字节时回退到 lossy 转换。
 pub(crate) fn read_proc_self_maps() -> Option<String> {
-    let bytes = std::fs::read("/proc/self/maps").ok()?;
+    let mut file = std::fs::File::open("/proc/self/maps").ok()?;
+    let mut bytes = Vec::new();
+    let mut buf = [0u8; 2048];
+    loop {
+        let n = file.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buf[..n]);
+    }
     Some(String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
 }
 

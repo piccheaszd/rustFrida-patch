@@ -21,6 +21,7 @@ pub(crate) struct Session {
     pub(crate) rpc_lock: Mutex<()>,
     pub(crate) loader_ctx_addr: std::sync::atomic::AtomicU64,
     pub(crate) agent_current_thread_eval_impl: std::sync::atomic::AtomicU64,
+    pub(crate) agent_start_java_worker_impl: std::sync::atomic::AtomicU64,
     pub(crate) java_worker_ready: AtomicBool,
     pub(crate) connected: AtomicBool,
     pub(crate) disconnected: AtomicBool,
@@ -41,6 +42,7 @@ impl Session {
             rpc_lock: Mutex::new(()),
             loader_ctx_addr: std::sync::atomic::AtomicU64::new(0),
             agent_current_thread_eval_impl: std::sync::atomic::AtomicU64::new(0),
+            agent_start_java_worker_impl: std::sync::atomic::AtomicU64::new(0),
             java_worker_ready: AtomicBool::new(false),
             connected: AtomicBool::new(false),
             disconnected: AtomicBool::new(false),
@@ -49,10 +51,17 @@ impl Session {
         }
     }
 
-    pub(crate) fn set_remote_agent_info(&self, loader_ctx_addr: u64, current_thread_eval_impl: u64) {
+    pub(crate) fn set_remote_agent_info(
+        &self,
+        loader_ctx_addr: u64,
+        current_thread_eval_impl: u64,
+        start_java_worker_impl: u64,
+    ) {
         self.loader_ctx_addr.store(loader_ctx_addr, Ordering::Release);
         self.agent_current_thread_eval_impl
             .store(current_thread_eval_impl, Ordering::Release);
+        self.agent_start_java_worker_impl
+            .store(start_java_worker_impl, Ordering::Release);
     }
 
     /// 向 agent 派发 RPC 调用并等待结果。

@@ -196,7 +196,7 @@ pub(super) fn art_controller_initialized() -> bool {
 }
 
 fn maybe_install_raw_clone_executor_loop_hook(env: *mut std::ffi::c_void) {
-    if env.is_null() && !crate::is_raw_clone_js_thread() {
+    if !crate::is_raw_clone_js_thread() {
         return;
     }
 

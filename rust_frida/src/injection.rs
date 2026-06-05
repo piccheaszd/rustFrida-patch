@@ -82,6 +82,7 @@ pub(crate) struct InjectionResult {
     pub(crate) target_pid: i32,
     pub(crate) loader_ctx_addr: u64,
     pub(crate) agent_current_thread_eval_impl: u64,
+    pub(crate) agent_start_java_worker_impl: u64,
     pub(crate) loader_alloc_base: u64,
     pub(crate) loader_alloc_size: u64,
     pub(crate) loader_stack: u64,
@@ -1062,6 +1063,9 @@ fn run_loader_handshake(
     if loader_ctx.agent_current_thread_eval_impl == 0 {
         return Err("Loader 未解析 rustfrida_loadjs_current_thread".to_string());
     }
+    if loader_ctx.agent_start_java_worker_impl == 0 {
+        return Err("Loader 未解析 rustfrida_start_java_worker_current_thread".to_string());
+    }
 
     // 5. 发送 ACK
     send_exact_timeout(ctrl_fd, &[message_type::ACK], deadline, "发送 loader ACK")?;
@@ -1073,6 +1077,7 @@ fn run_loader_handshake(
         target_pid,
         loader_ctx_addr: loader_ctx_addr as u64,
         agent_current_thread_eval_impl: loader_ctx.agent_current_thread_eval_impl,
+        agent_start_java_worker_impl: loader_ctx.agent_start_java_worker_impl,
         loader_alloc_base: loader_alloc_base as u64,
         loader_alloc_size: loader_alloc_size as u64,
         loader_stack: loader_ctx.loader_stack,
@@ -1294,12 +1299,15 @@ fn inject_via_bootstrapper_once(
     let str_base = loader_libc_addr + size_of::<FridaLibcApi>();
     let entrypoint_str = b"hello_entry\0";
     let current_thread_eval_str = b"rustfrida_loadjs_current_thread\0";
+    let start_java_worker_str = b"rustfrida_start_java_worker_current_thread\0";
     let data_str = b"\0";
     let fallback_str = format!("\x00rustfrida-{}\0", pid); // abstract socket: \0 prefix
     mem.pwrite_all(entrypoint_str, str_base as u64)?;
     let current_thread_eval_str_addr = str_base + entrypoint_str.len();
     mem.pwrite_all(current_thread_eval_str, current_thread_eval_str_addr as u64)?;
-    let data_str_addr = current_thread_eval_str_addr + current_thread_eval_str.len();
+    let start_java_worker_str_addr = current_thread_eval_str_addr + current_thread_eval_str.len();
+    mem.pwrite_all(start_java_worker_str, start_java_worker_str_addr as u64)?;
+    let data_str_addr = start_java_worker_str_addr + start_java_worker_str.len();
     mem.pwrite_all(data_str, data_str_addr as u64)?;
     let fallback_str_addr = data_str_addr + data_str.len();
     mem.pwrite_all(fallback_str.as_bytes(), fallback_str_addr as u64)?;
@@ -1313,6 +1321,7 @@ fn inject_via_bootstrapper_once(
     loader_ctx.libc = loader_libc_addr as u64;
     loader_ctx.string_table_addr = string_table_addr as u64;
     loader_ctx.agent_current_thread_eval = current_thread_eval_str_addr as u64;
+    loader_ctx.agent_start_java_worker = start_java_worker_str_addr as u64;
     loader_ctx.libc_base = bootstrap_ctx.fallback_libc;
     loader_ctx.linker_base = bootstrap_ctx.rtld_base;
     mem_write_value(&mem, loader_ctx_addr, &loader_ctx)?;
