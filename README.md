@@ -4,7 +4,7 @@ ARM64 Android 动态插桩框架。
 
 ## 环境要求
 
-- Android NDK 25+（默认路径 `~/Android/Sdk/ndk/`）
+- Android NDK r25+；仓库自带的 `.cargo/config.toml` 当前指向 `/home/p1cc/Android/Sdk/ndk/android-ndk-r25c`，新环境需要按本机 NDK 路径调整
 - Rust toolchain + `aarch64-linux-android` target
 - Python 3（构建 loader shellcode）
 - `.cargo/config.toml` 已配置交叉编译（仓库自带）
@@ -24,7 +24,7 @@ git submodule update --init --recursive
 - 默认构建：带 ptrace backend，支持 PID/name attach、`--watch-so`、server、trace、普通 spawn 和 pure spawn。
 - `noptrace` 构建：编译期移除 ptrace 注入/远程调用/trace 后端，只保留属性命令和 `--spawn --spawn-pure` 自加载路径；pure spawn 使用单独的精简 zymbiote stage-0。
 
-最终产物 `rustfrida` 通过 `include_bytes!` 内嵌 loader blob 和 agent SO。agent 与 host 的 feature 必须匹配，`rust_frida/build.rs` 会读取 `libagent.features`，发现 stale 或 `noptrace` 不一致时直接报错并给出需要重跑的 `cargo build -p agent ...` 命令。
+最终产物 `rustfrida` 通过 `include_bytes!` 内嵌 loader blob 和 agent SO。agent 与 host 的 feature 必须匹配，`rust_frida/build.rs` 会检查 `libagent.features` 以及按构建类型保存的 `libagent.ptrace.features` / `libagent.noptrace.features`，发现 stale 或 `noptrace` 不一致时直接报错并给出需要重跑的 `cargo build -p agent ...` 命令。
 
 ```
 loader shellcode  ──┐
@@ -41,7 +41,7 @@ python3 loader/build_helpers.py
 #   loader/build/rustfrida-loader.bin
 ```
 
-loader 是 ARM64 shellcode，被 `rustfrida` 通过 `include_bytes!` 嵌入。修改 `loader/` 下 C 代码后需要重新生成；当前 `rust_frida/build.rs` 也会在发现 blob 缺失或落后时自动运行 `python3 loader/build_helpers.py`。
+loader 是 ARM64 shellcode，被 `rustfrida` 通过 `include_bytes!` 嵌入。修改 `loader/` 下 C 代码后需要重新生成；当前 `rust_frida/build.rs` 只校验 blob 是否存在且新于输入文件，缺失或过期时会报错提示手动运行 `python3 loader/build_helpers.py`，不会自动生成。
 
 ### 2. 默认 ptrace 构建
 
@@ -125,7 +125,7 @@ printf 'jseval 1+1\nexit\n' | adb shell su -c '/data/local/tmp/rf-noptrace --spa
 
 已在 Android 14 arm64 设备上验证 `com.coloros.note` 和 `com.bochk.app.aos` 的 pure spawn；`com.bochk.app.aos` 可在 pre-resume 脚本里监听 `RegisterNatives`，也验证过 `Hook.WXSHADOW` patch。
 
-BOCHK 的 `noptrace` / WXSHADOW 分阶段探测记录和今晚复测顺序见
+BOCHK 的 `noptrace` / WXSHADOW 分阶段探测记录和复测顺序见
 [`docs/bochk-noptrace-test-notes.md`](docs/bochk-noptrace-test-notes.md)。
 
 ### noptrace 测试矩阵
@@ -142,9 +142,9 @@ BOCHK 的 `noptrace` / WXSHADOW 分阶段探测记录和今晚复测顺序见
 | 厂商 ROM | ColorOS / Android 14 已测；MIUI / OneUI / HarmonyOS Android 分支（NEXT 前）待测 | zygote64 布局、`libstagefright.so` host 页选择、SELinux/tracefs 验证能力 |
 | no-ptrace 证明 | tracefs raw syscall 在当前 ColorOS 设备上受 SELinux 限制，无法写入 `sys_enter_ptrace` filter | 用 eBPF tracepoint/kprobe 或可写 tracefs 验证 `sys_enter_ptrace(id==117)` 无 rustfrida/App 命中 |
 
-### 可选组件（单独构建）
+### 可选组件与辅助二进制
 
-这些不在 default-members 里，按需构建：
+这些 crate 不在 workspace `default-members` 里，按需构建：
 
 **QBDI Trace 支持：** 需要先构建 qbdi-helper SO，再用 `--features qbdi` 编译 agent 和 rustfrida：
 
@@ -154,7 +154,7 @@ cargo build -p agent --release --features qbdi  # agent 启用 qbdi feature
 cargo build -p rust_frida --release --features qbdi  # rustfrida 嵌入 qbdi-helper SO
 ```
 
-**eBPF SO 加载监控（`--watch-so`）：** ldmonitor 是 rustfrida 的编译依赖，默认构建已包含，`--watch-so` 无需额外步骤。如需独立使用 ldmonitor 命令行工具：
+**eBPF SO 加载监控（`--watch-so`）：** ldmonitor 是 rustfrida 的编译依赖，默认构建 `rust_frida` 时已包含，`--watch-so` 无需额外步骤。如需独立使用 ldmonitor 命令行工具：
 
 ```bash
 cargo build -p ldmonitor --release    # → ldmonitor 独立二进制
@@ -198,6 +198,7 @@ adb shell su -c 'chmod 755 /data/local/tmp/rf'
 # PID 注入
 ./rf --pid <pid>
 ./rf --pid <pid> -l script.js
+./rf --name com.example.app -l script.js
 
 # Spawn 模式（启动时注入）
 ./rf --spawn com.example.app
@@ -214,6 +215,16 @@ adb shell su -c 'chmod 755 /data/local/tmp/rf'
 
 # 同步输出日志到文件（终端仍正常输出，文件为纯文本）
 ./rf --pid <pid> -l script.js -o /data/local/tmp/rustfrida.log
+
+# QuickJS 精简 profile：跳过 Module / Java 等可选启动路径，适合先绕开加固 App 初始化期崩溃
+./rf --pid <pid> --quickjs-profile minimal
+
+# 属性 profile：默认 ptrace 版可在 spawn/server 生命周期内应用
+./rf --dump-props default
+./rf --set-prop default ro.debuggable=0
+./rf --del-prop default ro.secure
+./rf --repack-props default
+./rf --spawn com.example.app --profile default
 ```
 
 `noptrace` 版：
@@ -229,9 +240,11 @@ adb shell su -c 'chmod 755 /data/local/tmp/rf-noptrace'
 # 属性快照/伪装命令仍可独立使用
 ./rf-noptrace --dump-props default
 ./rf-noptrace --set-prop default ro.debuggable=0
+./rf-noptrace --del-prop default ro.secure
+./rf-noptrace --repack-props default
 ```
 
-`noptrace` 构建不包含 `--pid`、`--name`、`--watch-so`、`--server`、`--profile`、trace 命令和 process remote-call 后端。当前 pure-only stage-0 不包含属性 profile 注入 hook；需要这些能力时使用默认 ptrace 版。
+`noptrace` 构建不包含 `--pid`、`--name`、`--watch-so`、`--server`、`--profile`、trace 命令和 process remote-call 后端。当前 pure-only stage-0 不包含属性 profile 注入 hook；`--dump-props` / `--set-prop` / `--del-prop` / `--repack-props` 只能编辑 profile，不能自动应用到 pure spawn。需要自动应用 profile 时使用默认 ptrace 版。
 
 ### no-ptrace 验证
 
@@ -311,6 +324,8 @@ Java.ready(function() {
 | 采集指令 trace 用于回放分析 | `qbdi` | `registerTraceCallbacks()` |
 
 `noptrace` 构建中的脚本 API 仍来自同一个 agent，但 host 侧去掉了 ptrace attach、process remote-call、trace 命令和相关帮助文案；脚本要在恢复前执行时，统一通过 agent socket 发送。
+
+`--quickjs-profile minimal` 会在 agent 侧启用精简 API profile：保留 `console`、`File`、`ptr`、native hook、`Jni`、`Memory`、`rpc` 等核心能力，跳过 `Module` 和 lazy `Java` API 的启动注册，减少初始化阶段读取 maps 或解析 ART 状态的检测面。默认值是 `full`。
 
 ### 常见场景
 
@@ -1541,7 +1556,7 @@ p.writeU64(0xdeadbeefn);
 p.add(8).readPointer().readCString();     // 解指针再读字符串
 p.add(0x10).readByteArray(32);            // → ArrayBuffer
 
-// 写入代码后刷 I-cache
+// 写入代码后刷 I-cache；若后续要执行这块内存，先按需 Memory.protect(code, size, "rwx")
 var code = Memory.alloc(16);
 code.writeU32(0xd65f03c0);                // ret
 Memory.flushCodeCache(code, 16);
@@ -1563,15 +1578,16 @@ Memory.flushCodeCache(code, 16);
 | `Memory.writeBytes(addr, bytes, stealth?)` / `p.writeBytes(bytes, stealth?)` | `AddressLike, ArrayBuffer\|TypedArray\|number[], 0\|1` | `undefined` |
 | `Memory.writest(addr, bytes)` / `p.writest(bytes)` | `AddressLike, 4B 倍数指令字节` | `undefined` |
 | **分配 / 维护** | | |
-| `Memory.alloc(size)` | `number` (≤ 256MB) | `NativePointer` (RWX, 零初始化) |
-| `Memory.allocUtf8String(s)` | `string` | `NativePointer` (RWX，末尾 `\0`) |
+| `Memory.alloc(size)` | `number` (≤ 256MB) | `NativePointer` (普通 heap RW，零初始化) |
+| `Memory.allocUtf8String(s)` | `string` | `NativePointer` (普通 heap RW，末尾 `\0`) |
 | `Memory.flushCodeCache(addr, size)` | `AddressLike, number` | `undefined` |
+| `Memory.protect(addr, size, prot)` | `AddressLike, number, "rwx" 风格` | `boolean` |
 
 **约束**：
 - 无效地址抛 `RangeError`；`readCString` 超过 4096B 抛
-- `Memory.alloc` 是 RWX 堆内存，GC 时自动释放；勿 `munmap`
+- `Memory.alloc` / `Memory.allocUtf8String` 是普通 heap 分配，GC 时自动释放；勿 `munmap`
 - 写入代码后必须 `Memory.flushCodeCache` 刷 I-cache
-- `writeXxx` 不会自动 mprotect；只读段写入抛错，需先 `Memory.protect`
+- `writeXxx` 和 `writeBytes(bytes, 0)` 不会自动 mprotect；写入范围必须完整落在可写 VMA 中，只读段写入会抛错，需先 `Memory.protect`
 
 ### Memory.protect / writeBytes / writest
 
@@ -1579,7 +1595,7 @@ Memory.flushCodeCache(code, 16);
 | --- | --- | --- | --- |
 | `Memory.protect(addr, size, "rwx")` | 任意 | — | 改页权限（页级 mprotect） |
 | `p.writeBytes(bytes, 0)` 默认 | 可写段 | 可见 | 覆盖 N 字节（数据/结构体） |
-| `p.writeBytes(bytes, 1)` | r-x | 不可见 | wxshadow 覆盖 N 字节（短 patch，可跨页） |
+| `p.writeBytes(bytes, 1)` | r-x | 不可见 | wxshadow 覆盖 N 字节（短 patch，最多跨 2 页） |
 | `p.writest(bytes)` | r-x | 不可见 | 1 条指令 → N 条指令替换（PC-rel 自动 relocate） |
 
 `writeBytes(bytes, 1)` 由 wxshadow KPM 在内核侧完成 dcache/icache 维护；用户态不要再对 execute-only shadow 映射补做 clear-cache，否则部分内核会在 fault path 中卡住。
@@ -1687,7 +1703,7 @@ p.toInt();                     // → bigint (等价 toNumber)
 
 // Frida 兼容读写（完整 API 见上面 Memory 章节）
 p.readU32();                   // 等价 Memory.readU32(p)
-p.writeU64(0xdeadbeefn);       // 自动 mprotect
+p.writeU64(0xdeadbeefn);       // 等价 Memory.writeU64(p, ...)，目标范围必须可写
 p.readPointer().readCString(); // 链式解引用
 ```
 
@@ -1759,23 +1775,35 @@ out.close();
 
 | API | 参数 | 返回 |
 | --- | --- | --- |
-| `qbdi.newVM()` | — | `number` |
-| `qbdi.destroyVM(vm)` | `number` | `boolean` |
-| `qbdi.addInstrumentedModuleFromAddr(vm, addr)` | `number, AddressLike` | `boolean` |
-| `qbdi.addInstrumentedRange(vm, start, end)` | `number, AddressLike, AddressLike` | `boolean` |
-| `qbdi.removeInstrumentedRange(vm, start, end)` | `number, AddressLike, AddressLike` | `boolean` |
-| `qbdi.removeAllInstrumentedRanges(vm)` | `number` | `boolean` |
-| `qbdi.allocateVirtualStack(vm, size)` | `number, number` | `boolean` |
-| `qbdi.simulateCall(vm, retAddr, ...args)` | `number, AddressLike, ...AddressLike` | `boolean` |
-| `qbdi.call(vm, target, ...args)` | `number, AddressLike, ...AddressLike` | `NativePointer \| null` |
-| `qbdi.run(vm, start, stop)` | `number, AddressLike, AddressLike` | `boolean` |
-| `qbdi.getGPR(vm, reg)` | `number, number` | `NativePointer` |
-| `qbdi.setGPR(vm, reg, value)` | `number, number, AddressLike` | `boolean` |
-| `qbdi.registerTraceCallbacks(vm, target, outDir?)` | `number, AddressLike, string?` | `boolean` |
-| `qbdi.unregisterTraceCallbacks(vm)` | `number` | `boolean` |
-| `qbdi.lastError()` | — | `string` |
+| `qbdi.newVM()` | — | `number \| bigint \| null` |
+| `qbdi.destroyVM(vm)` | `number \| bigint` | `boolean` |
+| `qbdi.addInstrumentedModule(vm, name)` | `number \| bigint, string` | `boolean` |
+| `qbdi.addInstrumentedModuleFromAddr(vm, addr)` | `number \| bigint, AddressLike` | `boolean` |
+| `qbdi.instrumentAllExecutableMaps(vm)` | `number \| bigint` | `boolean` |
+| `qbdi.addInstrumentedRange(vm, start, end)` | `number \| bigint, AddressLike, AddressLike` | `boolean` |
+| `qbdi.removeInstrumentedRange(vm, start, end)` | `number \| bigint, AddressLike, AddressLike` | `boolean` |
+| `qbdi.removeAllInstrumentedRanges(vm)` | `number \| bigint` | `boolean` |
+| `qbdi.deleteAllInstrumentations(vm)` | `number \| bigint` | `boolean` |
+| `qbdi.recordMemoryAccess(vm, flags)` | `number \| bigint, qbdi.MEMORY_*` | `boolean` |
+| `qbdi.allocateVirtualStack(vm, size)` | `number \| bigint, number` | `boolean` |
+| `qbdi.clearVirtualStacks(vm)` | `number \| bigint` | `boolean` |
+| `qbdi.simulateCall(vm, retAddr, ...args)` | `number \| bigint, AddressLike, ...AddressLike` | `boolean` |
+| `qbdi.call(vm, target, ...args)` | `number \| bigint, AddressLike, ...AddressLike` | `number \| bigint \| null` |
+| `qbdi.switchStackAndCall(vm, target, stackSize, ...args)` | `number \| bigint, AddressLike, number, ...AddressLike` | `number \| bigint \| null` |
+| `qbdi.run(vm, start, stop)` | `number \| bigint, AddressLike, AddressLike` | `boolean` |
+| `qbdi.getGPR(vm, reg)` | `number \| bigint, number` | `number \| bigint \| null` |
+| `qbdi.setGPR(vm, reg, value)` | `number \| bigint, number, AddressLike` | `boolean` |
+| `qbdi.getFPR(vm, reg)` | `number \| bigint, number` | `{lo, hi} \| null` |
+| `qbdi.setFPR(vm, reg, lo, hi)` | `number \| bigint, number, AddressLike, AddressLike` | `boolean` |
+| `qbdi.getErrno(vm)` | `number \| bigint` | `number \| null` |
+| `qbdi.setErrno(vm, value)` | `number \| bigint, number` | `boolean` |
+| `qbdi.setTraceBundleMetadata(modulePath, moduleBase)` | `string, AddressLike` | `boolean` |
+| `qbdi.registerTraceCallbacks(vm, target, outDir?)` | `number \| bigint, AddressLike, string?` | `boolean` |
+| `qbdi.unregisterTraceCallbacks(vm)` | `number \| bigint` | `boolean` |
+| `qbdi.lastError()` | — | `string \| null` |
+| `qbdi.shutdown()` | — | `boolean` |
 
-常用寄存器常量：`qbdi.REG_RETURN`, `qbdi.REG_SP`, `qbdi.REG_LR`, `qbdi.REG_PC`
+常用常量：`qbdi.REG_RETURN`, `qbdi.REG_BP`, `qbdi.REG_LR`, `qbdi.REG_SP`, `qbdi.REG_FLAG`, `qbdi.REG_PC`, `qbdi.MEMORY_READ`, `qbdi.MEMORY_WRITE`, `qbdi.MEMORY_READ_WRITE`
 
 ```js
 var vm = qbdi.newVM();
@@ -1802,7 +1830,7 @@ Trace 文件默认输出到 `/data/data/<package>/trace_bundle.pb`，配合 qbdi
 - Spawn 模式下 Java hook 必须放在 `Java.ready(fn)` 里（`Java.classLoaders()` / `Java.choose` 同理）
 - `Java.setStealth()` 必须在 `Java.use().impl` 之前调用
 - `callNative()` 仅支持整数/指针参数（最多 6 个），需要浮点/任意签名用 `NativeFunction`
-- 自修改代码后需 `Memory.flushCodeCache(addr, size)` 清 I-cache
+- 自修改代码后需 `Memory.flushCodeCache(addr, size)` 清 I-cache；`Memory.alloc` 返回普通 heap 内存，若要执行需先 `Memory.protect(addr, size, "rwx")`
 
 ---
 
