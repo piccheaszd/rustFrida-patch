@@ -8,6 +8,7 @@ use std::ffi::CString;
 
 use super::art_controller::ensure_art_controller_initialized;
 use super::art_method::*;
+use super::callback::resolve_method_via_executor;
 use super::jni_core::*;
 use super::reflect::*;
 use crate::jsapi::callback_util::set_js_u64_property;
@@ -56,19 +57,39 @@ pub(super) unsafe extern "C" fn js_java_inspect_art_method(
         (sig_str.clone(), false)
     };
 
-    let env = match ensure_jni_initialized() {
-        Ok(e) => e,
-        Err(msg) => {
-            let err = CString::new(msg).unwrap();
-            return ffi::JS_ThrowInternalError(ctx, err.as_ptr());
+    let raw_clone = crate::is_raw_clone_js_thread();
+    let env = if raw_clone {
+        std::ptr::null_mut()
+    } else {
+        match ensure_jni_initialized() {
+            Ok(e) => e,
+            Err(msg) => {
+                let err = CString::new(msg).unwrap();
+                return ffi::JS_ThrowInternalError(ctx, err.as_ptr());
+            }
         }
     };
 
-    let (art_method, is_static) = match resolve_art_method(env, &class_name, &method_name, &actual_sig, force_static) {
-        Ok(r) => r,
-        Err(msg) => {
-            let err = CString::new(msg).unwrap();
-            return ffi::JS_ThrowInternalError(ctx, err.as_ptr());
+    let (art_method, is_static) = if raw_clone {
+        match resolve_method_via_executor(
+            class_name.clone(),
+            method_name.clone(),
+            actual_sig.clone(),
+            force_static,
+        ) {
+            Ok(r) => r,
+            Err(msg) => {
+                let err = CString::new(msg).unwrap();
+                return ffi::JS_ThrowInternalError(ctx, err.as_ptr());
+            }
+        }
+    } else {
+        match resolve_art_method(env, &class_name, &method_name, &actual_sig, force_static) {
+            Ok(r) => r,
+            Err(msg) => {
+                let err = CString::new(msg).unwrap();
+                return ffi::JS_ThrowInternalError(ctx, err.as_ptr());
+            }
         }
     };
 
@@ -159,6 +180,13 @@ pub(super) unsafe extern "C" fn js_java_set_forced_interpret_only(
 
     let enable = JSValue(*argv).to_bool().unwrap_or(false);
 
+    if crate::is_raw_clone_js_thread() {
+        return ffi::JS_ThrowInternalError(
+            ctx,
+            b"_setForcedInterpretOnly is disabled on raw clone JS threads\0".as_ptr() as *const _,
+        );
+    }
+
     let _env = match ensure_jni_initialized() {
         Ok(e) => e,
         Err(msg) => {
@@ -216,33 +244,53 @@ pub(super) unsafe extern "C" fn js_java_init_art_controller(
     _argc: i32,
     _argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
-    let env = match ensure_jni_initialized() {
-        Ok(e) => e,
-        Err(msg) => {
-            let err = CString::new(msg).unwrap();
-            return ffi::JS_ThrowInternalError(ctx, err.as_ptr());
+    let raw_clone = crate::is_raw_clone_js_thread();
+    let env = if raw_clone {
+        std::ptr::null_mut()
+    } else {
+        match ensure_jni_initialized() {
+            Ok(e) => e,
+            Err(msg) => {
+                let err = CString::new(msg).unwrap();
+                return ffi::JS_ThrowInternalError(ctx, err.as_ptr());
+            }
         }
     };
 
-    // 需要一个 ArtMethod 来探测 spec，用 Object.toString
-    let cls = find_class_safe(env, "java.lang.Object");
-    if cls.is_null() {
-        return ffi::JS_ThrowInternalError(ctx, b"FindClass Object failed\0".as_ptr() as *const _);
-    }
+    // 需要一个 ArtMethod 来探测 spec，用 Object.toString。raw clone 线程必须
+    // 通过 Java executor 解析，避免 env=null 时把 ART bridge 缓存成空结果。
+    let art_method = if raw_clone {
+        match resolve_method_via_executor(
+            "java.lang.Object".to_string(),
+            "toString".to_string(),
+            "()Ljava/lang/String;".to_string(),
+            false,
+        ) {
+            Ok((method, _)) => method,
+            Err(msg) => {
+                let err = CString::new(msg).unwrap();
+                return ffi::JS_ThrowInternalError(ctx, err.as_ptr());
+            }
+        }
+    } else {
+        let cls = find_class_safe(env, "java.lang.Object");
+        if cls.is_null() {
+            return ffi::JS_ThrowInternalError(ctx, b"FindClass Object failed\0".as_ptr() as *const _);
+        }
 
-    let c_name = CString::new("toString").unwrap();
-    let c_sig = CString::new("()Ljava/lang/String;").unwrap();
-    let get_method_id: GetMethodIdFn = jni_fn!(env, GetMethodIdFn, JNI_GET_METHOD_ID);
-    let method_id = get_method_id(env, cls, c_name.as_ptr(), c_sig.as_ptr());
-    let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
-    delete_local_ref(env, cls);
+        let c_name = CString::new("toString").unwrap();
+        let c_sig = CString::new("()Ljava/lang/String;").unwrap();
+        let get_method_id: GetMethodIdFn = jni_fn!(env, GetMethodIdFn, JNI_GET_METHOD_ID);
+        let method_id = get_method_id(env, cls, c_name.as_ptr(), c_sig.as_ptr());
+        let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+        delete_local_ref(env, cls);
 
-    if method_id.is_null() {
-        jni_check_exc(env);
-        return ffi::JS_ThrowInternalError(ctx, b"GetMethodID toString failed\0".as_ptr() as *const _);
-    }
-
-    let art_method = method_id as u64;
+        if method_id.is_null() {
+            jni_check_exc(env);
+            return ffi::JS_ThrowInternalError(ctx, b"GetMethodID toString failed\0".as_ptr() as *const _);
+        }
+        method_id as u64
+    };
     let spec = get_art_method_spec(env, art_method);
     let bridge = find_art_bridge_functions(env, spec.entry_point_offset);
 

@@ -19,6 +19,7 @@ use super::PAC_STRIP_MASK;
 
 include!("shared.rs");
 include!("bridge.rs");
+include!("dex_resolver.rs");
 include!("resolution.rs");
 include!("fields.rs");
 include!("instrumentation.rs");

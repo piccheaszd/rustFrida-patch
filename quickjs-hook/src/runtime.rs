@@ -16,7 +16,11 @@ impl JSRuntime {
         NonNull::new(ptr).map(|ptr| {
             unsafe {
                 ffi::JS_SetMemoryLimit(ptr.as_ptr(), 64 * 1024 * 1024);
-                // interrupt handler + NewLocalRef 都去掉，回到纯 try_lock
+                ffi::JS_SetInterruptHandler(
+                    ptr.as_ptr(),
+                    Some(crate::jsapi::callback_util::art_interrupt_handler),
+                    std::ptr::null_mut(),
+                );
             }
             JSRuntime { ptr }
         })

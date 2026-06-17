@@ -176,12 +176,16 @@ typedef struct {
   const char * agent_current_thread_eval;
   const ElfW(Addr) * resolver_module_bases;
   size_t resolver_module_count;
+  void * libc_base;
+  void * linker_base;
 
   /* Runtime state (filled by loader) */
-  pthread_t worker;
+  uintptr_t worker;
   void * agent_handle;
   void * agent_entrypoint_impl;
   void * agent_current_thread_eval_impl;
+  void * loader_stack;
+  size_t loader_stack_size;
   uint64_t spawn_resume_flag;
   uint64_t spawn_stage0_done_flag;
   uint64_t spawn_cleanup_payload_base;
@@ -296,18 +300,22 @@ static bool frida_send_chunk (int sockfd, const void * buffer, size_t length, co
 static void frida_enable_close_on_exec (int fd, const FridaLibcApi * libc);
 
 static bool rustfrida_link_agent (int fd, int diagfd, const FridaLibcApi * libc, RustFridaLinkedModule * module,
-    const ElfW(Addr) * resolver_module_bases, size_t resolver_module_count, const char * agent_vma_name,
-    bool catch_link_signals, bool stream_agent);
+    const ElfW(Addr) * resolver_module_bases, size_t resolver_module_count,
+    ElfW(Addr) libc_base, ElfW(Addr) linker_base, const char * agent_vma_name, bool catch_link_signals, bool stream_agent);
 static void * rustfrida_find_export (RustFridaLinkedModule * module, const char * symbol);
 static void rustfrida_close_module (RustFridaLinkedModule * module, const FridaLibcApi * libc);
 static void rustfrida_unmap_module (RustFridaLinkedModule * module, const FridaLibcApi * libc);
 static bool rustfrida_build_symbol_resolver (RustFridaLinkedModule * module, int diagfd, const FridaLibcApi * libc,
-    const ElfW(Addr) * resolver_module_bases, size_t resolver_module_count);
+    const ElfW(Addr) * resolver_module_bases, size_t resolver_module_count,
+    ElfW(Addr) libc_base, ElfW(Addr) linker_base);
 static int rustfrida_dl_iterate_add_module (struct dl_phdr_info * info, size_t size, void * user_data);
 static void rustfrida_set_error (RustFridaLinkedModule * module, const FridaLibcApi * libc, const char * message);
 static void rustfrida_set_symbol_error (RustFridaLinkedModule * module, const FridaLibcApi * libc, const char * prefix, const char * name);
 static bool rustfrida_protect_load_segments (RustFridaLinkedModule * module, const FridaLibcApi * libc, bool enable_bti);
 static void rustfrida_name_load_segments (RustFridaLinkedModule * module, const char * name);
+static void rustfrida_get_fd_vma_name (int fd, char * name, size_t name_size, const FridaLibcApi * libc);
+static void rustfrida_set_vma_name (ElfW(Addr) address, size_t size, const char * name);
+static bool rustfrida_address_is_executable (ElfW(Addr) address);
 static bool rustfrida_try_resolve_local_symbol (const char * name, ElfW(Addr) * value);
 static bool rustfrida_try_resolve_aarch64_builtin (const char * name, ElfW(Addr) * value);
 static void rustfrida_clear_cache (char * begin, char * end);
@@ -362,9 +370,9 @@ static int frida_raw_fcntl (int fd, int cmd, size_t arg);
 static void frida_sleep_ms (uint32_t millis);
 
 static size_t frida_strlen (const char * str);
+static int frida_strcmp (const char * a, const char * b);
 static bool frida_streq (const char * a, const char * b);
 static bool frida_str_has_suffix (const char * str, const char * suffix);
-static int frida_strcmp (const char * a, const char * b);
 static int frida_strncmp (const char * a, const char * b, size_t n);
 static char * frida_strchr (const char * str, int c);
 static char * frida_strrchr (const char * str, int c);
@@ -466,28 +474,16 @@ frida_load (RustFridaLoaderContext * ctx)
   void * stack_top;
   ssize_t tid;
 
-  if (frida_agent_data_has_token (ctx->agent_data, "pthread") &&
-      libc != NULL && libc->pthread_create != NULL)
-  {
-    pthread_t thread;
-
-    if (libc->pthread_create (&thread, NULL, frida_main, ctx) == 0)
-    {
-      ctx->worker = thread;
-      if (libc->pthread_detach != NULL)
-        libc->pthread_detach (thread);
-      return;
-    }
-  }
-
   stack = frida_raw_mmap (NULL, stack_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (stack == MAP_FAILED)
     return;
 
+  ctx->loader_stack = stack;
+  ctx->loader_stack_size = stack_size;
   stack_top = (void *) (((uintptr_t) stack + stack_size) & ~(uintptr_t) 15);
   tid = frida_clone_thread (flags, stack_top, frida_main_raw, ctx);
   if (tid > 0)
-    ctx->worker = (pthread_t) (uintptr_t) tid;
+    ctx->worker = (uintptr_t) tid;
 }
 
 static void
@@ -791,6 +787,21 @@ rustfrida_elf_has_bti_property (const void * file_map, size_t file_size, const E
   return false;
 }
 
+static bool
+rustfrida_is_mapped_elf (const ElfW(Ehdr) * ehdr)
+{
+  return ehdr->e_ident[EI_MAG0] == ELFMAG0 &&
+      ehdr->e_ident[EI_MAG1] == ELFMAG1 &&
+      ehdr->e_ident[EI_MAG2] == ELFMAG2 &&
+      ehdr->e_ident[EI_MAG3] == ELFMAG3 &&
+      ehdr->e_ident[EI_CLASS] == ELFCLASS64 &&
+      ehdr->e_ident[EI_DATA] == ELFDATA2LSB &&
+      ehdr->e_phoff >= sizeof (ElfW(Ehdr)) &&
+      ehdr->e_phentsize == sizeof (ElfW(Phdr)) &&
+      ehdr->e_phnum != 0 &&
+      ehdr->e_phnum < 128;
+}
+
 static size_t
 rustfrida_gnu_hash_nsyms (const uint32_t * gnu_hash)
 {
@@ -894,7 +905,7 @@ rustfrida_export_module_init (ElfW(Addr) candidate_base, RustFridaExportModule *
   ElfW(Dyn) * dynamic = NULL;
   ElfW(Dyn) * dyn;
 
-  if (!rustfrida_is_valid_elf (ehdr))
+  if (!rustfrida_is_mapped_elf (ehdr))
     return false;
 
   phdrs = (ElfW(Phdr) *) (candidate_base + ehdr->e_phoff);
@@ -916,7 +927,6 @@ rustfrida_export_module_init (ElfW(Addr) candidate_base, RustFridaExportModule *
     if (phdr->p_type == PT_DYNAMIC)
     {
       dynamic = (ElfW(Dyn) *) (load_bias + phdr->p_vaddr);
-      break;
     }
   }
 
@@ -970,6 +980,81 @@ rustfrida_export_module_init (ElfW(Addr) candidate_base, RustFridaExportModule *
 }
 
 static bool
+rustfrida_address_is_executable (ElfW(Addr) address)
+{
+  static const char maps_path[] = "/proc/self/maps";
+  char buffer[8192];
+  char line[512];
+  size_t line_len = 0;
+  int fd;
+  ssize_t n;
+  bool result = false;
+
+  fd = frida_syscall_4 (__NR_openat, AT_FDCWD, (size_t) maps_path, O_RDONLY, 0);
+  if (fd < 0)
+    return false;
+
+  while (!result && (n = frida_syscall_3 (__NR_read, fd, (size_t) buffer, sizeof (buffer))) > 0)
+  {
+    ssize_t i;
+
+    for (i = 0; i != n; i++)
+    {
+      char ch = buffer[i];
+
+      if (ch == '\n' || line_len == sizeof (line) - 1)
+      {
+        ElfW(Addr) start;
+        ElfW(Addr) end;
+        const char * cursor;
+
+        line[line_len] = '\0';
+        line_len = 0;
+
+        cursor = rustfrida_parse_hex (line, &start);
+        if (cursor == NULL || *cursor != '-')
+          continue;
+        cursor++;
+        cursor = rustfrida_parse_hex (cursor, &end);
+        if (cursor == NULL || address < start || address >= end)
+          continue;
+
+        cursor = rustfrida_skip_spaces (cursor);
+        result = cursor[2] == 'x';
+        break;
+      }
+      else
+      {
+        line[line_len++] = ch;
+      }
+    }
+  }
+
+  if (!result && line_len != 0)
+  {
+    ElfW(Addr) start;
+    ElfW(Addr) end;
+    const char * cursor;
+
+    line[line_len] = '\0';
+    cursor = rustfrida_parse_hex (line, &start);
+    if (cursor != NULL && *cursor == '-')
+    {
+      cursor++;
+      cursor = rustfrida_parse_hex (cursor, &end);
+      if (cursor != NULL && address >= start && address < end)
+      {
+        cursor = rustfrida_skip_spaces (cursor);
+        result = cursor[2] == 'x';
+      }
+    }
+  }
+
+  frida_syscall_1 (__NR_close, fd);
+  return result;
+}
+
+static bool
 rustfrida_resolver_add_module (RustFridaSymbolResolver * resolver, ElfW(Addr) base)
 {
   RustFridaExportModule module;
@@ -1014,7 +1099,7 @@ rustfrida_maps_line_add_module (RustFridaSymbolResolver * resolver, const char *
   cursor = rustfrida_next_field (cursor);
 
   cursor = rustfrida_parse_hex (cursor, &offset);
-  if (cursor == NULL || offset != 0)
+  if (cursor == NULL)
     return false;
   cursor = rustfrida_next_field (cursor);
   cursor = rustfrida_next_field (cursor);
@@ -1036,12 +1121,16 @@ rustfrida_maps_line_add_module (RustFridaSymbolResolver * resolver, const char *
     return false;
   }
 
-  return rustfrida_resolver_add_module (resolver, start);
+  if (offset > start)
+    return false;
+
+  return rustfrida_resolver_add_module (resolver, start - offset);
 }
 
 static bool
 rustfrida_build_symbol_resolver (RustFridaLinkedModule * module, int diagfd, const FridaLibcApi * libc,
-    const ElfW(Addr) * resolver_module_bases, size_t resolver_module_count)
+    const ElfW(Addr) * resolver_module_bases, size_t resolver_module_count,
+    ElfW(Addr) libc_base, ElfW(Addr) linker_base)
 {
   static const char maps_path[] = "/proc/self/maps";
   char buffer[16384];
@@ -1067,6 +1156,11 @@ rustfrida_build_symbol_resolver (RustFridaLinkedModule * module, int diagfd, con
     rustfrida_set_error (module, libc, "host resolver module list unusable");
     return false;
   }
+
+  if (libc_base != 0)
+    rustfrida_resolver_add_module (&module->resolver, libc_base);
+  if (linker_base != 0)
+    rustfrida_resolver_add_module (&module->resolver, linker_base);
 
   if (libc->dl_iterate_phdr != NULL)
   {
@@ -1199,7 +1293,13 @@ rustfrida_resolver_lookup (const RustFridaSymbolResolver * resolver, const char 
         ElfW(Addr) resolved = (sym->st_shndx == SHN_ABS) ? sym->st_value : module->base + sym->st_value;
 
         if (type == STT_GNU_IFUNC)
+        {
+          if (!rustfrida_address_is_executable (resolved))
+            continue;
           resolved = ((ElfW(Addr) (*) (void)) resolved) ();
+          if (resolved == 0 || !rustfrida_address_is_executable (resolved))
+            continue;
+        }
         *value = resolved;
         return true;
       }
@@ -1222,7 +1322,13 @@ rustfrida_set_symbol_error (RustFridaLinkedModule * module, const FridaLibcApi *
 {
   if (libc->sprintf != NULL)
   {
-    libc->sprintf (module->error, "%s%s (modules=%zu)", prefix, name, module->resolver.count);
+    libc->sprintf (module->error, "%s%s (modules=%zu nsyms=%zu,%zu,%zu)",
+        prefix,
+        name,
+        module->resolver.count,
+        module->resolver.count > 0 ? module->resolver.modules[0].nsyms : 0,
+        module->resolver.count > 1 ? module->resolver.modules[1].nsyms : 0,
+        module->resolver.count > 2 ? module->resolver.modules[2].nsyms : 0);
   }
 }
 
@@ -2058,8 +2164,8 @@ rustfrida_call_fini_functions (RustFridaLinkedModule * module)
 
 static bool
 rustfrida_link_agent (int fd, int diagfd, const FridaLibcApi * libc, RustFridaLinkedModule * module,
-    const ElfW(Addr) * resolver_module_bases, size_t resolver_module_count, const char * agent_vma_name,
-    bool catch_link_signals, bool stream_agent)
+    const ElfW(Addr) * resolver_module_bases, size_t resolver_module_count,
+    ElfW(Addr) libc_base, ElfW(Addr) linker_base, const char * agent_vma_name, bool catch_link_signals, bool stream_agent)
 {
   size_t page_size = 4096;
   ssize_t file_size;
@@ -2286,7 +2392,8 @@ rustfrida_link_agent (int fd, int diagfd, const FridaLibcApi * libc, RustFridaLi
   frida_send_log (diagfd, "link: dynamic parsed", libc);
 
   frida_send_debug (diagfd, "link:build-resolver", libc);
-  if (!rustfrida_build_symbol_resolver (module, diagfd, libc, resolver_module_bases, resolver_module_count))
+  if (!rustfrida_build_symbol_resolver (module, diagfd, libc, resolver_module_bases, resolver_module_count,
+        libc_base, linker_base))
     goto fail;
   frida_send_log (diagfd, "link: resolver built", libc);
 
@@ -2717,7 +2824,9 @@ frida_main (void * user_data)
       frida_send_debug (ctrlfd, "loader:waiting-agent-stream", libc);
       frida_send_debug (ctrlfd, "loader:link-agent-begin", libc);
       if (!rustfrida_link_agent (-1, ctrlfd, libc, &agent_module,
-        ctx->resolver_module_bases, ctx->resolver_module_count, agent_vma_name, catch_entry_signals, true))
+        ctx->resolver_module_bases, ctx->resolver_module_count,
+        (ElfW(Addr)) ctx->libc_base, (ElfW(Addr)) ctx->linker_base,
+        agent_vma_name, catch_entry_signals, true))
         goto dlopen_failed;
     }
     else
@@ -2737,7 +2846,9 @@ frida_main (void * user_data)
         int owned_agent_fd = agent_codefd;
         agent_codefd = -1;
         if (!rustfrida_link_agent (owned_agent_fd, ctrlfd, libc, &agent_module,
-          ctx->resolver_module_bases, ctx->resolver_module_count, agent_vma_name, catch_entry_signals, false))
+          ctx->resolver_module_bases, ctx->resolver_module_count,
+          (ElfW(Addr)) ctx->libc_base, (ElfW(Addr)) ctx->linker_base,
+          agent_vma_name, catch_entry_signals, false))
           goto dlopen_failed;
       }
     }
@@ -3182,6 +3293,18 @@ frida_strlen (const char * str)
   return n;
 }
 
+static int
+frida_strcmp (const char * a, const char * b)
+{
+  while (*a != '\0' && *a == *b)
+  {
+    a++;
+    b++;
+  }
+
+  return ((unsigned char) *a) - ((unsigned char) *b);
+}
+
 static bool
 frida_streq (const char * a, const char * b)
 {
@@ -3214,18 +3337,6 @@ frida_str_has_suffix (const char * str, const char * suffix)
   }
 
   return true;
-}
-
-static int
-frida_strcmp (const char * a, const char * b)
-{
-  while (*a != '\0' && *a == *b)
-  {
-    a++;
-    b++;
-  }
-
-  return ((unsigned char) *a) - ((unsigned char) *b);
 }
 
 static int

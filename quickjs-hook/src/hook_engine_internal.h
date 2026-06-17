@@ -21,6 +21,26 @@
 #include <errno.h>
 #include <fcntl.h>
 
+static inline void hook_lock_init(HookLock* lock) {
+    __atomic_store_n(&lock->state, 0, __ATOMIC_RELEASE);
+}
+
+static inline void hook_lock(HookLock* lock) {
+    while (__atomic_exchange_n(&lock->state, 1, __ATOMIC_ACQUIRE) != 0) {
+        while (__atomic_load_n(&lock->state, __ATOMIC_RELAXED) != 0) {
+            __asm__ __volatile__("yield" ::: "memory");
+        }
+    }
+}
+
+static inline void hook_unlock(HookLock* lock) {
+    __atomic_store_n(&lock->state, 0, __ATOMIC_RELEASE);
+}
+
+static inline void hook_lock_destroy(HookLock* lock) {
+    __atomic_store_n(&lock->state, 0, __ATOMIC_RELEASE);
+}
+
 /* wxshadow prctl operations - two-step shadow page patching:
  *   1. PATCH: create shadow + write data + activate (--x) in one step
  *   2. RELEASE: restore the exact patch identified by its patch start address
@@ -56,7 +76,6 @@ extern HookEngine g_engine;
 extern HookLogFn g_log_fn;
 extern ExecPoolRange g_retained_pool_ranges[MAX_EXEC_POOLS];
 extern int g_retained_pool_range_count;
-
 /* --- ART router globals (defined in hook_engine_art.c) --- */
 extern ArtRouterEntry g_art_router_table[ART_ROUTER_TABLE_MAX];
 extern volatile uint64_t g_art_router_last_x0;
@@ -78,8 +97,13 @@ void hook_engine_munmap_pools_direct(void);
 
 /* --- Memory management (hook_engine_mem.c) --- */
 int page_has_read_perm(uintptr_t addr);
+int page_prot_flags(uintptr_t addr);
 int read_target_safe(void* target, void* buf, size_t len);
+int mprotect_range_pages(void* target, size_t len, int prot);
+void restore_range_prot_pages(void* target, size_t len, const int* prot_flags, size_t prot_count);
+size_t save_range_prot_pages(void* target, size_t len, int* prot_flags, size_t prot_cap);
 void restore_page_rx(uintptr_t page_start);
+void restore_page_prot_span(uintptr_t page_start, int first_prot, int second_prot);
 HookEntry* alloc_entry(void);
 void free_entry(HookEntry* entry);
 int wxshadow_patch(void* addr, const void* buf, size_t len);

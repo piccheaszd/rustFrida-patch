@@ -19,6 +19,30 @@ use super::cmodule::is_cmodule_code_address;
 use super::registry::{hook_error_message, init_registry, HookData, HookKind, StealthMode, HOOK_OK, HOOK_REGISTRY};
 use crate::jsapi::callback_util::with_registry_mut;
 
+unsafe fn finalize_recomp_hook_slot(
+    hook_addr: u64,
+    orig_addr: u64,
+    trampoline: *mut std::ffi::c_void,
+) -> Result<(), String> {
+    if trampoline.is_null() {
+        return Err("recomp hook trampoline is null".to_string());
+    }
+    if let Err(e) = crate::recomp::fixup_slot_trampoline(trampoline as *mut u8, orig_addr as usize) {
+        let _ = crate::recomp::try_revert_slot_patch(orig_addr as usize);
+        return Err(format!("recomp fixup trampoline: {}", e));
+    }
+    let ret = hook_ffi::hook_mark_recomp_hook(hook_addr as *mut std::ffi::c_void);
+    if ret != HOOK_OK {
+        let _ = crate::recomp::try_revert_slot_patch(orig_addr as usize);
+        return Err(format!("recomp mark hook: {}", hook_error_str(ret)));
+    }
+    if let Err(e) = crate::recomp::commit_slot_patch(orig_addr as usize) {
+        let _ = crate::recomp::try_revert_slot_patch(orig_addr as usize);
+        return Err(format!("recomp commit slot: {}", e));
+    }
+    Ok(())
+}
+
 /// hook(ptr, callback, mode?) - Install a hook at the given address
 ///
 /// mode: Hook.NORMAL (0, default), Hook.WXSHADOW (1) / true, Hook.RECOMP (2)
@@ -121,7 +145,6 @@ unsafe fn install_hook(
 
     let stealth_flag = match mode {
         StealthMode::WxShadow => 1,
-        StealthMode::Recomp => 2,
         _ => 0,
     };
 
@@ -140,8 +163,12 @@ unsafe fn install_hook(
 
     // Recomp: fixup trampoline + commit B 指令
     if mode == StealthMode::Recomp {
-        let _ = crate::recomp::fixup_slot_trampoline(trampoline as *mut u8, addr as usize);
-        let _ = crate::recomp::commit_slot_patch(addr as usize);
+        if let Err(e) = finalize_recomp_hook_slot(hook_addr, addr, trampoline) {
+            let callback: ffi::JSValue = std::ptr::read(callback_bytes.as_ptr() as *const ffi::JSValue);
+            ffi::qjs_free_value(ctx, callback);
+            hook_ffi::hook_remove(hook_addr as *mut std::ffi::c_void);
+            return throw_internal_error(ctx, &format!("hook(recomp): {}", e));
+        }
     }
 
     with_registry_mut(&HOOK_REGISTRY, |registry| {
@@ -331,7 +358,6 @@ pub(crate) unsafe extern "C" fn js_hook_native(
 
     let stealth_flag = match mode {
         StealthMode::WxShadow => 1,
-        StealthMode::Recomp => 2,
         _ => 0,
     };
     let callback_fn: unsafe extern "C" fn(*mut hook_ffi::HookContext, *mut std::ffi::c_void) =
@@ -348,8 +374,10 @@ pub(crate) unsafe extern "C" fn js_hook_native(
     }
 
     if mode == StealthMode::Recomp {
-        let _ = crate::recomp::fixup_slot_trampoline(trampoline as *mut u8, target as usize);
-        let _ = crate::recomp::commit_slot_patch(target as usize);
+        if let Err(e) = finalize_recomp_hook_slot(hook_addr, target, trampoline) {
+            hook_ffi::hook_remove(hook_addr as *mut std::ffi::c_void);
+            return throw_internal_error(ctx, &format!("hookNative(recomp): {}", e));
+        }
     }
 
     with_registry_mut(&HOOK_REGISTRY, |registry| {
@@ -505,7 +533,6 @@ pub(crate) unsafe extern "C" fn js_attach_native(
     };
     let stealth_flag = match mode {
         StealthMode::WxShadow => 1,
-        StealthMode::Recomp => 2,
         _ => 0,
     };
     let user_on_enter_fn: Option<NativeHookCallback> = if on_enter_addr == 0 {
@@ -546,10 +573,11 @@ pub(crate) unsafe extern "C" fn js_attach_native(
     }
     if mode == StealthMode::Recomp {
         let trampoline = hook_ffi::hook_get_trampoline(hook_addr as *mut std::ffi::c_void);
-        if !trampoline.is_null() {
-            let _ = crate::recomp::fixup_slot_trampoline(trampoline as *mut u8, target as usize);
+        if let Err(e) = finalize_recomp_hook_slot(hook_addr, target, trampoline) {
+            super::callback::free_native_attach_callbacks(native_attach_data);
+            hook_ffi::hook_remove(hook_addr as *mut std::ffi::c_void);
+            return throw_internal_error(ctx, &format!("attachNative(recomp): {}", e));
         }
-        let _ = crate::recomp::commit_slot_patch(target as usize);
     }
 
     with_registry_mut(&HOOK_REGISTRY, |registry| {
@@ -934,7 +962,6 @@ pub(crate) unsafe extern "C" fn js_interceptor_attach(
 
     let stealth_flag = match mode {
         StealthMode::WxShadow => 1,
-        StealthMode::Recomp => 2,
         _ => 0,
     };
 
@@ -969,10 +996,18 @@ pub(crate) unsafe extern "C" fn js_interceptor_attach(
     // Recomp: 需要修正 slot trampoline（hook_attach 已生成 thunk 并 patch 了 slot 的 4 字节）
     if mode == StealthMode::Recomp {
         let trampoline = hook_ffi::hook_get_trampoline(hook_addr as *mut std::ffi::c_void);
-        if !trampoline.is_null() {
-            let _ = crate::recomp::fixup_slot_trampoline(trampoline as *mut u8, addr as usize);
+        if let Err(e) = finalize_recomp_hook_slot(hook_addr, addr, trampoline) {
+            if has_on_enter {
+                let v: ffi::JSValue = std::ptr::read(on_enter_bytes.as_ptr() as *const ffi::JSValue);
+                ffi::qjs_free_value(ctx, v);
+            }
+            if has_on_leave {
+                let v: ffi::JSValue = std::ptr::read(on_leave_bytes.as_ptr() as *const ffi::JSValue);
+                ffi::qjs_free_value(ctx, v);
+            }
+            hook_ffi::hook_remove(hook_addr as *mut std::ffi::c_void);
+            return throw_internal_error(ctx, &format!("hook_attach(recomp): {}", e));
         }
-        let _ = crate::recomp::commit_slot_patch(addr as usize);
     }
 
     with_registry_mut(&HOOK_REGISTRY, |registry| {

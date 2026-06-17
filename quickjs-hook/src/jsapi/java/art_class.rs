@@ -10,7 +10,7 @@ use std::sync::{Mutex, OnceLock};
 
 use super::art_method::get_art_field_spec;
 use super::jni_core::*;
-use super::safe_mem::{refresh_mem_regions, safe_read_u16, safe_read_u32, safe_read_u64};
+use super::safe_mem::{is_readable, refresh_mem_regions, safe_read_u16, safe_read_u32, safe_read_u64};
 use super::PAC_STRIP_MASK;
 use crate::jsapi::console::output_verbose;
 use crate::jsapi::module::libart_dlsym;
@@ -61,23 +61,12 @@ fn probe_art_class_spec(env: JniEnv) -> Option<ArtClassSpec> {
         let get_field_id: GetFieldIdFn = jni_fn!(env, GetFieldIdFn, JNI_GET_FIELD_ID);
         let get_static_field_id: GetStaticFieldIdFn = jni_fn!(env, GetStaticFieldIdFn, JNI_GET_STATIC_FIELD_ID);
         let get_method_id: GetMethodIdFn = jni_fn!(env, GetMethodIdFn, JNI_GET_METHOD_ID);
-        let new_global_ref: NewGlobalRefFn = jni_fn!(env, NewGlobalRefFn, JNI_NEW_GLOBAL_REF);
-        let delete_global_ref: DeleteGlobalRefFn = jni_fn!(env, DeleteGlobalRefFn, JNI_DELETE_GLOBAL_REF);
         let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
 
         let c_thread = std::ffi::CString::new("java/lang/Thread").unwrap();
         let cls_local = find_class(env, c_thread.as_ptr());
-        if cls_local.is_null() || jni_check_exc(env) {
+        if jni_null_or_exc(env, cls_local) {
             output_verbose("[art class] FindClass(java/lang/Thread) 失败");
-            return None;
-        }
-
-        // 转为 global ref: DecodeJObject 对 global ref 更可靠，
-        // 且避免 GC 移动对象导致扫描时读到脏数据
-        let cls_global = new_global_ref(env, cls_local);
-        delete_local_ref(env, cls_local);
-        if cls_global.is_null() {
-            output_verbose("[art class] NewGlobalRef 失败");
             return None;
         }
 
@@ -90,16 +79,16 @@ fn probe_art_class_spec(env: JniEnv) -> Option<ArtClassSpec> {
         let c_get_name_sig = std::ffi::CString::new("()Ljava/lang/String;").unwrap();
 
         jni_check_exc(env);
-        let static_field_id = get_static_field_id(env, cls_global, c_max_pri.as_ptr(), c_int_sig.as_ptr());
+        let static_field_id = get_static_field_id(env, cls_local, c_max_pri.as_ptr(), c_int_sig.as_ptr());
         jni_check_exc(env);
-        let instance_field_id = get_field_id(env, cls_global, c_name.as_ptr(), c_string_sig.as_ptr());
+        let instance_field_id = get_field_id(env, cls_local, c_name.as_ptr(), c_string_sig.as_ptr());
         jni_check_exc(env);
-        let method_id = get_method_id(env, cls_global, c_get_name.as_ptr(), c_get_name_sig.as_ptr());
+        let method_id = get_method_id(env, cls_local, c_get_name.as_ptr(), c_get_name_sig.as_ptr());
         jni_check_exc(env);
 
         if static_field_id.is_null() && instance_field_id.is_null() && method_id.is_null() {
             output_verbose("[art class] 所有引用获取失败");
-            delete_global_ref(env, cls_global);
+            delete_local_ref(env, cls_local);
             return None;
         }
 
@@ -111,9 +100,9 @@ fn probe_art_class_spec(env: JniEnv) -> Option<ArtClassSpec> {
         // Step 3: 解码 ID → 真实指针
         // jfieldID 在 API 30+ 可能是 opaque index 而非 ArtField*，需解码
         // jmethodID 可能是 opaque (API 30+)，使用 decode_method_id
-        let art_field_static = super::reflect::decode_field_id(env, cls_global, static_field_id as u64, true);
-        let art_field_instance = super::reflect::decode_field_id(env, cls_global, instance_field_id as u64, false);
-        let art_method_instance = super::reflect::decode_method_id(env, cls_global, method_id as u64, false);
+        let art_field_static = super::reflect::decode_field_id(env, cls_local, static_field_id as u64, true);
+        let art_field_instance = super::reflect::decode_field_id(env, cls_local, instance_field_id as u64, false);
+        let art_method_instance = super::reflect::decode_method_id(env, cls_local, method_id as u64, false);
 
         output_verbose(&format!(
             "[art class] 解码后: static_field={:#x}, instance_field={:#x}, method={:#x}",
@@ -129,7 +118,7 @@ fn probe_art_class_spec(env: JniEnv) -> Option<ArtClassSpec> {
         let scan_result = with_runnable_thread(env, || {
             scan_class_layout(
                 env,
-                cls_global,
+                cls_local,
                 art_field_static,
                 art_field_instance,
                 art_method_instance,
@@ -138,7 +127,7 @@ fn probe_art_class_spec(env: JniEnv) -> Option<ArtClassSpec> {
             )
         });
 
-        delete_global_ref(env, cls_global);
+        delete_local_ref(env, cls_local);
 
         let spec = scan_result?;
 
@@ -215,7 +204,7 @@ unsafe fn scan_class_layout(
 
         // 检查 LengthPrefixedArray<ArtMethod> 是否包含已知 method 指针
         if methods_offset.is_none() && art_method_instance != 0 {
-            if check_array_contains(val_stripped, m_entry_size, 8, art_method_instance, 100) {
+            if check_array_contains(val_stripped, m_entry_size, 8, art_method_instance, 4096) {
                 methods_offset = Some(offset);
                 output_verbose(&format!(
                     "[art class] 找到 methods_ 在 Class+{:#x} (array={:#x})",
@@ -384,6 +373,13 @@ impl ThreadStateEncoding {
             ThreadStateEncoding::High16 => (original & 0x0000_ffff) | ((state & 0xffff) << 16),
         }
     }
+
+    fn flags(self, value: u32) -> u32 {
+        match self {
+            ThreadStateEncoding::High8 => value & 0x00ff_ffff,
+            ThreadStateEncoding::High16 => value & 0x0000_ffff,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -499,6 +495,10 @@ pub(crate) unsafe fn transition_current_thread_to_native_for_blocking(env: JniEn
 
     let from_runnable_sym = libart_dlsym("_ZN3art6Thread33TransitionFromRunnableToSuspendedENS_11ThreadStateE");
     if from_runnable_sym.is_null() {
+        if slot.encoding.flags(current) != 0 {
+            output_verbose("[runnable] pending flags present; skip direct kNative transition");
+            return false;
+        }
         output_verbose("[runnable] TransitionFromRunnableToSuspended 不可用，直接写回 kNative state");
         let ptr = (thread as usize + slot.offset) as *mut u32;
         let restored = slot.encoding.encode_state(current, slot.native_state as u32);
@@ -585,7 +585,14 @@ where
 
         let result = f();
 
-        // 恢复原始状态
+        let after = std::ptr::read_volatile(ptr);
+        if encoding.flags(after) != encoding.flags(original) {
+            output_verbose(&format!(
+                "[runnable] direct fallback dropping pending flags: before={:#x}, after={:#x}",
+                encoding.flags(original),
+                encoding.flags(after)
+            ));
+        }
         std::ptr::write_volatile(ptr, original);
 
         return result;
@@ -635,7 +642,7 @@ pub(crate) unsafe fn decode_jobject(env: JniEnv, obj: *mut std::ffi::c_void) -> 
         }
     }
 
-    None
+    decode_indirect_jobject_fallback(obj, "DecodeJObject")
 }
 
 pub(crate) unsafe fn decode_global_jobject(env: JniEnv, obj: *mut std::ffi::c_void) -> Option<u64> {
@@ -666,7 +673,7 @@ pub(crate) unsafe fn decode_global_jobject(env: JniEnv, obj: *mut std::ffi::c_vo
         }
     }
 
-    None
+    decode_indirect_jobject_fallback(obj, "DecodeGlobalJObject")
 }
 
 /// 解码 jclass 引用为 mirror::Class* 地址
@@ -685,10 +692,8 @@ unsafe fn decode_jclass(env: JniEnv, cls: *mut std::ffi::c_void) -> Option<u64> 
         return Some(stripped);
     }
 
-    // 策略 2: 直接读取 global ref entry
-    // Global ref 在 ART 中指向 IndirectReferenceTable 的 IrtEntry，
-    // IrtEntry 中存储 GcRoot<mirror::Object>，对于非压缩指针就是 mirror::Object*
-    // 尝试: 将 ref 当作指针读取其指向的值
+    // 策略 2: 兼容旧 fallback：将 ref 当作裸 entry 指针读取。
+    // 正常 local ref 会在 decode_indirect_jobject_fallback() 中先清 tag。
     let cls_val = cls as u64;
     if cls_val != 0 && cls_val > 0x1000 {
         let deref = safe_read_u64(cls_val);
@@ -715,4 +720,78 @@ unsafe fn decode_jclass(env: JniEnv, cls: *mut std::ffi::c_void) -> Option<u64> 
 
     output_verbose("[art class] jclass 解码失败: DecodeJObject 不可用且 fallback 无效");
     None
+}
+
+/// Decode ART indirect refs without calling stripped libart helpers.
+///
+/// Modern ART local refs are encoded as `LrtEntry* | kLocal`. `LrtEntry`
+/// stores a compressed `GcRoot<mirror::Object>` at offset 0, so clearing the
+/// low kind bits and reading the u32 root is enough while the thread is
+/// Runnable. Global refs use an indexed `IndirectReferenceTable`; we keep them
+/// on the symbol path for now and avoid creating globals in the resolver.
+unsafe fn decode_indirect_jobject_fallback(obj: *mut std::ffi::c_void, caller: &str) -> Option<u64> {
+    const KIND_MASK: u64 = 0x3;
+    const KIND_LOCAL: u64 = 0x1;
+
+    let raw = obj as u64;
+    if raw == 0 {
+        return None;
+    }
+
+    let kind = raw & KIND_MASK;
+    if kind == KIND_LOCAL {
+        let entry = raw & !KIND_MASK;
+        if let Some(decoded) = decode_lrt_entry_root(entry) {
+            output_verbose(&format!(
+                "[art class] {} fallback local-ref: ref={:#x}, entry={:#x} -> mirror::Object*={:#x}",
+                caller, raw, entry, decoded
+            ));
+            return Some(decoded);
+        }
+        output_verbose(&format!(
+            "[art class] {} fallback local-ref failed: ref={:#x}, entry={:#x}",
+            caller, raw, entry
+        ));
+        return None;
+    }
+
+    if kind == 0 && is_readable(raw, 4) {
+        if let Some(decoded) = decode_lrt_entry_root(raw) {
+            output_verbose(&format!(
+                "[art class] {} fallback raw-entry: ref={:#x} -> mirror::Object*={:#x}",
+                caller, raw, decoded
+            ));
+            return Some(decoded);
+        }
+    }
+
+    None
+}
+
+unsafe fn decode_lrt_entry_root(entry: u64) -> Option<u64> {
+    if entry < 0x1000 || !is_readable(entry, 4) {
+        return None;
+    }
+
+    let compressed = safe_read_u32(entry);
+    if let Some(decoded) = normalize_object_root(compressed as u64) {
+        return Some(decoded);
+    }
+
+    if is_readable(entry, 8) {
+        let raw = safe_read_u64(entry) & PAC_STRIP_MASK;
+        return normalize_object_root(raw);
+    }
+
+    None
+}
+
+fn normalize_object_root(raw: u64) -> Option<u64> {
+    if raw < 0x10000 || (raw & 0x7) != 0 {
+        return None;
+    }
+    if !is_readable(raw, 4) {
+        return None;
+    }
+    Some(raw & PAC_STRIP_MASK)
 }

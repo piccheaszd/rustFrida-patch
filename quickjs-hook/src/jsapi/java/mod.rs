@@ -57,6 +57,14 @@ pub fn detach_current_jni_thread() {
     jni_core::detach_current_thread_if_owned();
 }
 
+pub fn start_java_worker_thread(native_loop: *mut std::ffi::c_void) -> Result<(), String> {
+    if crate::is_raw_clone_js_thread() {
+        unsafe { callback::start_java_worker_thread_via_executor(native_loop) }
+    } else {
+        unsafe { java_hook_api::start_java_worker_thread(native_loop) }
+    }
+}
+
 pub(crate) unsafe fn decode_jobject_raw(env: jni_core::JniEnv, obj: *mut std::ffi::c_void) -> Option<u64> {
     art_class::decode_jobject(env, obj)
 }
@@ -104,17 +112,19 @@ pub(crate) unsafe fn try_read_jstring(env_ptr: u64, obj_ptr: u64) -> Option<Stri
     let rel_str: ReleaseStringUtfCharsFn = jni_fn!(env, ReleaseStringUtfCharsFn, JNI_RELEASE_STRING_UTF_CHARS);
 
     let local_obj = new_local_ref(env, obj);
-    if local_obj.is_null() || jni_check_exc(env) {
+    if jni_null_or_exc(env, local_obj) {
         return None;
     }
 
     let mut chars: *const std::os::raw::c_char = std::ptr::null();
     let result = (|| {
         if let Some(reflect) = REFLECT_IDS.get() {
-            if !reflect.string_class.is_null()
-                && (is_instance_of(env, local_obj, reflect.string_class) == 0 || jni_check_exc(env))
-            {
-                return None;
+            if !reflect.string_class.is_null() {
+                let is_string = is_instance_of(env, local_obj, reflect.string_class) != 0;
+                let had_exc = jni_check_exc(env);
+                if !is_string || had_exc {
+                    return None;
+                }
             }
         }
 
@@ -196,7 +206,9 @@ pub(crate) unsafe fn try_is_same_object(env_ptr: u64, a_ptr: u64, b_ptr: u64) ->
     }
 
     let is_same_object: IsSameObjectFn = jni_fn!(env, IsSameObjectFn, JNI_IS_SAME_OBJECT);
-    is_same_object(env, a, b) != 0 && !jni_check_exc(env)
+    let same = is_same_object(env, a, b) != 0;
+    let had_exc = jni_check_exc(env);
+    same && !had_exc
 }
 
 pub(crate) unsafe fn try_is_instance_of(env_ptr: u64, obj_ptr: u64, cls_ptr: u64) -> bool {
@@ -208,7 +220,9 @@ pub(crate) unsafe fn try_is_instance_of(env_ptr: u64, obj_ptr: u64, cls_ptr: u64
     }
 
     let is_instance_of: IsInstanceOfFn = jni_fn!(env, IsInstanceOfFn, JNI_IS_INSTANCE_OF);
-    is_instance_of(env, obj, cls) != 0 && !jni_check_exc(env)
+    let is_instance = is_instance_of(env, obj, cls) != 0;
+    let had_exc = jni_check_exc(env);
+    is_instance && !had_exc
 }
 
 pub(crate) unsafe fn try_get_object_class_name(env_ptr: u64, obj_ptr: u64) -> Option<String> {
@@ -390,13 +404,25 @@ unsafe extern "C" fn js_java_deoptimize_method(
             Ok(v) => v,
             Err(e) => return e,
         };
+    let (actual_sig, force_static) = if let Some(stripped) = sig.strip_prefix("static:") {
+        (stripped.to_string(), true)
+    } else {
+        (sig, false)
+    };
+
+    if crate::is_raw_clone_js_thread() {
+        return match callback::deoptimize_method_via_executor(class_name, method_name, actual_sig, force_static) {
+            Ok(()) => JSValue::bool(true).raw(),
+            Err(msg) => crate::jsapi::callback_util::throw_internal_error(ctx, msg),
+        };
+    }
 
     let env = match ensure_jni_initialized() {
         Ok(e) => e,
         Err(msg) => return crate::jsapi::callback_util::throw_internal_error(ctx, msg),
     };
 
-    let (art_method, _is_static) = match resolve_art_method(env, &class_name, &method_name, &sig, false) {
+    let (art_method, _is_static) = match resolve_art_method(env, &class_name, &method_name, &actual_sig, force_static) {
         Ok(r) => r,
         Err(msg) => return crate::jsapi::callback_util::throw_internal_error(ctx, msg),
     };
@@ -819,6 +845,12 @@ unsafe extern "C" fn js_update_classloader(
     argc: i32,
     argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
+    if crate::is_raw_clone_js_thread() {
+        return throw_internal_error(
+            ctx,
+            "Java._updateClassLoader is disabled on raw clone JS threads because it stores JNI references",
+        );
+    }
     if argc < 1 {
         return ffi::JS_ThrowTypeError(
             ctx,
@@ -838,9 +870,13 @@ unsafe extern "C" fn js_update_classloader(
 
     match ensure_jni_initialized() {
         Ok(env) => {
-            update_app_classloader(env, cl_ptr);
-            output_verbose("[java.ready] ClassLoader 已更新");
-            JSValue::bool(true).raw()
+            let updated = update_app_classloader(env, cl_ptr);
+            if updated {
+                output_verbose("[java.ready] ClassLoader 已更新");
+            } else {
+                output_verbose("[java.ready] ClassLoader 更新失败");
+            }
+            JSValue::bool(updated).raw()
         }
         Err(_) => {
             output_verbose("[java.ready] 获取 JNIEnv 失败，ClassLoader 更新失败");
@@ -859,14 +895,50 @@ unsafe extern "C" fn js_is_classloader_ready(
     JSValue::bool(is_classloader_ready()).raw()
 }
 
-/// JS CFunction: Java._reprobeClassLoader() — 主动重新探测 ClassLoader
-unsafe extern "C" fn js_reprobe_classloader(
+/// JS CFunction: Java._isRawCloneJsThread() — 当前 JS 是否运行在 raw clone TLS worker。
+unsafe extern "C" fn js_is_raw_clone_js_thread(
     _ctx: *mut ffi::JSContext,
     _this: ffi::JSValue,
     _argc: i32,
     _argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
+    JSValue::bool(crate::is_raw_clone_js_thread()).raw()
+}
+
+/// JS CFunction: Java._cutRawCloneExecutorHook() — pre-resume 失败路径切掉 executor hook。
+unsafe extern "C" fn js_cut_raw_clone_executor_hook(
+    _ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    JSValue::bool(callback::cut_raw_clone_executor_loop_hook()).raw()
+}
+
+/// JS CFunction: Java._reprobeClassLoader() — 主动重新探测 ClassLoader
+unsafe extern "C" fn js_reprobe_classloader(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if crate::is_raw_clone_js_thread() {
+        return callback::reprobe_classloader_via_executor(ctx, false);
+    }
     JSValue::bool(reflect::reprobe_classloader()).raw()
+}
+
+/// JS CFunction: Java._reprobeClassLoaderOnce() — 单次轻量探测 ClassLoader。
+unsafe extern "C" fn js_reprobe_classloader_once(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if crate::is_raw_clone_js_thread() {
+        return callback::reprobe_classloader_via_executor(ctx, true);
+    }
+    JSValue::bool(reflect::reprobe_classloader_once()).raw()
 }
 
 unsafe fn js_loader_arg_to_ptr(ctx: *mut ffi::JSContext, arg: JSValue) -> u64 {
@@ -899,6 +971,9 @@ unsafe extern "C" fn js_java_classloaders(
     _argc: i32,
     _argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
+    if crate::is_raw_clone_js_thread() {
+        return callback::classloaders_via_executor(ctx);
+    }
     let env = match ensure_jni_initialized() {
         Ok(env) => env,
         Err(msg) => return throw_internal_error(ctx, msg),
@@ -924,6 +999,29 @@ unsafe extern "C" fn js_java_find_class_with_loader(
     argc: i32,
     argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
+    if crate::is_raw_clone_js_thread() {
+        if argc < 2 {
+            return throw_type_error(
+                ctx,
+                b"Java._findClassWithLoader() requires 2 arguments: loader, className\0",
+            );
+        }
+
+        let loader_ptr = js_loader_arg_to_ptr(ctx, JSValue(*argv));
+        if loader_ptr == 0 {
+            return throw_type_error(
+                ctx,
+                b"Java._findClassWithLoader() loader must be a loader object or pointer\0",
+            );
+        }
+
+        let class_name = match JSValue(*argv.add(1)).to_string(ctx) {
+            Some(v) => v,
+            None => return throw_type_error(ctx, b"Java._findClassWithLoader() className must be a string\0"),
+        };
+
+        return callback::find_class_with_loader_via_executor(ctx, loader_ptr, class_name);
+    }
     if argc < 2 {
         return throw_type_error(
             ctx,
@@ -976,6 +1074,17 @@ unsafe extern "C" fn js_java_find_class_object(
     argc: i32,
     argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
+    if crate::is_raw_clone_js_thread() {
+        if argc < 1 {
+            return throw_type_error(ctx, b"Java._findClassObject() requires 1 argument: className\0");
+        }
+        let class_name = match JSValue(*argv).to_string(ctx) {
+            Some(v) => v,
+            None => return throw_type_error(ctx, b"Java._findClassObject() className must be a string\0"),
+        };
+
+        return callback::find_class_object_via_executor(ctx, class_name);
+    }
     if argc < 1 {
         return throw_type_error(ctx, b"Java._findClassObject() requires 1 argument: className\0");
     }
@@ -1005,6 +1114,21 @@ unsafe extern "C" fn js_java_set_classloader(
     argc: i32,
     argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
+    if crate::is_raw_clone_js_thread() {
+        if argc < 1 {
+            return throw_type_error(ctx, b"Java._setClassLoader() requires 1 argument: loader\0");
+        }
+
+        let loader_ptr = js_loader_arg_to_ptr(ctx, JSValue(*argv));
+        if loader_ptr == 0 {
+            return throw_type_error(
+                ctx,
+                b"Java._setClassLoader() loader must be a loader object or pointer\0",
+            );
+        }
+
+        return callback::set_classloader_via_executor(ctx, loader_ptr);
+    }
     if argc < 1 {
         return throw_type_error(ctx, b"Java._setClassLoader() requires 1 argument: loader\0");
     }
@@ -1021,6 +1145,9 @@ unsafe extern "C" fn js_java_set_classloader(
         Ok(env) => env,
         Err(msg) => return throw_internal_error(ctx, msg),
     };
+    if env.is_null() {
+        return throw_internal_error(ctx, "JNI env unavailable for Java._setClassLoader");
+    }
 
     JSValue::bool(set_classloader_override(env, loader_ptr as *mut std::ffi::c_void)).raw()
 }
@@ -1096,9 +1223,21 @@ pub fn java_subsystem_active_for_cleanup() -> bool {
     java_cleanup_needed()
 }
 
+pub fn abort_raw_clone_java_executor_for_unload() -> bool {
+    callback::cut_raw_clone_executor_loop_hook()
+}
+
+pub fn raw_clone_java_executor_hook_active() -> bool {
+    callback::raw_clone_executor_hook_active()
+}
+
 /// 延迟初始化 Java reflection 缓存（PID 注入模式下首次调用 Java API 时触发）
 pub(crate) fn lazy_init_reflect_cache() {
     JAVA_SUBSYSTEM_TOUCHED.store(true, Ordering::Release);
+    if crate::is_raw_clone_js_thread() {
+        crate::jsapi::console::output_verbose("[java] lazy_init_reflect_cache: skip on raw clone JS thread");
+        return;
+    }
     if REFLECT_CACHE_INITED.load(Ordering::Acquire) {
         return;
     }
@@ -1294,9 +1433,31 @@ unsafe fn install_java_api(ctx_ptr: *mut ffi::JSContext) -> Result<ffi::JSValue,
         1,
     );
     add_cfunction_to_object(ctx_ptr, java_obj, "_initArtController", js_java_init_art_controller, 0);
+    add_cfunction_to_object(
+        ctx_ptr,
+        java_obj,
+        "_installExecutorHook",
+        callback::js_install_raw_clone_executor_hook,
+        0,
+    );
+    add_cfunction_to_object(
+        ctx_ptr,
+        java_obj,
+        "_cutRawCloneExecutorHook",
+        js_cut_raw_clone_executor_hook,
+        0,
+    );
     add_cfunction_to_object(ctx_ptr, java_obj, "_updateClassLoader", js_update_classloader, 1);
     add_cfunction_to_object(ctx_ptr, java_obj, "_isClassLoaderReady", js_is_classloader_ready, 0);
+    add_cfunction_to_object(ctx_ptr, java_obj, "_isRawCloneJsThread", js_is_raw_clone_js_thread, 0);
     add_cfunction_to_object(ctx_ptr, java_obj, "_reprobeClassLoader", js_reprobe_classloader, 0);
+    add_cfunction_to_object(
+        ctx_ptr,
+        java_obj,
+        "_reprobeClassLoaderOnce",
+        js_reprobe_classloader_once,
+        0,
+    );
     add_cfunction_to_object(ctx_ptr, java_obj, "_classLoaders", js_java_classloaders, 0);
     add_cfunction_to_object(
         ctx_ptr,
@@ -1364,24 +1525,23 @@ pub fn register_java_api(ctx: &JSContext) {
 // Java hook 拆卸原子操作 — 供 js_java_unhook 和 cleanup_java_hooks 复用
 // ============================================================================
 
-/// 恢复 ArtMethod 原始字段 (access_flags, data_, entry_point) + flush icache。
+/// 恢复 ArtMethod 原始 flags。
+///
+/// 目标 app/framework ArtMethod 的 entry_point_/data_ 不写外部地址，也不在
+/// cleanup 时用旧快照覆盖 ART 自己后续做出的更新。路由切断通过 code hook /
+/// ART shared entry hook 完成。
 pub(in crate::jsapi::java) unsafe fn restore_art_method_fields(data: &JavaHookData) {
+    if !data.hook_type.original_flags_mutated() {
+        return;
+    }
     if let Some(spec) = ART_METHOD_SPEC.get() {
         std::ptr::write_volatile(
             (data.art_method as usize + spec.access_flags_offset) as *mut u32,
             data.original_access_flags,
         );
-        std::ptr::write_volatile(
-            (data.art_method as usize + spec.data_offset) as *mut u64,
-            data.original_data,
-        );
-        std::ptr::write_volatile(
-            (data.art_method as usize + spec.entry_point_offset) as *mut u64,
-            data.original_entry_point,
-        );
         hook_ffi::hook_flush_cache(
-            data.art_method as usize as *mut std::ffi::c_void,
-            spec.entry_point_offset + 8,
+            (data.art_method as usize + spec.access_flags_offset) as *mut std::ffi::c_void,
+            4,
         );
     }
 }
@@ -1389,15 +1549,14 @@ pub(in crate::jsapi::java) unsafe fn restore_art_method_fields(data: &JavaHookDa
 /// 移除 Layer 3 per-method inline hook + stealth2 revert_slot_patch。
 pub(in crate::jsapi::java) unsafe fn remove_per_method_hook(data: &JavaHookData) {
     if data.quick_trampoline == 0 {
-        // Standalone shared-stub routers are written directly into ArtMethod.entry_point_.
-        // They are not installed with hook_install_art_router(), so hook_remove(target)
-        // would treat generated pool code as an inline hook site. restore_art_method_fields()
-        // restores entry_point_ to original_entry_point; the generated stub remains owned by
-        // the hook engine pool for the current agent lifetime.
+        // No inline per-method hook was installed. Shared/early-entry methods are
+        // routed through ART trampolines only; restore_art_method_fields() only
+        // restores the access flags.
         return;
     }
 
     match &data.hook_type {
+        callback::HookType::NativeEntry => {}
         callback::HookType::Replaced {
             per_method_hook_target, ..
         }
@@ -1418,18 +1577,23 @@ pub(in crate::jsapi::java) unsafe fn remove_per_method_hook(data: &JavaHookData)
 /// 移除 registered native fnPtr inline hook。
 pub(in crate::jsapi::java) unsafe fn remove_native_entry_hook(data: &JavaHookData) {
     if data.native_entry_hook_target != 0 {
+        crate::recomp::try_revert_slot_patch_by_slot(data.native_entry_hook_target as usize);
         hook_ffi::hook_remove(data.native_entry_hook_target as *mut std::ffi::c_void);
     }
 }
 
 /// 移除 native trampoline (hook_remove_redirect)。
 pub(in crate::jsapi::java) unsafe fn remove_native_trampoline(data: &JavaHookData) {
+    if matches!(data.hook_type, callback::HookType::NativeEntry) {
+        return;
+    }
     hook_ffi::hook_remove_redirect(data.art_method);
 }
 
 /// 释放 replacement/clone ArtMethod 堆内存 + JNI global ref + JS callback。
 pub(in crate::jsapi::java) unsafe fn free_java_hook_resources(data: &JavaHookData, env_opt: Option<JniEnv>) {
     let replacement_addr = match &data.hook_type {
+        callback::HookType::NativeEntry => 0,
         callback::HookType::Replaced { replacement_addr, .. } | callback::HookType::Quick { replacement_addr, .. } => {
             *replacement_addr
         }
@@ -1475,10 +1639,12 @@ pub fn cut_java_hooks() {
         return;
     }
 
-    if let Ok(env) = ensure_jni_initialized() {
-        unsafe {
-            cleanup_enumerated_classloader_refs(env);
-            cleanup_cached_class_refs(env);
+    if !crate::is_raw_clone_js_thread() {
+        if let Ok(env) = ensure_jni_initialized() {
+            unsafe {
+                cleanup_enumerated_classloader_refs(env);
+                cleanup_cached_class_refs(env);
+            }
         }
     }
 
@@ -1490,7 +1656,7 @@ pub fn cut_java_hooks() {
                 remove_per_method_hook(data);
                 // registered native 直接 fnPtr hook 也要先切断，避免新调用进 callback
                 remove_native_entry_hook(data);
-                // 恢复 ArtMethod 字段 (Layer 1/2 路由也切断)
+                // 恢复 ArtMethod flags (Layer 1/2 路由也切断)
                 restore_art_method_fields(data);
                 // router 表条目保留 → OAT bypass 对 in-flight 仍生效
                 // router 表清空放到 free 阶段
@@ -1502,23 +1668,20 @@ pub fn cut_java_hooks() {
 /// Phase 2 - Drain g_thunk_in_flight → 0。返回 true 表示真的归零，false 超时。
 ///
 /// 调用方必须保证所有 hook 入口（Java + native + OAT inline）已在此之前切断，
-/// 否则 counter 可能永不归 0 → 走到 30s 硬上限超时。
+/// 否则 counter 可能永不归 0 → 走到短预算超时。
 ///
 /// **超时处理很重要**：超时意味着有线程阻塞在 callback 深处的 JNI/Java monitor，
 /// 它们未来可能醒来返回 thunk。**false 时调用方必须跳过 free 资源和 munmap**，
 /// 否则线程醒来会访问已释放内存 → 崩溃。安全做法：让资源 leak 到进程退出。
 ///
-/// 循环 500ms 粒度轮询，每 5s 输出诊断，30s 总上限兜底。
+/// 循环 100ms 粒度轮询，2.5s 总上限兜底。
 /// 诊断走 `output_message` 保证始终可见（不依赖 VERBOSE 开关）。
 pub fn drain_thunk_in_flight() -> bool {
     use crate::jsapi::console::output_message;
-    // 无限等待 — callback 归零后可释放 JS 资源；exec 归零后才可 munmap pool/recomp。
+    // callback 归零后可释放 JS 资源；exec 归零后才可 munmap pool/recomp。
     // Phase 1 已 cut 全部 routing 入口，counter 只减不增。若线程 parked 在 hooked 深处
-    // (Looper.pollOnce / JNI monitor 等)，等它醒。用户侧 Ctrl-C 可强制中断 rustfrida CLI,
-    // 但 agent 仍应尝试真正归零; 这是 "完整卸载不 leak" 的前提。
-    //
-    // 每 5s 打印一次 counter 值诊断卡在哪。返回值始终 true — 调用方 unconditional
-    // 走 Phase 3/4.
+    // (Looper.pollOnce / JNI monitor 等)，短等后放弃 free，让资源 leak 到进程退出。
+    const DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(2500);
     let start = std::time::Instant::now();
     let initial_callback = in_flight_java_hook_callbacks();
     let initial_exec = unsafe { hook_ffi::hook_thunk_in_flight_count() };
@@ -1528,7 +1691,7 @@ pub fn drain_thunk_in_flight() -> bool {
     ));
     let mut rounds = 0u32;
     loop {
-        let callbacks_done = wait_for_in_flight_java_hook_callbacks(std::time::Duration::from_millis(500));
+        let callbacks_done = wait_for_in_flight_java_hook_callbacks(std::time::Duration::from_millis(100));
         let exec_remaining = unsafe { hook_ffi::hook_thunk_in_flight_count() };
         if callbacks_done && exec_remaining == 0 {
             output_message(&format!(
@@ -1539,14 +1702,25 @@ pub fn drain_thunk_in_flight() -> bool {
             return true;
         }
         if callbacks_done {
-            crate::raw_thread::sleep_ms(500);
+            crate::raw_thread::sleep_ms(100);
         }
         rounds += 1;
+        if start.elapsed() >= DRAIN_BUDGET {
+            let callback_remaining = in_flight_java_hook_callbacks();
+            let exec_remaining = unsafe { hook_ffi::hook_thunk_in_flight_count() };
+            output_message(&format!(
+                "[drain] timeout after {}ms, callback_in_flight={}, exec_in_flight={} (skip free, keep resources)",
+                DRAIN_BUDGET.as_millis(),
+                callback_remaining,
+                exec_remaining
+            ));
+            return false;
+        }
         if rounds % 10 == 0 {
             let callback_remaining = in_flight_java_hook_callbacks();
             let exec_remaining = unsafe { hook_ffi::hook_thunk_in_flight_count() };
             output_message(&format!(
-                "[drain] round {}, {}ms, callback_in_flight={}, exec_in_flight={} (无限等待归零)",
+                "[drain] round {}, {}ms, callback_in_flight={}, exec_in_flight={}",
                 rounds,
                 start.elapsed().as_millis(),
                 callback_remaining,
@@ -1580,7 +1754,11 @@ pub fn free_java_hooks() {
         }
     }
 
-    let env_opt = unsafe { get_thread_env().ok() };
+    let env_opt = if crate::is_raw_clone_js_thread() {
+        None
+    } else {
+        unsafe { get_thread_env().ok() }
+    };
     let _js_guard = crate::JS_ENGINE.try_lock();
 
     let mut guard = JAVA_HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());

@@ -12,8 +12,11 @@ use nix::unistd::Pid;
 #[cfg(not(feature = "noptrace"))]
 use std::mem::size_of;
 use std::os::unix::io::RawFd;
-#[cfg(not(feature = "noptrace"))]
-use std::time::Duration;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::time::{Duration, Instant};
 
 #[cfg(not(feature = "noptrace"))]
 use crate::proc_mem::ProcMem;
@@ -45,6 +48,8 @@ const SYS_PIDFD_OPEN: i64 = 434;
 const SYS_PIDFD_GETFD: i64 = 438;
 #[cfg(not(feature = "noptrace"))]
 const PAGE_SIZE: u64 = 4096;
+const LOADER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+const LOADER_IO_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 #[cfg(not(feature = "noptrace"))]
 fn align_down(value: u64, alignment: u64) -> u64 {
@@ -145,6 +150,11 @@ pub(crate) struct InjectionResult {
     pub(crate) target_pid: i32,
     pub(crate) loader_ctx_addr: u64,
     pub(crate) agent_current_thread_eval_impl: u64,
+    pub(crate) loader_alloc_base: u64,
+    pub(crate) loader_alloc_size: u64,
+    pub(crate) loader_stack: u64,
+    pub(crate) loader_stack_size: u64,
+    pub(crate) libc_munmap: u64,
 }
 
 /// 通过 pidfd_getfd 从目标进程提取文件描述符到 host
@@ -290,12 +300,8 @@ fn use_stream_agent_transfer() -> bool {
 }
 
 #[cfg(not(feature = "noptrace"))]
-fn build_loader_agent_data(use_pthread_loader: bool) -> Result<Vec<u8>, String> {
+fn build_loader_agent_data() -> Result<Vec<u8>, String> {
     let mut tokens = Vec::new();
-
-    if use_pthread_loader {
-        tokens.push("pthread".to_string());
-    }
 
     let close_loader_ctrl = match std::env::var("RF_CLOSE_LOADER_CTRL") {
         Ok(value) => env_value_enabled(&value),
@@ -796,7 +802,9 @@ fn choose_probe_injection_thread(pid: i32) -> Option<i32> {
 }
 
 #[cfg(not(feature = "noptrace"))]
-fn choose_injection_thread(pid: i32) -> Result<i32, String> {
+pub(crate) fn choose_injection_thread(pid: i32) -> Result<i32, String> {
+    crate::process::thaw_cgroup_freezer(pid);
+
     if let Ok(value) = std::env::var("RF_INJECT_THREAD") {
         let value = value.trim();
         if value.eq_ignore_ascii_case("main") || value.eq_ignore_ascii_case("pid") {
@@ -821,13 +829,19 @@ fn choose_injection_thread(pid: i32) -> Result<i32, String> {
         }
     }
 
+    let (tid, _score) = choose_injection_thread_once(pid);
+    log_injection_thread_candidate(pid, tid);
+    Ok(tid)
+}
+
+fn choose_injection_thread_once(pid: i32) -> (i32, i32) {
     let task_dir = format!("/proc/{}/task", pid);
     let mut best_tid = pid;
     let mut best_score = i32::MIN;
 
     let entries = match std::fs::read_dir(task_dir) {
         Ok(entries) => entries,
-        Err(_) => return Ok(pid),
+        Err(_) => return (pid, i32::MIN),
     };
 
     for entry in entries.flatten() {
@@ -847,17 +861,24 @@ fn choose_injection_thread(pid: i32) -> Result<i32, String> {
         }
         if status.contains("State:\tS") {
             score += 100;
+        } else if status.contains("State:\tR") {
+            score -= 400;
         }
-        if wchan.contains("epoll") {
+        if wchan.contains("freezer") {
+            score -= 1200;
+        } else if wchan.trim() == "0" {
+            score -= 600;
+        } else if wchan.contains("epoll") {
             score += 80;
         } else if wchan.contains("futex") || wchan.contains("poll") {
-            score += 50;
+            score += 80;
         }
         if comm.contains("LigIO")
             || comm.contains("LightHTing")
             || comm.contains("AsyncHTing")
             || comm.contains("soul_im")
             || comm.contains("RxCached")
+            || comm.contains("FinalizerWatchd")
         {
             score += 120;
         }
@@ -871,22 +892,118 @@ fn choose_injection_thread(pid: i32) -> Result<i32, String> {
         }
     }
 
-    if best_tid != pid {
-        let comm = std::fs::read_to_string(format!("/proc/{}/task/{}/comm", pid, best_tid))
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        let wchan = std::fs::read_to_string(format!("/proc/{}/task/{}/wchan", pid, best_tid))
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        log_verbose!("注入线程候选: tid={} comm={} wchan={}", best_tid, comm, wchan);
-    }
-
-    Ok(best_tid)
+    (best_tid, best_score)
 }
 
-#[cfg(not(feature = "noptrace"))]
+fn log_injection_thread_candidate(pid: i32, tid: i32) {
+    let comm = std::fs::read_to_string(format!("/proc/{}/task/{}/comm", pid, tid))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let wchan = std::fs::read_to_string(format!("/proc/{}/task/{}/wchan", pid, tid))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    log_verbose!("注入线程候选: tid={} comm={} wchan={}", tid, comm, wchan);
+}
+
+pub(crate) fn choose_java_eval_thread(pid: i32) -> i32 {
+    let task_dir = format!("/proc/{}/task", pid);
+    let mut best_tid = pid;
+    let mut best_score = i32::MIN;
+
+    let entries = match std::fs::read_dir(task_dir) {
+        Ok(entries) => entries,
+        Err(_) => return pid,
+    };
+
+    for entry in entries.flatten() {
+        let tid = match entry.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) {
+            Some(tid) => tid,
+            None => continue,
+        };
+
+        let status = std::fs::read_to_string(format!("/proc/{}/task/{}/status", pid, tid)).unwrap_or_default();
+        let comm = std::fs::read_to_string(format!("/proc/{}/task/{}/comm", pid, tid)).unwrap_or_default();
+        let wchan = std::fs::read_to_string(format!("/proc/{}/task/{}/wchan", pid, tid)).unwrap_or_default();
+        let comm_trimmed = comm.trim();
+        let comm_lower = comm_trimmed.to_ascii_lowercase();
+        let wchan_lower = wchan.to_ascii_lowercase();
+
+        let mut score = 0;
+
+        if tid == pid {
+            score += 2000;
+        }
+        if status.contains("State:\tS") {
+            score += 120;
+        } else if status.contains("State:\tR") {
+            score += 40;
+        }
+        if wchan_lower.contains("epoll") || wchan_lower.contains("poll") {
+            score += 80;
+        } else if wchan_lower.contains("futex") {
+            score += 30;
+        }
+        if comm_lower.contains("main") || comm_lower.contains("ui") {
+            score += 100;
+        }
+
+        let bad_java_eval_thread = comm_lower.contains("signal catcher")
+            || comm_lower.contains("adb-jdwp")
+            || comm_lower.contains("perfetto")
+            || comm_lower.contains("binder:")
+            || comm_lower.contains("crash")
+            || comm_lower.contains("sentry")
+            || comm_lower.contains("npth")
+            || comm_lower.contains("process reaper")
+            || comm_lower.contains("jit thread")
+            || comm_lower.contains("renderthread")
+            || comm_lower.contains("heaptaskdaemon")
+            || comm_lower.contains("finalizer")
+            || comm_lower.contains("referencequeue")
+            || comm_lower.contains("rxcached")
+            || comm_lower.contains("rxcomputation")
+            || comm_lower.contains("rxscheduler")
+            || comm_lower.contains("okhttp")
+            || comm_lower.contains("okio")
+            || comm_lower.contains("pool-")
+            || comm_lower.contains("threadpool")
+            || comm_lower.starts_with("thread-")
+            || comm_lower.contains("chromium")
+            || comm_lower.contains("cronet")
+            || comm_lower.contains("mali-")
+            || comm_lower.contains("hwuitask")
+            || comm_lower.contains("audio")
+            || comm_lower.contains("profile saver");
+        if bad_java_eval_thread {
+            score -= 600;
+        }
+
+        if score > best_score {
+            best_score = score;
+            best_tid = tid;
+        }
+    }
+
+    let comm = std::fs::read_to_string(format!("/proc/{}/task/{}/comm", pid, best_tid))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let wchan = std::fs::read_to_string(format!("/proc/{}/task/{}/wchan", pid, best_tid))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    log_verbose!(
+        "Java remote eval 线程候选: tid={} comm={} wchan={}",
+        best_tid,
+        comm,
+        wchan
+    );
+
+    best_tid
+}
+
 fn is_risky_injection_thread(comm: &str) -> bool {
     const RISKY_NAMES: &[&str] = &[
         "Runtime worker",
@@ -961,6 +1078,12 @@ impl StopWorldSession {
                         attached_count += 1;
                         changed = true;
                     }
+                    Ok(WaitStatus::Exited(_, code)) => {
+                        log_verbose!("stop-the-world: 线程 {} attach 期间已退出(code={})，跳过", tid, code);
+                    }
+                    Ok(WaitStatus::Signaled(_, signal, _)) => {
+                        log_verbose!("stop-the-world: 线程 {} attach 期间被信号 {:?} 结束，跳过", tid, signal);
+                    }
                     Ok(status) => {
                         let _ = ptrace::detach(target, Some(nix::sys::signal::Signal::SIGCONT));
                         return Err(format!("暂停线程 {} 状态异常: {:?}", tid, status));
@@ -1017,13 +1140,6 @@ fn write_string_table_at(
                 .get("sym_name")
                 .map(|s| s.as_bytes().to_vec())
                 .unwrap_or_else(|| b"hello_entry".to_vec()),
-        ),
-        (
-            "pthread_err",
-            overrides
-                .get("pthread_err")
-                .map(|s| s.as_bytes().to_vec())
-                .unwrap_or_else(|| b"pthreadded".to_vec()),
         ),
         (
             "dlsym_err",
@@ -1124,9 +1240,160 @@ fn is_system_resolver_module(path: &str) -> bool {
         || path.starts_with("/vendor/")
 }
 
+struct OwnedFd {
+    fd: RawFd,
+}
+
+impl OwnedFd {
+    fn new(fd: RawFd) -> Self {
+        Self { fd }
+    }
+
+    fn raw(&self) -> RawFd {
+        self.fd
+    }
+
+    fn into_raw(mut self) -> RawFd {
+        let fd = self.fd;
+        self.fd = -1;
+        fd
+    }
+}
+
+impl Drop for OwnedFd {
+    fn drop(&mut self) {
+        if self.fd >= 0 {
+            unsafe { close(self.fd) };
+            self.fd = -1;
+        }
+    }
+}
+
+struct CgroupThawGuard {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CgroupThawGuard {
+    fn start(pid: i32) -> Self {
+        crate::process::thaw_cgroup_freezer(pid);
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            while !worker_stop.load(Ordering::Acquire) {
+                crate::process::thaw_cgroup_freezer(pid);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for CgroupThawGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn read_trimmed(path: String) -> String {
+    std::fs::read_to_string(path).unwrap_or_default().trim().to_string()
+}
+
+fn cgroup_freezer_state(pid: i32) -> String {
+    let cgroup_path = format!("/proc/{}/cgroup", pid);
+    let content = match std::fs::read_to_string(&cgroup_path) {
+        Ok(content) => content,
+        Err(e) => return format!("unavailable({})", e),
+    };
+
+    for line in content.lines() {
+        let parts: Vec<&str> = line.splitn(3, ':').collect();
+        if parts.len() != 3 {
+            continue;
+        }
+        let cgroup_rel = parts[2].trim_start_matches('/');
+        let freeze_path = format!("/sys/fs/cgroup/{}/cgroup.freeze", cgroup_rel);
+        if let Ok(value) = std::fs::read_to_string(&freeze_path) {
+            return format!("{}={}", freeze_path, value.trim());
+        }
+    }
+
+    "none".to_string()
+}
+
+fn loader_thread_diagnostics(pid: i32, tid: i32) -> String {
+    let status = std::fs::read_to_string(format!("/proc/{}/task/{}/status", pid, tid)).unwrap_or_default();
+    let state = status
+        .lines()
+        .find_map(|line| line.strip_prefix("State:"))
+        .map(|line| line.trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let tracer = status
+        .lines()
+        .find_map(|line| line.strip_prefix("TracerPid:"))
+        .map(|line| line.trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let comm = read_trimmed(format!("/proc/{}/task/{}/comm", pid, tid));
+    let wchan = read_trimmed(format!("/proc/{}/task/{}/wchan", pid, tid));
+
+    format!(
+        "loader_diag: tid={} comm={} state={} wchan={} tracer={} freezer={}",
+        tid,
+        if comm.is_empty() { "unknown" } else { &comm },
+        state,
+        if wchan.is_empty() { "unknown" } else { &wchan },
+        tracer,
+        cgroup_freezer_state(pid)
+    )
+}
+
+fn loader_timeout_left(deadline: Instant, context: &str) -> Result<Duration, String> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| format!("{} 超时({}ms)", context, LOADER_HANDSHAKE_TIMEOUT.as_millis()))
+}
+
+fn poll_loader_fd(sockfd: RawFd, events: libc::c_short, deadline: Instant, context: &str) -> Result<(), String> {
+    loop {
+        let left = loader_timeout_left(deadline, context)?;
+        let wait = left.min(LOADER_IO_POLL_INTERVAL);
+        let timeout_ms = wait.as_millis().clamp(1, i32::MAX as u128) as i32;
+        let mut pfd = libc::pollfd {
+            fd: sockfd,
+            events,
+            revents: 0,
+        };
+        let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if ret > 0 {
+            let revents = pfd.revents;
+            if (revents & events) != 0 {
+                return Ok(());
+            }
+            if (revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0 {
+                return Err(format!("{}: ctrl socket 关闭/异常 revents=0x{:x}", context, revents));
+            }
+            continue;
+        }
+        if ret == 0 {
+            continue;
+        }
+
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        return Err(format!("{} poll 失败: {}", context, err));
+    }
+}
+
 /// Unix socket fd-passing: 通过 SCM_RIGHTS 发送 fd
-#[cfg(not(feature = "noptrace"))]
-fn send_fd(sockfd: RawFd, fd_to_send: RawFd) -> Result<(), String> {
+fn send_fd_timeout(sockfd: RawFd, fd_to_send: RawFd, deadline: Instant, context: &str) -> Result<(), String> {
     use std::io::IoSlice;
 
     let dummy = [0u8; 1];
@@ -1149,139 +1416,99 @@ fn send_fd(sockfd: RawFd, fd_to_send: RawFd) -> Result<(), String> {
     }
 
     loop {
-        let ret = unsafe { libc::sendmsg(sockfd, &msg, libc::MSG_NOSIGNAL) };
+        poll_loader_fd(sockfd, libc::POLLOUT, deadline, context)?;
+        let ret = unsafe { libc::sendmsg(sockfd, &msg, libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT) };
         if ret > 0 {
             return Ok(());
         }
         if ret == 0 {
-            return Err("sendmsg(SCM_RIGHTS) 返回 0，fd 未发送".to_string());
+            return Err(format!("{}: sendmsg(SCM_RIGHTS) 写入 0 字节", context));
         }
 
         let err = std::io::Error::last_os_error();
         match err.raw_os_error() {
-            Some(libc::EINTR) => continue,
-            errno if is_would_block(errno) => {
-                wait_fd(sockfd, libc::POLLOUT, "send_fd")?;
-                continue;
-            }
-            _ => {
-                return Err(format!(
-                    "sendmsg(SCM_RIGHTS) 失败: {} errno={:?}",
-                    err,
-                    err.raw_os_error()
-                ));
-            }
+            Some(libc::EINTR) | Some(libc::EAGAIN) => continue,
+            _ => return Err(format!("{}: sendmsg(SCM_RIGHTS) 失败: {}", context, err)),
         }
     }
 }
 
 /// 从 ctrl socket 读取指定字节数
-fn recv_exact(sockfd: RawFd, buf: &mut [u8]) -> Result<(), String> {
+fn recv_exact_timeout(sockfd: RawFd, buf: &mut [u8], deadline: Instant, context: &str) -> Result<(), String> {
     let mut done = 0;
     while done < buf.len() {
-        let n = unsafe { libc::read(sockfd, buf[done..].as_mut_ptr() as *mut c_void, buf.len() - done) };
-        if n < 0 {
-            let err = std::io::Error::last_os_error();
-            match err.raw_os_error() {
-                Some(libc::EINTR) => continue,
-                errno if is_would_block(errno) => {
-                    wait_fd(sockfd, libc::POLLIN, "recv_exact")?;
-                    continue;
-                }
-                _ => {
-                    return Err(format!(
-                        "recv_exact: read 失败: {} errno={:?}, done={}/{}",
-                        err,
-                        err.raw_os_error(),
-                        done,
-                        buf.len()
-                    ));
-                }
-            }
+        poll_loader_fd(sockfd, libc::POLLIN, deadline, context)?;
+        let n = unsafe {
+            libc::recv(
+                sockfd,
+                buf[done..].as_mut_ptr() as *mut c_void,
+                buf.len() - done,
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if n > 0 {
+            done += n as usize;
+            continue;
         }
         if n == 0 {
-            return Err(format!("recv_exact: EOF, done={}/{}", done, buf.len()));
+            return Err(format!("{}: ctrl socket EOF (done={}/{})", context, done, buf.len()));
         }
-        done += n as usize;
+
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR) | Some(libc::EAGAIN) => continue,
+            _ => return Err(format!("{}: recv 失败: {} (done={}/{})", context, err, done, buf.len())),
+        }
     }
     Ok(())
 }
 
 /// 向 ctrl socket 写入数据
-fn send_exact(sockfd: RawFd, buf: &[u8]) -> Result<(), String> {
+fn send_exact_timeout(sockfd: RawFd, buf: &[u8], deadline: Instant, context: &str) -> Result<(), String> {
     let mut done = 0;
     while done < buf.len() {
+        poll_loader_fd(sockfd, libc::POLLOUT, deadline, context)?;
         let n = unsafe {
             libc::send(
                 sockfd,
                 buf[done..].as_ptr() as *const c_void,
                 buf.len() - done,
-                libc::MSG_NOSIGNAL,
+                libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
             )
         };
-        if n < 0 {
-            let err = std::io::Error::last_os_error();
-            match err.raw_os_error() {
-                Some(libc::EINTR) => continue,
-                errno if is_would_block(errno) => {
-                    wait_fd(sockfd, libc::POLLOUT, "send_exact")?;
-                    continue;
-                }
-                _ => {
-                    return Err(format!(
-                        "send_exact: send 失败: {} errno={:?}, done={}/{}",
-                        err,
-                        err.raw_os_error(),
-                        done,
-                        buf.len()
-                    ));
-                }
-            }
+        if n > 0 {
+            done += n as usize;
+            continue;
         }
         if n == 0 {
-            return Err(format!("send_exact: send 返回 0, done={}/{}", done, buf.len()));
+            return Err(format!("{}: send 写入 0 字节", context));
         }
-        done += n as usize;
+
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR) | Some(libc::EAGAIN) => continue,
+            _ => return Err(format!("{}: send 失败: {}", context, err)),
+        }
     }
     Ok(())
 }
 
-fn is_would_block(errno: Option<i32>) -> bool {
-    errno == Some(libc::EAGAIN) || errno == Some(libc::EWOULDBLOCK)
+fn recv_exact(sockfd: RawFd, buf: &mut [u8]) -> Result<(), String> {
+    recv_exact_timeout(
+        sockfd,
+        buf,
+        Instant::now() + LOADER_HANDSHAKE_TIMEOUT,
+        "读取 loader 消息",
+    )
 }
 
-fn wait_fd(sockfd: RawFd, events: i16, op: &str) -> Result<(), String> {
-    let mut pfd = libc::pollfd {
-        fd: sockfd,
-        events,
-        revents: 0,
-    };
-
-    loop {
-        let n = unsafe { libc::poll(&mut pfd, 1, 30_000) };
-        if n > 0 {
-            let fatal = pfd.revents & (libc::POLLERR | libc::POLLNVAL);
-            if fatal != 0 {
-                return Err(format!("{}: poll 失败 revents=0x{:x} fd={}", op, pfd.revents, sockfd));
-            }
-            if pfd.revents & events != 0 {
-                return Ok(());
-            }
-            if pfd.revents & libc::POLLHUP != 0 {
-                return Err(format!("{}: poll hangup fd={}", op, sockfd));
-            }
-            continue;
-        }
-        if n == 0 {
-            return Err(format!("{}: poll 超时 fd={} events=0x{:x}", op, sockfd, events));
-        }
-
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EINTR) {
-            continue;
-        }
-        return Err(format!("{}: poll 失败: {} errno={:?}", op, err, err.raw_os_error()));
-    }
+fn send_exact(sockfd: RawFd, buf: &[u8]) -> Result<(), String> {
+    send_exact_timeout(
+        sockfd,
+        buf,
+        Instant::now() + LOADER_HANDSHAKE_TIMEOUT,
+        "发送 loader 消息",
+    )
 }
 
 fn recv_loader_string(ctrl_fd: RawFd) -> Result<String, String> {
@@ -1370,15 +1597,25 @@ fn drain_loader_messages_for(ctrl_fd: RawFd, duration: std::time::Duration) {
 /// Host 端执行 loader IPC 握手协议
 /// 返回 REPL 用的 host_fd
 #[cfg(not(feature = "noptrace"))]
-fn run_loader_handshake(ctrl_fd: RawFd, target_pid: i32, loader_ctx_addr: usize) -> Result<InjectionResult, String> {
+fn run_loader_handshake(
+    ctrl_fd: RawFd,
+    target_pid: i32,
+    loader_ctx_addr: usize,
+    loader_alloc_base: usize,
+    loader_alloc_size: usize,
+    libc_munmap: u64,
+) -> Result<InjectionResult, String> {
+    let deadline = Instant::now() + LOADER_HANDSHAKE_TIMEOUT;
+    let _thaw_guard = CgroupThawGuard::start(target_pid);
+
     // 1. 接收 HELLO 消息: [type:u8][thread_id:i32]
     let mut msg_type = [0u8; 1];
-    recv_exact(ctrl_fd, &mut msg_type)?;
+    recv_exact_timeout(ctrl_fd, &mut msg_type, deadline, "等待 loader HELLO")?;
     if msg_type[0] != message_type::HELLO {
         return Err(format!("期望 HELLO({}), 收到 {}", message_type::HELLO, msg_type[0]));
     }
     let mut tid_buf = [0u8; 4];
-    recv_exact(ctrl_fd, &mut tid_buf)?;
+    recv_exact_timeout(ctrl_fd, &mut tid_buf, deadline, "读取 loader tid")?;
     let thread_id = i32::from_le_bytes(tid_buf);
     log_verbose!("Loader worker tid: {}", thread_id);
 
@@ -1386,12 +1623,12 @@ fn run_loader_handshake(ctrl_fd: RawFd, target_pid: i32, loader_ctx_addr: usize)
     //    agent memfd fd；仅显式诊断/兼容开关才回退 SCM_RIGHTS memfd。
     if use_stream_agent_transfer() {
         let size = (AGENT_SO.len() as u64).to_le_bytes();
-        if let Err(e) = send_exact(ctrl_fd, &size) {
+        if let Err(e) = send_exact_timeout(ctrl_fd, &size, deadline, "发送 agent stream size") {
             log_warn!("agent stream size 发送失败，读取 loader 诊断: {}", e);
             drain_loader_messages_for(ctrl_fd, std::time::Duration::from_millis(750));
             return Err(e);
         }
-        if let Err(e) = send_exact(ctrl_fd, AGENT_SO) {
+        if let Err(e) = send_exact_timeout(ctrl_fd, AGENT_SO, deadline, "发送 agent stream") {
             log_warn!("agent stream 发送失败，读取 loader 诊断: {}", e);
             drain_loader_messages_for(ctrl_fd, std::time::Duration::from_millis(750));
             return Err(e);
@@ -1404,39 +1641,29 @@ fn run_loader_handshake(ctrl_fd: RawFd, target_pid: i32, loader_ctx_addr: usize)
         if agent_memfd < 0 {
             return Err(format!("memfd_create 失败: {}", std::io::Error::last_os_error()));
         }
+        let agent_memfd = OwnedFd::new(agent_memfd);
         // relabel memfd：匹配目标进程的 MLS categories，绕过 MLS/MCS 检查
-        relabel_fd_for_injection(agent_memfd, target_pid);
+        relabel_fd_for_injection(agent_memfd.raw(), target_pid);
         let mut written = 0usize;
         while written < AGENT_SO.len() {
             let n = unsafe {
                 libc::write(
-                    agent_memfd,
+                    agent_memfd.raw(),
                     AGENT_SO[written..].as_ptr() as *const c_void,
                     AGENT_SO.len() - written,
                 )
             };
             if n <= 0 {
-                unsafe { close(agent_memfd) };
                 return Err("写入 agent SO 到 memfd 失败".to_string());
             }
             written += n as usize;
         }
-        let padded_len = match padded_agent_memfd_len() {
-            Ok(len) => len,
-            Err(e) => {
-                unsafe { close(agent_memfd) };
-                return Err(e);
-            }
-        };
-        if padded_len > AGENT_SO.len() && unsafe { libc::ftruncate(agent_memfd, padded_len as libc::off_t) } != 0 {
-            unsafe { close(agent_memfd) };
+        let padded_len = padded_agent_memfd_len()?;
+        if padded_len > AGENT_SO.len() && unsafe { libc::ftruncate(agent_memfd.raw(), padded_len as libc::off_t) } != 0
+        {
             return Err(format!("扩展 agent SO memfd 失败: {}", std::io::Error::last_os_error()));
         }
-        if let Err(e) = send_fd(ctrl_fd, agent_memfd) {
-            unsafe { close(agent_memfd) };
-            return Err(e);
-        }
-        unsafe { close(agent_memfd) };
+        send_fd_timeout(ctrl_fd, agent_memfd.raw(), deadline, "发送 agent SO fd")?;
         log_verbose!("agent SO fd 已发送 ({} bytes, padded {})", AGENT_SO.len(), padded_len);
     }
 
@@ -1446,69 +1673,74 @@ fn run_loader_handshake(ctrl_fd: RawFd, target_pid: i32, loader_ctx_addr: usize)
     if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) } != 0 {
         return Err(format!("host socketpair 失败: {}", std::io::Error::last_os_error()));
     }
-    let host_repl_fd = sv[0];
-    let agent_repl_fd = sv[1];
+    let host_repl_fd = OwnedFd::new(sv[0]);
+    let agent_repl_fd = OwnedFd::new(sv[1]);
     // 注意：socketpair 在 sockfs 上，不支持 fsetxattr relabel（associate 被拒），
     // 但 Unix socket fd 的 SCM_RIGHTS 传递不受 MLS file 检查约束，无需 relabel
-    if let Err(e) = send_fd(ctrl_fd, agent_repl_fd) {
-        unsafe {
-            close(agent_repl_fd);
-            close(host_repl_fd);
-        }
-        return Err(e);
-    }
-    unsafe { close(agent_repl_fd) };
+    send_fd_timeout(ctrl_fd, agent_repl_fd.raw(), deadline, "发送 REPL socket fd")?;
+    drop(agent_repl_fd);
     log_verbose!("REPL socketpair fd 已发送");
 
     // 4. 等待 READY（或错误）— DEBUG/LOG 消息用于定位 READY 前断开的阶段
     loop {
-        recv_exact(ctrl_fd, &mut msg_type)?;
+        match recv_exact_timeout(ctrl_fd, &mut msg_type, deadline, "等待 loader READY") {
+            Ok(()) => {}
+            Err(e) => {
+                return Err(format!("{}; {}", e, loader_thread_diagnostics(target_pid, thread_id)));
+            }
+        }
         match msg_type[0] {
             t if t == message_type::READY => {
                 log_success!("Loader: agent 加载成功");
                 break;
             }
-            t if t == message_type::DEBUG || t == message_type::LOG => {
-                let msg = recv_loader_string(ctrl_fd)?;
-                log_verbose!("Loader debug: {}", msg);
-            }
-            t if t == message_type::ERROR_DLOPEN || t == message_type::ERROR_DLSYM => {
-                let msg = recv_loader_string(ctrl_fd)?;
+            t if t == message_type::ERROR_DLOPEN || t == message_type::ERROR_DLSYM || t == message_type::LOG => {
+                let mut len_buf = [0u8; 2];
+                recv_exact_timeout(ctrl_fd, &mut len_buf, deadline, "读取 loader 消息长度")?;
+                let msg_len = u16::from_le_bytes(len_buf) as usize;
+                let mut msg_buf = vec![0u8; msg_len];
+                recv_exact_timeout(ctrl_fd, &mut msg_buf, deadline, "读取 loader 消息")?;
+                if t == message_type::LOG {
+                    log_verbose!("Loader: {}", String::from_utf8_lossy(&msg_buf));
+                    continue;
+                }
                 let kind = if t == message_type::ERROR_DLOPEN {
                     "link"
                 } else {
                     "entrypoint"
                 };
-                unsafe { close(host_repl_fd) };
+                let msg = String::from_utf8_lossy(&msg_buf);
                 return Err(format!("Loader {} 失败: {}", kind, msg));
             }
             t if t == message_type::BYE => {
-                unsafe { close(host_repl_fd) };
                 return Err("Loader 在 READY 前退出 (BYE)，请查看 loader/agent 崩溃日志".to_string());
             }
             t => {
-                unsafe { close(host_repl_fd) };
-                return Err(format!("Loader 协议错误: 期望 READY/DEBUG/ERROR, 收到 {}", t));
+                return Err(format!("Loader 协议错误: 期望 READY/ERROR, 收到 {}", t));
             }
         }
     }
 
     let loader_ctx = read_loader_runtime_context(target_pid, loader_ctx_addr)?;
     if loader_ctx.agent_current_thread_eval_impl == 0 {
-        unsafe { close(host_repl_fd) };
         return Err("Loader 未解析 rustfrida_loadjs_current_thread".to_string());
     }
 
     // 5. 发送 ACK
-    send_exact(ctrl_fd, &[message_type::ACK])?;
+    send_exact_timeout(ctrl_fd, &[message_type::ACK], deadline, "发送 loader ACK")?;
 
     // ctrl_fd 保持打开用于生命周期管理（BYE 消息）
     // 但对于 rustFrida，REPL 通信走 host_repl_fd
     Ok(InjectionResult {
-        host_fd: host_repl_fd,
+        host_fd: host_repl_fd.into_raw(),
         target_pid,
         loader_ctx_addr: loader_ctx_addr as u64,
         agent_current_thread_eval_impl: loader_ctx.agent_current_thread_eval_impl,
+        loader_alloc_base: loader_alloc_base as u64,
+        loader_alloc_size: loader_alloc_size as u64,
+        loader_stack: loader_ctx.loader_stack,
+        loader_stack_size: loader_ctx.loader_stack_size,
+        libc_munmap,
     })
 }
 
@@ -1587,6 +1819,11 @@ pub(crate) fn run_loader_handshake_pure(ctrl_fd: RawFd, target_pid: i32) -> Resu
         target_pid,
         loader_ctx_addr: 0,
         agent_current_thread_eval_impl: 0,
+        loader_alloc_base: 0,
+        loader_alloc_size: 0,
+        loader_stack: 0,
+        loader_stack_size: 0,
+        libc_munmap: 0,
     })
 }
 
@@ -1671,7 +1908,6 @@ fn inject_via_bootstrapper_once(
     let code_pages = code_size.div_ceil(page_size) * page_size;
     let data_size = 4 * page_size;
     let total_alloc = code_pages + data_size;
-
     // === Code-swap: 临时覆盖目标进程可执行区域运行 bootstrapper ===
     // 1. 找到目标进程的一个 r-xp 区域（linker64 最安全，所有进程都有）
     let code_swap_size = BOOTSTRAPPER.len() + BRK_RETURN_TRAP.len();
@@ -1778,16 +2014,14 @@ fn inject_via_bootstrapper_once(
     let libc_api: FridaLibcApi = mem_read_value(&mem, libc_api_addr)?;
 
     log_verbose!("rtld_flavor: {}", bootstrap_ctx.rtld_flavor);
+    log_verbose!(
+        "platform bases: libc=0x{:x}, linker=0x{:x}",
+        bootstrap_ctx.fallback_libc,
+        bootstrap_ctx.rtld_base
+    );
     log_verbose!("ctrlfds: [{}, {}]", bootstrap_ctx.ctrlfds[0], bootstrap_ctx.ctrlfds[1]);
     log_verbose!("agent linker: 自解析 ELF/重定位/外部符号，不调用 dlopen/dlsym");
-    let use_pthread_loader = std::env::var("RF_LOADER_THREAD")
-        .map(|value| value.eq_ignore_ascii_case("pthread"))
-        .unwrap_or(false);
-    if use_pthread_loader {
-        log_verbose!("loader thread: 请求 pthread_create 模式");
-    } else {
-        log_verbose!("loader thread: raw clone，不调用 pthread_create");
-    }
+    log_verbose!("loader thread: raw clone，不调用 libc pthread");
 
     // 提取 ctrlfds[0] 到 host
     let host_ctrl_fd = extract_fd_from_target(pid, bootstrap_ctx.ctrlfds[0])?;
@@ -1835,7 +2069,7 @@ fn inject_via_bootstrapper_once(
     let str_base = loader_libc_addr + size_of::<FridaLibcApi>();
     let entrypoint_str = build_agent_entrypoint()?;
     let current_thread_eval_str = b"rustfrida_loadjs_current_thread\0";
-    let data_str = build_loader_agent_data(use_pthread_loader)?;
+    let data_str = build_loader_agent_data()?;
     let fallback_str = format!("\x00rustfrida-{}\0", pid); // abstract socket: \0 prefix
     mem.pwrite_all(&entrypoint_str, str_base as u64)?;
     let current_thread_eval_str_addr = str_base + entrypoint_str.len();
@@ -1854,6 +2088,8 @@ fn inject_via_bootstrapper_once(
         libc: loader_libc_addr as u64,
         string_table_addr: string_table_addr as u64,
         agent_current_thread_eval: current_thread_eval_str_addr as u64,
+        libc_base: bootstrap_ctx.fallback_libc,
+        linker_base: bootstrap_ctx.rtld_base,
         ..Default::default()
     };
     if !resolver_module_bases.is_empty() {
@@ -1938,7 +2174,14 @@ fn inject_via_bootstrapper_once(
     }
 
     // === Host 端 loader IPC 握手 ===
-    let result = match run_loader_handshake(host_ctrl_fd, pid, loader_ctx_addr) {
+    let result = match run_loader_handshake(
+        host_ctrl_fd,
+        pid,
+        loader_ctx_addr,
+        alloc_base,
+        total_alloc,
+        libc_api.munmap_fn,
+    ) {
         Ok(result) => result,
         Err(e) => {
             unsafe { close(host_ctrl_fd) };

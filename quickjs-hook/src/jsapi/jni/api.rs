@@ -1,6 +1,7 @@
 use crate::context::JSContext;
 use crate::ffi;
 use crate::jsapi::callback_util::{extract_pointer_address, extract_string_arg};
+use crate::jsapi::java::callback::JniExecutorOp;
 use crate::jsapi::java::ensure_jni_initialized;
 use crate::jsapi::ptr::create_native_pointer;
 use crate::jsapi::util::add_cfunction_to_object;
@@ -8,6 +9,50 @@ use crate::value::JSValue;
 use std::ffi::CString;
 
 use super::load_jni_boot_script;
+
+unsafe fn raw_clone_jni_op_to_js(ctx: *mut ffi::JSContext, op: JniExecutorOp) -> Option<ffi::JSValue> {
+    if crate::is_raw_clone_js_thread() {
+        Some(crate::jsapi::java::callback::run_jni_executor_op_to_js(ctx, op))
+    } else {
+        None
+    }
+}
+
+unsafe fn raw_clone_ref_arg(
+    ctx: *mut ffi::JSContext,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+    func_name: &str,
+    argc_with_explicit_env: i32,
+) -> Result<u64, ffi::JSValue> {
+    let index = if argc >= argc_with_explicit_env { 1 } else { 0 };
+    resolve_ref_arg(ctx, argv, index, func_name)
+}
+
+unsafe fn raw_clone_two_ref_args(
+    ctx: *mut ffi::JSContext,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+    func_name: &str,
+    argc_with_explicit_env: i32,
+) -> Result<(u64, u64), ffi::JSValue> {
+    let first = if argc >= argc_with_explicit_env { 1 } else { 0 };
+    let a = resolve_ref_arg(ctx, argv, first, func_name)?;
+    let b = resolve_ref_arg(ctx, argv, first + 1, func_name)?;
+    Ok((a, b))
+}
+
+unsafe fn raw_clone_string_arg(
+    ctx: *mut ffi::JSContext,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+    func_name: &str,
+    argc_with_explicit_env: i32,
+    type_error: &'static [u8],
+) -> Result<String, ffi::JSValue> {
+    let index = if argc >= argc_with_explicit_env { 1 } else { 0 };
+    extract_string_arg(ctx, JSValue(*argv.add(index)), type_error)
+}
 
 unsafe fn resolve_env_ptr(
     ctx: *mut ffi::JSContext,
@@ -84,6 +129,10 @@ unsafe extern "C" fn js_jni_class_name(
         Err(err) => return err,
     };
 
+    if let Some(value) = raw_clone_jni_op_to_js(ctx, JniExecutorOp::ClassName { cls_ptr }) {
+        return value;
+    }
+
     match crate::jsapi::java::try_get_class_name(env_ptr, cls_ptr) {
         Some(name) => JSValue::string(ctx, &name).raw(),
         None => JSValue::null().raw(),
@@ -96,6 +145,9 @@ unsafe extern "C" fn js_jni_thread_env(
     _argc: i32,
     _argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
+    if let Some(value) = raw_clone_jni_op_to_js(ctx, JniExecutorOp::ThreadEnv) {
+        return value;
+    }
     match ensure_jni_initialized() {
         Ok(env) => create_native_pointer(ctx, env as usize as u64).raw(),
         Err(err) => {
@@ -116,6 +168,14 @@ unsafe extern "C" fn js_jni_read_jstring(
             ctx,
             b"Jni._readJString() requires at least 1 argument: jstringPtr\0".as_ptr() as *const _,
         );
+    }
+
+    if crate::is_raw_clone_js_thread() {
+        let obj_ptr = match raw_clone_ref_arg(ctx, argc, argv, "Jni._readJString", 2) {
+            Ok(v) => v,
+            Err(err) => return err,
+        };
+        return crate::jsapi::java::callback::run_jni_executor_op_to_js(ctx, JniExecutorOp::ReadJString { obj_ptr });
     }
 
     let (env_ptr, str_ptr) = match resolve_env_and_ref(ctx, argc, argv, "Jni._readJString", 2) {
@@ -142,6 +202,14 @@ unsafe extern "C" fn js_jni_get_object_class(
         );
     }
 
+    if crate::is_raw_clone_js_thread() {
+        let obj_ptr = match raw_clone_ref_arg(ctx, argc, argv, "Jni._getObjectClass", 2) {
+            Ok(v) => v,
+            Err(err) => return err,
+        };
+        return crate::jsapi::java::callback::run_jni_executor_op_to_js(ctx, JniExecutorOp::GetObjectClass { obj_ptr });
+    }
+
     let (env_ptr, obj_ptr) = match resolve_env_and_ref(ctx, argc, argv, "Jni._getObjectClass", 2) {
         Ok(v) => v,
         Err(err) => return err,
@@ -164,6 +232,14 @@ unsafe extern "C" fn js_jni_get_superclass(
             ctx,
             b"Jni._getSuperclass() requires at least 1 argument: classPtr\0".as_ptr() as *const _,
         );
+    }
+
+    if crate::is_raw_clone_js_thread() {
+        let cls_ptr = match raw_clone_ref_arg(ctx, argc, argv, "Jni._getSuperclass", 2) {
+            Ok(v) => v,
+            Err(err) => return err,
+        };
+        return crate::jsapi::java::callback::run_jni_executor_op_to_js(ctx, JniExecutorOp::GetSuperclass { cls_ptr });
     }
 
     let (env_ptr, cls_ptr) = match resolve_env_and_ref(ctx, argc, argv, "Jni._getSuperclass", 2) {
@@ -190,6 +266,17 @@ unsafe extern "C" fn js_jni_is_same_object(
         );
     }
 
+    if crate::is_raw_clone_js_thread() {
+        let (a_ptr, b_ptr) = match raw_clone_two_ref_args(ctx, argc, argv, "Jni._isSameObject", 3) {
+            Ok(v) => v,
+            Err(err) => return err,
+        };
+        return crate::jsapi::java::callback::run_jni_executor_op_to_js(
+            ctx,
+            JniExecutorOp::IsSameObject { a_ptr, b_ptr },
+        );
+    }
+
     let (env_ptr, a_ptr, b_ptr) = match resolve_env_and_two_refs(ctx, argc, argv, "Jni._isSameObject", 3) {
         Ok(v) => v,
         Err(err) => return err,
@@ -208,6 +295,17 @@ unsafe extern "C" fn js_jni_is_instance_of(
         return ffi::JS_ThrowTypeError(
             ctx,
             b"Jni._isInstanceOf() requires at least 2 arguments: objPtr, classPtr\0".as_ptr() as *const _,
+        );
+    }
+
+    if crate::is_raw_clone_js_thread() {
+        let (obj_ptr, cls_ptr) = match raw_clone_two_ref_args(ctx, argc, argv, "Jni._isInstanceOf", 3) {
+            Ok(v) => v,
+            Err(err) => return err,
+        };
+        return crate::jsapi::java::callback::run_jni_executor_op_to_js(
+            ctx,
+            JniExecutorOp::IsInstanceOf { obj_ptr, cls_ptr },
         );
     }
 
@@ -232,6 +330,17 @@ unsafe extern "C" fn js_jni_get_object_class_name(
         );
     }
 
+    if crate::is_raw_clone_js_thread() {
+        let obj_ptr = match raw_clone_ref_arg(ctx, argc, argv, "Jni._getObjectClassName", 2) {
+            Ok(v) => v,
+            Err(err) => return err,
+        };
+        return crate::jsapi::java::callback::run_jni_executor_op_to_js(
+            ctx,
+            JniExecutorOp::GetObjectClassName { obj_ptr },
+        );
+    }
+
     let (env_ptr, obj_ptr) = match resolve_env_and_ref(ctx, argc, argv, "Jni._getObjectClassName", 2) {
         Ok(v) => v,
         Err(err) => return err,
@@ -249,6 +358,9 @@ unsafe extern "C" fn js_jni_exception_check(
     argc: i32,
     argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
+    if let Some(value) = raw_clone_jni_op_to_js(ctx, JniExecutorOp::ExceptionCheck) {
+        return value;
+    }
     let (env_ptr, _) = match resolve_env_ptr(ctx, argc, argv, "Jni._exceptionCheck", 1) {
         Ok(v) => v,
         Err(err) => return err,
@@ -262,6 +374,9 @@ unsafe extern "C" fn js_jni_exception_clear(
     argc: i32,
     argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
+    if let Some(value) = raw_clone_jni_op_to_js(ctx, JniExecutorOp::ExceptionClear) {
+        return value;
+    }
     let (env_ptr, _) = match resolve_env_ptr(ctx, argc, argv, "Jni._exceptionClear", 1) {
         Ok(v) => v,
         Err(err) => return err,
@@ -276,6 +391,9 @@ unsafe extern "C" fn js_jni_exception_occurred(
     argc: i32,
     argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
+    if let Some(value) = raw_clone_jni_op_to_js(ctx, JniExecutorOp::ExceptionOccurred) {
+        return value;
+    }
     let (env_ptr, _) = match resolve_env_ptr(ctx, argc, argv, "Jni._exceptionOccurred", 1) {
         Ok(v) => v,
         Err(err) => return err,
@@ -297,6 +415,21 @@ unsafe extern "C" fn js_jni_find_class(
             ctx,
             b"Jni._findClass() requires at least 1 argument: name\0".as_ptr() as *const _,
         );
+    }
+
+    if crate::is_raw_clone_js_thread() {
+        let name = match raw_clone_string_arg(
+            ctx,
+            argc,
+            argv,
+            "Jni._findClass",
+            2,
+            b"Jni._findClass: name must be a string\0",
+        ) {
+            Ok(v) => v,
+            Err(err) => return err,
+        };
+        return crate::jsapi::java::callback::run_jni_executor_op_to_js(ctx, JniExecutorOp::FindClass { name });
     }
 
     // 第一个参数要么是 env（显式）后跟 name，要么直接就是 name
@@ -345,6 +478,21 @@ unsafe extern "C" fn js_jni_new_string_utf(
         );
     }
 
+    if crate::is_raw_clone_js_thread() {
+        let value = match raw_clone_string_arg(
+            ctx,
+            argc,
+            argv,
+            "Jni._newStringUtf",
+            2,
+            b"Jni._newStringUtf: str must be a string\0",
+        ) {
+            Ok(v) => v,
+            Err(err) => return err,
+        };
+        return crate::jsapi::java::callback::run_jni_executor_op_to_js(ctx, JniExecutorOp::NewStringUtf { value });
+    }
+
     let (env_ptr, str_idx) = if argc >= 2 {
         let env = match extract_pointer_address(ctx, JSValue(*argv), "Jni._newStringUtf") {
             Ok(v) => v,
@@ -390,6 +538,14 @@ unsafe extern "C" fn js_jni_new_local_ref(
         );
     }
 
+    if crate::is_raw_clone_js_thread() {
+        let obj_ptr = match raw_clone_ref_arg(ctx, argc, argv, "Jni._newLocalRef", 2) {
+            Ok(v) => v,
+            Err(err) => return err,
+        };
+        return crate::jsapi::java::callback::run_jni_executor_op_to_js(ctx, JniExecutorOp::NewLocalRef { obj_ptr });
+    }
+
     let (env_ptr, obj_ptr) = match resolve_env_and_ref(ctx, argc, argv, "Jni._newLocalRef", 2) {
         Ok(v) => v,
         Err(err) => return err,
@@ -412,6 +568,14 @@ unsafe extern "C" fn js_jni_delete_local_ref(
             ctx,
             b"Jni._deleteLocalRef() requires at least 1 argument: obj\0".as_ptr() as *const _,
         );
+    }
+
+    if crate::is_raw_clone_js_thread() {
+        let obj_ptr = match raw_clone_ref_arg(ctx, argc, argv, "Jni._deleteLocalRef", 2) {
+            Ok(v) => v,
+            Err(err) => return err,
+        };
+        return crate::jsapi::java::callback::run_jni_executor_op_to_js(ctx, JniExecutorOp::DeleteLocalRef { obj_ptr });
     }
 
     let (env_ptr, obj_ptr) = match resolve_env_and_ref(ctx, argc, argv, "Jni._deleteLocalRef", 2) {

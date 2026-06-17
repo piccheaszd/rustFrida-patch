@@ -88,7 +88,7 @@ impl OrElse for Option<TryPatch> {
     }
 }
 
-/* === B / BL (imm26, 基于 PC+4) ============================
+/* === B / BL (imm26, 基于当前 PC) ============================
  * 掩码/模式： (insn & 0x7C00_0000) == 0x1400_0000
  * BL 由 bit31 区分。偏移字节 = sign_extend(imm26)<<2
  * 参考：Arm DDI0602 — B / BL（imm26, ±128MB） :contentReference[oaicite:0]{index=0}
@@ -100,8 +100,8 @@ fn try_b_bl(src: usize, dst: usize, insn: u32) -> Option<TryPatch> {
     let imm26 = get_bits(insn, 25, 0) as usize;
     let off_bytes = (sign_extend_usize_to_i64(imm26, 26)) << 2;
 
-    let target = (src + 4) as i64 + off_bytes;
-    let new_off = target - (dst as i64 + 4);
+    let target = src as i64 + off_bytes;
+    let new_off = target - dst as i64;
 
     if (new_off & 0b11) != 0 {
         return Some(TryPatch::OutOfRange);
@@ -115,7 +115,7 @@ fn try_b_bl(src: usize, dst: usize, insn: u32) -> Option<TryPatch> {
     Some(TryPatch::Patched(patched))
 }
 
-/* === B.cond (imm19, 基于 PC+4) ============================
+/* === B.cond (imm19, 基于当前 PC) ============================
  * 掩码/模式： (insn & 0xFF00_0010) == 0x5400_0000
  * 偏移字节 = sign_extend(imm19)<<2，范围 ±1MB
  * 参考：GDB 源码解码掩码（aarch64_decode_bcond） :contentReference[oaicite:1]{index=1}
@@ -127,8 +127,8 @@ fn try_b_cond(src: usize, dst: usize, insn: u32) -> Option<TryPatch> {
     let imm19 = get_bits(insn, 23, 5) as usize;
     let off_bytes = (sign_extend_usize_to_i64(imm19, 19)) << 2;
 
-    let target = (src + 4) as i64 + off_bytes;
-    let new_off = target - (dst as i64 + 4);
+    let target = src as i64 + off_bytes;
+    let new_off = target - dst as i64;
 
     if (new_off & 0b11) != 0 {
         return Some(TryPatch::OutOfRange);
@@ -142,7 +142,7 @@ fn try_b_cond(src: usize, dst: usize, insn: u32) -> Option<TryPatch> {
     Some(TryPatch::Patched(patched))
 }
 
-/* === CBZ/CBNZ (imm19, 基于 PC+4) ==========================
+/* === CBZ/CBNZ (imm19, 基于当前 PC) ==========================
  * 掩码/模式： (insn & 0x7E00_0000) == 0x3400_0000（bit31/24 区分宽度/是否 CBNZ）
  * 偏移字节 = sign_extend(imm19)<<2
  * 参考：GDB aarch64_decode_cb 掩码/字段位置 :contentReference[oaicite:2]{index=2}
@@ -154,8 +154,8 @@ fn try_cbz_cbnz(src: usize, dst: usize, insn: u32) -> Option<TryPatch> {
     let imm19 = get_bits(insn, 23, 5) as usize;
     let off_bytes = (sign_extend_usize_to_i64(imm19, 19)) << 2;
 
-    let target = (src + 4) as i64 + off_bytes;
-    let new_off = target - (dst as i64 + 4);
+    let target = src as i64 + off_bytes;
+    let new_off = target - dst as i64;
 
     if (new_off & 0b11) != 0 {
         return Some(TryPatch::OutOfRange);
@@ -169,7 +169,7 @@ fn try_cbz_cbnz(src: usize, dst: usize, insn: u32) -> Option<TryPatch> {
     Some(TryPatch::Patched(patched))
 }
 
-/* === TBZ/TBNZ (imm14, 基于 PC+4) ==========================
+/* === TBZ/TBNZ (imm14, 基于当前 PC) ==========================
  * 掩码/模式： (insn & 0x7E00_0000) == 0x3600_0000（bit24 区分 TBNZ）
  * imm14 在 [18:5]，偏移字节 = sign_extend(imm14)<<2（±32KB）
  * 参考：GDB aarch64_decode_tb 掩码/字段位置；斯坦福资料范围说明 :contentReference[oaicite:3]{index=3}
@@ -181,8 +181,8 @@ fn try_tbz_tbnz(src: usize, dst: usize, insn: u32) -> Option<TryPatch> {
     let imm14 = get_bits(insn, 18, 5) as usize;
     let off_bytes = (sign_extend_usize_to_i64(imm14, 14)) << 2;
 
-    let target = (src + 4) as i64 + off_bytes;
-    let new_off = target - (dst as i64 + 4);
+    let target = src as i64 + off_bytes;
+    let new_off = target - dst as i64;
 
     if (new_off & 0b11) != 0 {
         return Some(TryPatch::OutOfRange);

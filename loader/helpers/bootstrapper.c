@@ -187,6 +187,7 @@ frida_bootstrap (FridaBootstrapContext * ctx)
   ctx->rtld_flavor = process.rtld_flavor;
   ctx->rtld_base = process.interpreter;
   ctx->r_brk = process.r_brk;
+  ctx->fallback_libc = process.libc;
 
   if (process.interpreter != NULL && process.libc == NULL)
     return FRIDA_BOOTSTRAP_TOO_EARLY;

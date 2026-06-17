@@ -5,6 +5,7 @@
 pub(super) struct CachedFieldInfo {
     pub(super) jni_sig: String,
     pub(super) field_id: *mut std::ffi::c_void, // jfieldID — stable across threads
+    pub(super) field_offset: u32,
     pub(super) is_static: bool,
 }
 
@@ -28,6 +29,35 @@ pub(super) unsafe fn cache_fields_for_class(env: JniEnv, class_name: &str) {
         if guard.as_ref().unwrap().contains_key(class_name) {
             return;
         }
+    }
+
+    if crate::is_raw_clone_js_thread() {
+        let fields = match enumerate_fields_by_dex(env, class_name) {
+            Some(fields) => fields,
+            None => {
+                output_verbose(&format!(
+                    "[field cache] raw clone dex self-parse failed: {}",
+                    class_name
+                ));
+                return;
+            }
+        };
+
+        let mut field_map = HashMap::new();
+        for field in fields {
+            field_map.entry(field.name).or_insert_with(|| CachedFieldInfo {
+                jni_sig: field.jni_sig,
+                field_id: field.field_id,
+                field_offset: field.field_offset,
+                is_static: field.is_static,
+            });
+        }
+
+        let mut guard = FIELD_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cache) = guard.as_mut() {
+            cache.insert(class_name.to_string(), field_map);
+        }
+        return;
     }
 
     // Enumerate fields using JNI reflection (safe from init thread)
@@ -75,6 +105,7 @@ pub(super) unsafe fn cache_fields_for_class(env: JniEnv, class_name: &str) {
             CachedFieldInfo {
                 jni_sig,
                 field_id: fid,
+                field_offset: art_field_offset(fid).unwrap_or(0),
                 is_static: *is_static,
             },
         );
@@ -86,6 +117,73 @@ pub(super) unsafe fn cache_fields_for_class(env: JniEnv, class_name: &str) {
     if let Some(cache) = guard.as_mut() {
         cache.insert(class_name.to_string(), field_map);
     }
+}
+
+pub(super) unsafe fn cache_fields_for_class_mirror(_env: JniEnv, class_name: &str, class_mirror: u64) {
+    super::safe_mem::refresh_mem_regions();
+    if class_mirror < 0x1000 || !super::safe_mem::is_readable(class_mirror, 4) {
+        output_verbose(&format!(
+            "[field cache] raw clone mirror unreadable {} -> {:#x}",
+            class_name, class_mirror
+        ));
+        return;
+    }
+
+    output_verbose(&format!(
+        "[field cache] raw clone mirror cache start {} -> {:#x}",
+        class_name, class_mirror
+    ));
+
+    {
+        let mut guard = FIELD_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            *guard = Some(HashMap::new());
+        }
+        if guard.as_ref().unwrap().contains_key(class_name) {
+            return;
+        }
+    }
+
+    let fields = match enumerate_fields_by_dex_from_mirror(class_mirror, class_name) {
+        Some(fields) => fields,
+        None => {
+            output_verbose(&format!(
+                "[field cache] raw clone dex self-parse failed from mirror: {} -> {:#x}",
+                class_name, class_mirror
+            ));
+            return;
+        }
+    };
+
+    output_verbose(&format!(
+        "[field cache] raw clone mirror cache parsed {} fields for {}",
+        fields.len(),
+        class_name
+    ));
+
+    let mut field_map = HashMap::new();
+    for field in fields {
+        field_map.entry(field.name).or_insert_with(|| CachedFieldInfo {
+            jni_sig: field.jni_sig,
+            field_id: field.field_id,
+            field_offset: field.field_offset,
+            is_static: field.is_static,
+        });
+    }
+
+    let mut guard = FIELD_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(cache) = guard.as_mut() {
+        cache.insert(class_name.to_string(), field_map);
+    }
+}
+
+pub(super) unsafe fn art_field_offset(field_id: *mut std::ffi::c_void) -> Option<u32> {
+    let spec = get_art_field_spec()?;
+    let art_field = field_id as u64;
+    if art_field < 0x1000 || !super::safe_mem::is_readable(art_field + spec.offset_offset as u64, 4) {
+        return None;
+    }
+    Some(super::safe_mem::safe_read_u32(art_field + spec.offset_offset as u64))
 }
 
 /// Enumerate fields of a class and all its superclasses via JNI reflection.
@@ -246,7 +344,7 @@ unsafe fn enumerate_class_fields(
                 break;
             }
             let super_cls = call_obj(env, current_cls, get_superclass_mid, std::ptr::null());
-            if jni_check_exc(env) || super_cls.is_null() {
+            if jni_null_or_exc(env, super_cls) {
                 break;
             }
             current_cls = super_cls;

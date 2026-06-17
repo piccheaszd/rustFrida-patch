@@ -51,6 +51,37 @@ impl MarshaledJValue {
     }
 }
 
+unsafe fn raw_clone_object_arg_to_local(
+    ctx: *mut ffi::JSContext,
+    env: JniEnv,
+    val: JSValue,
+) -> Option<MarshaledJValue> {
+    if !crate::is_raw_clone_js_thread() || !val.is_object() {
+        return None;
+    }
+
+    let jptr_val = val.get_property(ctx, "__jptr");
+    if jptr_val.is_undefined() || jptr_val.is_null() {
+        jptr_val.free(ctx);
+        return None;
+    }
+    let raw = js_value_to_u64_or_zero(ctx, jptr_val);
+    jptr_val.free(ctx);
+    if raw == 0 {
+        return Some(MarshaledJValue::raw(0));
+    }
+
+    let raw_flag = val.get_property(ctx, "__jraw");
+    let is_raw = raw_flag.to_bool().unwrap_or(false);
+    raw_flag.free(ctx);
+    if !is_raw {
+        return Some(MarshaledJValue::raw(raw));
+    }
+
+    let local = raw_mirror_to_local_ref(env, raw) as u64;
+    Some(MarshaledJValue::local(local))
+}
+
 /// Convert a JS value to a JNI jvalue (u64) based on the parameter type descriptor.
 ///
 /// Handles: primitives (Z/B/C/S/I/J/F/D), String (JS string → NewStringUTF),
@@ -128,6 +159,15 @@ unsafe fn marshal_js_to_jvalue_owned(
             }
         }
         b'[' => {
+            if let Some(raw_arg) = raw_clone_object_arg_to_local(ctx, env, val) {
+                return raw_arg;
+            }
+            if crate::is_raw_clone_js_thread() {
+                crate::jsapi::console::output_verbose(
+                    "[java.marshal] raw clone refuses JS array -> Java array JNI allocation",
+                );
+                return MarshaledJValue::raw(0);
+            }
             // 数组类型: JS array → Java primitive array (via NewXxxArray + SetXxxArrayRegion)
             // byte[] 额外接受 ArrayBuffer / TypedArray，按原始字节拷贝。
             // Fallback: JS object with __jptr (已存在的 Java 数组) → 透传
@@ -153,6 +193,15 @@ unsafe fn marshal_js_to_jvalue_owned(
             MarshaledJValue::raw(0)
         }
         b'L' => {
+            if let Some(raw_arg) = raw_clone_object_arg_to_local(ctx, env, val) {
+                return raw_arg;
+            }
+            if crate::is_raw_clone_js_thread() {
+                crate::jsapi::console::output_verbose(
+                    "[java.marshal] raw clone refuses JS value -> Java object JNI allocation/autobox",
+                );
+                return MarshaledJValue::raw(0);
+            }
             // JS string → NewStringUTF for ANY Object type (not just Ljava/lang/String;).
             // ctx.orig() 返回 String 时 marshal_jni_arg_to_js 会 unbox 为 JS string，
             // 但 return_type_sig 可能是 Ljava/lang/Object; (如 HashMap.put)。
@@ -259,7 +308,7 @@ unsafe fn new_java_byte_array_from_bytes(env: JniEnv, bytes: &[u8]) -> Option<u6
     let len = i32::try_from(bytes.len()).ok()?;
     let new_fn: NewPrimitiveArrayFn = jni_fn!(env, NewPrimitiveArrayFn, JNI_NEW_BYTE_ARRAY);
     let jarr = new_fn(env, len);
-    if jarr.is_null() || jni_check_exc(env) {
+    if jni_null_or_exc(env, jarr) {
         return None;
     }
     if len > 0 {
@@ -493,7 +542,16 @@ pub(crate) unsafe fn invoke_original_jni(
     quick_trampoline: u64,
     _use_blr: bool,
 ) -> u64 {
-    jni_check_exc(env);
+    let raw_clone = crate::is_raw_clone_js_thread();
+    let raw_clone_jni_allowed = raw_clone_executor_jni_scope_active();
+    if !raw_clone || raw_clone_jni_allowed {
+        jni_check_exc(env);
+    } else {
+        crate::jsapi::console::output_verbose(
+            "[java.orig] raw clone refuses JNI Call*MethodA original-call fallback",
+        );
+        return 0;
+    }
 
     let thread_id = crate::current_thread_id_u64();
     let method_id_addr = lookup_call_original_method_id(art_method_addr);
@@ -514,9 +572,13 @@ pub(crate) unsafe fn invoke_original_jni(
         if this_obj == 0 {
             (0, false)
         } else {
-            let new_local_ref: NewLocalRefFn = jni_fn!(env, NewLocalRefFn, JNI_NEW_LOCAL_REF);
-            let local = new_local_ref(env, this_obj as *mut std::ffi::c_void) as u64;
-            if local == 0 || jni_check_exc(env) {
+            let local = if crate::is_raw_clone_js_thread() {
+                raw_mirror_to_local_ref(env, this_obj) as u64
+            } else {
+                let new_local_ref: NewLocalRefFn = jni_fn!(env, NewLocalRefFn, JNI_NEW_LOCAL_REF);
+                new_local_ref(env, this_obj as *mut std::ffi::c_void) as u64
+            };
+            if local == 0 || ((!raw_clone || raw_clone_jni_allowed) && jni_check_exc(env)) {
                 if bypass_set {
                     hook_ffi::orig_bypass_clear(thread_id);
                 }
@@ -534,8 +596,12 @@ pub(crate) unsafe fn invoke_original_jni(
     );
 
     if delete_local_after {
-        let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
-        delete_local_ref(env, call_this_obj as *mut std::ffi::c_void);
+        if crate::is_raw_clone_js_thread() {
+            raw_delete_local_ref(env, call_this_obj as *mut std::ffi::c_void);
+        } else {
+            let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+            delete_local_ref(env, call_this_obj as *mut std::ffi::c_void);
+        }
     }
 
     if bypass_set {
@@ -573,10 +639,20 @@ unsafe fn invoke_original_jni_inner(
     jargs_ptr: *const std::ffi::c_void,
 ) -> u64 {
     let method_id = art_method_addr as *mut std::ffi::c_void;
-    let cls = class_global_ref as *mut std::ffi::c_void;
+    let delete_class_local = class_global_ref == 0;
+    let cls = if class_global_ref != 0 {
+        class_global_ref as *mut std::ffi::c_void
+    } else {
+        let cls = local_class_ref_for_art_method(env, art_method_addr);
+        let raw_clone_jni_allowed = raw_clone_executor_jni_scope_active();
+        if cls.is_null() || ((!crate::is_raw_clone_js_thread() || raw_clone_jni_allowed) && jni_check_exc(env)) {
+            return 0;
+        }
+        cls
+    };
     let this_ptr = this_obj as *mut std::ffi::c_void;
 
-    match return_type {
+    let result = match return_type {
         b'V' => {
             dispatch_call!(
                 env,
@@ -678,7 +754,18 @@ unsafe fn invoke_original_jni_inner(
             ret as u64
         }
         _ => 0,
+    };
+
+    if delete_class_local {
+        if crate::is_raw_clone_js_thread() {
+            raw_delete_local_ref(env, cls);
+        } else {
+            let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+            delete_local_ref(env, cls);
+        }
     }
+
+    result
 }
 
 /// Build jvalue args from HookContext registers (ARM64 JNI calling convention).
@@ -707,6 +794,52 @@ pub(crate) unsafe fn build_jargs_from_registers(
         });
     }
     jargs
+}
+
+unsafe fn delete_owned_jvalue_refs(env: JniEnv, refs: &[u64]) {
+    if refs.is_empty() {
+        return;
+    }
+    if crate::is_raw_clone_js_thread() {
+        for &raw in refs {
+            raw_delete_local_ref(env, raw as *mut std::ffi::c_void);
+        }
+    } else {
+        let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+        for &raw in refs {
+            delete_local_ref(env, raw as *mut std::ffi::c_void);
+        }
+    }
+}
+
+unsafe fn build_jargs_from_js_args(
+    ctx: *mut ffi::JSContext,
+    env: JniEnv,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+    param_count: usize,
+    param_types: &[String],
+) -> Result<(Vec<u64>, Vec<u64>), ffi::JSValue> {
+    if argc as usize != param_count {
+        let msg = format!(
+            "orig(...args) expected {} argument(s), got {}\0",
+            param_count, argc
+        );
+        return Err(ffi::JS_ThrowTypeError(ctx, msg.as_ptr() as *const _));
+    }
+
+    let mut jargs = Vec::with_capacity(param_count);
+    let mut owned_refs = Vec::new();
+    for i in 0..param_count {
+        let val = JSValue(*argv.add(i));
+        let type_sig = param_types.get(i).map(|s| s.as_str());
+        let marshaled = marshal_js_to_jvalue_owned(ctx, env, val, type_sig);
+        if marshaled.owned_local_ref && marshaled.raw != 0 {
+            owned_refs.push(marshaled.raw);
+        }
+        jargs.push(marshaled.raw);
+    }
+    Ok((jargs, owned_refs))
 }
 
 unsafe fn js_value_from_jni_return(
@@ -875,8 +1008,8 @@ pub(crate) unsafe fn prepare_fast_orig_router_frame(
 unsafe extern "C" fn js_call_original(
     ctx: *mut ffi::JSContext,
     this_val: ffi::JSValue,
-    _argc: i32,
-    _argv: *mut ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
     let atoms = hot_atoms();
     let art_method_addr = get_js_u64_property_atom(ctx, this_val, atoms.hook_art_method);
@@ -961,6 +1094,12 @@ unsafe extern "C" fn js_call_original(
     }
 
     if native_entry_trampoline != 0 && native_entry_critical {
+        if argc > 0 {
+            return ffi::JS_ThrowTypeError(
+                ctx,
+                b"orig(...args) is not supported for critical native hooks\0".as_ptr() as *const _,
+            );
+        }
         let ret_x0 = hook_ffi::hook_invoke_trampoline(
             ctx_ptr,
             native_entry_trampoline as *mut std::ffi::c_void,
@@ -986,7 +1125,37 @@ unsafe extern "C" fn js_call_original(
         e
     };
 
+    let (supplied_jargs, supplied_owned_refs) = if argc > 0 {
+        match build_jargs_from_js_args(ctx, env, argc, argv, param_count, &param_types) {
+            Ok(v) => (Some(v.0), v.1),
+            Err(e) => return e,
+        }
+    } else {
+        (None, Vec::new())
+    };
+
     if native_entry_trampoline != 0 {
+        if let Some(ref jargs) = supplied_jargs {
+            let jargs_ptr = if jargs.is_empty() {
+                std::ptr::null()
+            } else {
+                jargs.as_ptr() as *const std::ffi::c_void
+            };
+            let ret_raw = invoke_original_jni(
+                env,
+                art_method_addr,
+                class_global_ref,
+                hook_ctx.x[1],
+                return_type,
+                is_static,
+                jargs_ptr,
+                quick_trampoline,
+                use_blr,
+            );
+            delete_owned_jvalue_refs(env, &supplied_owned_refs);
+            return js_value_from_jni_return(ctx, env, ret_raw, return_type, &return_type_sig);
+        }
+
         let ret_x0 = hook_ffi::hook_invoke_trampoline(
             ctx_ptr,
             native_entry_trampoline as *mut std::ffi::c_void,
@@ -1000,12 +1169,9 @@ unsafe extern "C" fn js_call_original(
         return js_value_from_jni_return(ctx, env, ret_raw, return_type, &return_type_sig);
     }
 
-    // 始终从 hook_ctx 寄存器读参数 (transition ref)。
-    // transition ref 指向 GenericJNI 帧 vreg CompressedReference，GC 会实时更新该值。
-    // 比从 JS __jptr 缓存读更安全（__jptr 和 transition ref 是同一个栈地址，
-    // 但绕过 marshal 避免潜在的 JS 对象生命周期问题）。
-    // TODO: 支持用户修改参数时需要 hybrid 策略
-    let jargs = build_jargs_from_registers(hook_ctx, param_count, &param_types);
+    // 无参 orig() 仍从 hook_ctx 寄存器读原始 transition refs；显式
+    // orig(arg0, ...) 则使用 JS 传入值，支持 hook 中改参后调用原方法。
+    let jargs = supplied_jargs.unwrap_or_else(|| build_jargs_from_registers(hook_ctx, param_count, &param_types));
     let jargs_ptr = if param_count > 0 {
         jargs.as_ptr() as *const std::ffi::c_void
     } else {
@@ -1013,6 +1179,7 @@ unsafe extern "C" fn js_call_original(
     };
 
     if !is_static && hook_ctx.x[1] == 0 {
+        delete_owned_jvalue_refs(env, &supplied_owned_refs);
         return match return_type {
             b'V' => ffi::qjs_undefined(),
             b'Z' => JSValue::bool(false).raw(),
@@ -1030,6 +1197,7 @@ unsafe extern "C" fn js_call_original(
     {
         let thread_id = crate::current_thread_id_u64();
         if hook_ffi::fast_orig_set(thread_id, art_method_addr, quick_trampoline) == 0 {
+            delete_owned_jvalue_refs(env, &supplied_owned_refs);
             return match return_type {
                 b'V' => ffi::qjs_undefined(),
                 b'Z' => JSValue::bool(false).raw(),
@@ -1053,6 +1221,7 @@ unsafe extern "C" fn js_call_original(
         quick_trampoline,
         use_blr,
     );
+    delete_owned_jvalue_refs(env, &supplied_owned_refs);
 
     js_value_from_jni_return(ctx, env, ret_raw, return_type, &return_type_sig)
 }

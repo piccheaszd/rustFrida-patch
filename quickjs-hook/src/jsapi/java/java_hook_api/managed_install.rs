@@ -4,20 +4,22 @@ use crate::jsapi::console::output_message;
 use crate::value::JSValue;
 use std::collections::HashMap;
 use std::ffi::{c_void, CString};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use super::super::art_controller::{ensure_art_controller_initialized, refresh_walkstack_sigsegv_guard};
 use super::super::art_method::*;
 use super::super::callback::*;
-use super::super::java_fast_api::{compile_art_method_to_quick, RequestedCompileKind};
 use super::super::jni_core::*;
 use super::super::reflect::{decode_method_id, find_class_safe, get_app_classloader_local_ref};
-use super::install_support::{create_class_global_ref, update_original_method_flags_for_hook, JavaHookInstallGuard};
+use super::install_support::{
+    create_class_global_ref, install_per_method_router_hook, update_original_method_flags_for_hook,
+    JavaHookInstallGuard,
+};
 use super::managed_dex_builder::{
-    build_managed_dsl_dex, GeneratedCounter, GeneratedMessageChannel, GeneratedStringLiteral, MANAGED_MESSAGE_CAPACITY,
-    MANAGED_MESSAGE_CODES_FIELD, MANAGED_MESSAGE_DROPPED_FIELD, MANAGED_MESSAGE_HEAD_FIELD, MANAGED_MESSAGE_TAIL_FIELD,
-    MANAGED_MESSAGE_TEXTS_FIELD, MANAGED_MESSAGE_VALUES_FIELD,
+    build_java_worker_dex, build_managed_dsl_dex, GeneratedCounter, GeneratedMessageChannel, GeneratedStringLiteral,
+    MANAGED_MESSAGE_CAPACITY, MANAGED_MESSAGE_CODES_FIELD, MANAGED_MESSAGE_DROPPED_FIELD, MANAGED_MESSAGE_HEAD_FIELD,
+    MANAGED_MESSAGE_TAIL_FIELD, MANAGED_MESSAGE_TEXTS_FIELD, MANAGED_MESSAGE_VALUES_FIELD,
 };
 
 struct DynamicManagedHelperRefs {
@@ -29,7 +31,16 @@ struct DynamicManagedHelperRefs {
 
 static DYNAMIC_MANAGED_HELPER_REFS: Mutex<Vec<DynamicManagedHelperRefs>> = Mutex::new(Vec::new());
 static DYNAMIC_MANAGED_CLASS_ID: AtomicU64 = AtomicU64::new(1);
+static JAVA_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
+static JAVA_WORKER_THREAD_GLOBAL: Mutex<Option<u64>> = Mutex::new(None);
 static NATIVE_MANAGED_COUNTERS: OnceLock<Mutex<HashMap<(String, String), Box<AtomicU64>>>> = OnceLock::new();
+
+unsafe fn jni_failure_with_exception(env: JniEnv, context: &str) -> String {
+    match jni_take_exception(env) {
+        Some(exc) if !exc.is_empty() => format!("{}: {}", context, exc),
+        _ => context.to_string(),
+    }
+}
 
 fn native_counter_registry() -> &'static Mutex<HashMap<(String, String), Box<AtomicU64>>> {
     NATIVE_MANAGED_COUNTERS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -102,27 +113,52 @@ unsafe fn load_dynamic_managed_helper_class(
     let ctor_name = CString::new("<init>").unwrap();
     let ctor_sig = CString::new("(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V").unwrap();
     let ctor = get_mid(env, find_loader_cls, ctor_name.as_ptr(), ctor_sig.as_ptr());
-    if ctor.is_null() || jni_check_exc(env) {
+    if ctor.is_null() {
+        let err = jni_failure_with_exception(
+            env,
+            "InMemoryDexClassLoader(ByteBuffer, ClassLoader) constructor not found",
+        );
         delete_local_ref(env, find_loader_cls);
-        return Err("InMemoryDexClassLoader(ByteBuffer, ClassLoader) constructor not found".to_string());
+        return Err(err);
+    }
+    if let Some(exc) = jni_take_exception(env) {
+        delete_local_ref(env, find_loader_cls);
+        return Err(format!(
+            "InMemoryDexClassLoader(ByteBuffer, ClassLoader) constructor lookup failed: {}",
+            exc
+        ));
     }
 
     let dex_buf = new_direct(env, dex_ptr, dex_len);
-    if dex_buf.is_null() || jni_check_exc(env) {
+    if dex_buf.is_null() {
+        let err = jni_failure_with_exception(env, "NewDirectByteBuffer for dynamic managed dex failed");
         delete_local_ref(env, find_loader_cls);
-        return Err("NewDirectByteBuffer for dynamic managed dex failed".to_string());
+        return Err(err);
+    }
+    if let Some(exc) = jni_take_exception(env) {
+        delete_local_ref(env, find_loader_cls);
+        return Err(format!("NewDirectByteBuffer for dynamic managed dex failed: {}", exc));
     }
 
     let parent_loader = get_app_classloader_local_ref(env);
     let args = [dex_buf as u64, parent_loader as u64];
     let loader = new_object(env, find_loader_cls, ctor, args.as_ptr() as *const std::ffi::c_void);
-    if loader.is_null() || jni_check_exc(env) {
+    if loader.is_null() {
+        let err = jni_failure_with_exception(env, "new dynamic InMemoryDexClassLoader failed");
         if !parent_loader.is_null() {
             delete_local_ref(env, parent_loader);
         }
         delete_local_ref(env, dex_buf);
         delete_local_ref(env, find_loader_cls);
-        return Err("new dynamic InMemoryDexClassLoader failed".to_string());
+        return Err(err);
+    }
+    if let Some(exc) = jni_take_exception(env) {
+        if !parent_loader.is_null() {
+            delete_local_ref(env, parent_loader);
+        }
+        delete_local_ref(env, dex_buf);
+        delete_local_ref(env, find_loader_cls);
+        return Err(format!("new dynamic InMemoryDexClassLoader failed: {}", exc));
     }
 
     let class_loader_cls = find_class_safe(env, "java/lang/ClassLoader");
@@ -138,7 +174,8 @@ unsafe fn load_dynamic_managed_helper_class(
     let load_name = CString::new("loadClass").unwrap();
     let load_sig = CString::new("(Ljava/lang/String;)Ljava/lang/Class;").unwrap();
     let load_mid = get_mid(env, class_loader_cls, load_name.as_ptr(), load_sig.as_ptr());
-    if load_mid.is_null() || jni_check_exc(env) {
+    if load_mid.is_null() {
+        let err = jni_failure_with_exception(env, "ClassLoader.loadClass method not found");
         delete_local_ref(env, class_loader_cls);
         delete_local_ref(env, loader);
         if !parent_loader.is_null() {
@@ -146,12 +183,23 @@ unsafe fn load_dynamic_managed_helper_class(
         }
         delete_local_ref(env, dex_buf);
         delete_local_ref(env, find_loader_cls);
-        return Err("ClassLoader.loadClass method not found".to_string());
+        return Err(err);
+    }
+    if let Some(exc) = jni_take_exception(env) {
+        delete_local_ref(env, class_loader_cls);
+        delete_local_ref(env, loader);
+        if !parent_loader.is_null() {
+            delete_local_ref(env, parent_loader);
+        }
+        delete_local_ref(env, dex_buf);
+        delete_local_ref(env, find_loader_cls);
+        return Err(format!("ClassLoader.loadClass lookup failed: {}", exc));
     }
 
     let helper_name = CString::new(helper_class_name).map_err(|_| "invalid helper class name".to_string())?;
     let helper_jstr = new_string_utf(env, helper_name.as_ptr());
-    if helper_jstr.is_null() || jni_check_exc(env) {
+    if helper_jstr.is_null() {
+        let err = jni_failure_with_exception(env, "NewStringUTF for dynamic helper class failed");
         delete_local_ref(env, class_loader_cls);
         delete_local_ref(env, loader);
         if !parent_loader.is_null() {
@@ -159,12 +207,23 @@ unsafe fn load_dynamic_managed_helper_class(
         }
         delete_local_ref(env, dex_buf);
         delete_local_ref(env, find_loader_cls);
-        return Err("NewStringUTF for dynamic helper class failed".to_string());
+        return Err(err);
+    }
+    if let Some(exc) = jni_take_exception(env) {
+        delete_local_ref(env, class_loader_cls);
+        delete_local_ref(env, loader);
+        if !parent_loader.is_null() {
+            delete_local_ref(env, parent_loader);
+        }
+        delete_local_ref(env, dex_buf);
+        delete_local_ref(env, find_loader_cls);
+        return Err(format!("NewStringUTF for dynamic helper class failed: {}", exc));
     }
     let load_args = [helper_jstr as u64];
     let helper_cls = call_obj(env, loader, load_mid, load_args.as_ptr() as *const std::ffi::c_void);
     delete_local_ref(env, helper_jstr);
-    if helper_cls.is_null() || jni_check_exc(env) {
+    if helper_cls.is_null() {
+        let err = jni_failure_with_exception(env, "dynamic managed helper loadClass failed");
         delete_local_ref(env, class_loader_cls);
         delete_local_ref(env, loader);
         if !parent_loader.is_null() {
@@ -172,12 +231,23 @@ unsafe fn load_dynamic_managed_helper_class(
         }
         delete_local_ref(env, dex_buf);
         delete_local_ref(env, find_loader_cls);
-        return Err("dynamic managed helper loadClass failed".to_string());
+        return Err(err);
+    }
+    if let Some(exc) = jni_take_exception(env) {
+        delete_local_ref(env, class_loader_cls);
+        delete_local_ref(env, loader);
+        if !parent_loader.is_null() {
+            delete_local_ref(env, parent_loader);
+        }
+        delete_local_ref(env, dex_buf);
+        delete_local_ref(env, find_loader_cls);
+        return Err(format!("dynamic managed helper loadClass failed: {}", exc));
     }
 
     let helper_global = new_global_ref(env, helper_cls);
     let loader_global = new_global_ref(env, loader);
-    if helper_global.is_null() || loader_global.is_null() || jni_check_exc(env) {
+    if helper_global.is_null() || loader_global.is_null() {
+        let err = jni_failure_with_exception(env, "dynamic helper global ref creation failed");
         delete_local_ref(env, helper_cls);
         delete_local_ref(env, class_loader_cls);
         delete_local_ref(env, loader);
@@ -186,7 +256,18 @@ unsafe fn load_dynamic_managed_helper_class(
         }
         delete_local_ref(env, dex_buf);
         delete_local_ref(env, find_loader_cls);
-        return Err("dynamic helper global ref creation failed".to_string());
+        return Err(err);
+    }
+    if let Some(exc) = jni_take_exception(env) {
+        delete_local_ref(env, helper_cls);
+        delete_local_ref(env, class_loader_cls);
+        delete_local_ref(env, loader);
+        if !parent_loader.is_null() {
+            delete_local_ref(env, parent_loader);
+        }
+        delete_local_ref(env, dex_buf);
+        delete_local_ref(env, find_loader_cls);
+        return Err(format!("dynamic helper global ref creation failed: {}", exc));
     }
 
     {
@@ -206,6 +287,119 @@ unsafe fn load_dynamic_managed_helper_class(
     delete_local_ref(env, find_loader_cls);
 
     Ok(helper_cls)
+}
+
+pub(crate) unsafe fn start_java_worker_thread(native_loop: *mut c_void) -> Result<(), String> {
+    if native_loop.is_null() {
+        return Err("java worker native loop pointer is null".to_string());
+    }
+    if JAVA_WORKER_STARTED.load(Ordering::Acquire) {
+        return Ok(());
+    }
+
+    let env = ensure_jni_initialized()?;
+    let class_id = DYNAMIC_MANAGED_CLASS_ID.fetch_add(1, Ordering::Relaxed);
+    let generated = build_java_worker_dex(class_id)?;
+    output_message(&format!(
+        "[java worker] generated dex class={} size={}",
+        generated.class_name,
+        generated.dex.len()
+    ));
+    let worker_cls = load_dynamic_managed_helper_class(env, generated.dex, &generated.class_name)?;
+    output_message("[java worker] helper class loaded");
+
+    let register_natives: RegisterNativesFn = jni_fn!(env, RegisterNativesFn, JNI_REGISTER_NATIVES);
+    let native_name = CString::new("nativeLoop").unwrap();
+    let native_sig = CString::new("()V").unwrap();
+    let methods = [JniNativeMethod {
+        name: native_name.as_ptr(),
+        signature: native_sig.as_ptr(),
+        fn_ptr: native_loop,
+    }];
+    if register_natives(env, worker_cls, methods.as_ptr(), methods.len() as i32) != 0 {
+        return Err(jni_failure_with_exception(
+            env,
+            "RegisterNatives failed for Java worker nativeLoop",
+        ));
+    }
+    if let Some(exc) = jni_take_exception(env) {
+        return Err(format!("RegisterNatives failed for Java worker nativeLoop: {}", exc));
+    }
+    output_message("[java worker] nativeLoop registered");
+
+    let get_mid: GetMethodIdFn = jni_fn!(env, GetMethodIdFn, JNI_GET_METHOD_ID);
+    let new_object: NewObjectAFn = jni_fn!(env, NewObjectAFn, JNI_NEW_OBJECT_A);
+    let call_void: CallVoidMethodAFn = jni_fn!(env, CallVoidMethodAFn, JNI_CALL_VOID_METHOD_A);
+    let new_global_ref: NewGlobalRefFn = jni_fn!(env, NewGlobalRefFn, JNI_NEW_GLOBAL_REF);
+    let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+
+    let ctor_name = CString::new("<init>").unwrap();
+    let ctor_sig = CString::new("()V").unwrap();
+    let ctor = get_mid(env, worker_cls, ctor_name.as_ptr(), ctor_sig.as_ptr());
+    if ctor.is_null() {
+        return Err(jni_failure_with_exception(env, "Java worker constructor not found"));
+    }
+    if let Some(exc) = jni_take_exception(env) {
+        return Err(format!("Java worker constructor lookup failed: {}", exc));
+    }
+
+    let worker = new_object(env, worker_cls, ctor, std::ptr::null());
+    if worker.is_null() {
+        return Err(jni_failure_with_exception(env, "new Java worker thread failed"));
+    }
+    if let Some(exc) = jni_take_exception(env) {
+        return Err(format!("new Java worker thread failed: {}", exc));
+    }
+    output_message("[java worker] thread object created");
+
+    let thread_cls = find_class_safe(env, "java/lang/Thread");
+    if thread_cls.is_null() {
+        delete_local_ref(env, worker);
+        return Err("java.lang.Thread class not found".to_string());
+    }
+    let start_name = CString::new("start").unwrap();
+    let start_sig = CString::new("()V").unwrap();
+    let start_mid = get_mid(env, thread_cls, start_name.as_ptr(), start_sig.as_ptr());
+    if start_mid.is_null() {
+        let err = jni_failure_with_exception(env, "Thread.start method not found");
+        delete_local_ref(env, thread_cls);
+        delete_local_ref(env, worker);
+        return Err(err);
+    }
+    if let Some(exc) = jni_take_exception(env) {
+        delete_local_ref(env, thread_cls);
+        delete_local_ref(env, worker);
+        return Err(format!("Thread.start method lookup failed: {}", exc));
+    }
+
+    let worker_global = new_global_ref(env, worker);
+    if worker_global.is_null() {
+        let err = jni_failure_with_exception(env, "Java worker global ref creation failed");
+        delete_local_ref(env, thread_cls);
+        delete_local_ref(env, worker);
+        return Err(err);
+    }
+    if let Some(exc) = jni_take_exception(env) {
+        delete_local_ref(env, thread_cls);
+        delete_local_ref(env, worker);
+        return Err(format!("Java worker global ref creation failed: {}", exc));
+    }
+
+    output_message("[java worker] calling Thread.start");
+    call_void(env, worker, start_mid, std::ptr::null());
+    delete_local_ref(env, thread_cls);
+    delete_local_ref(env, worker);
+    if let Some(exc) = jni_take_exception(env) {
+        return Err(format!("Thread.start failed for Java worker: {}", exc));
+    }
+
+    *JAVA_WORKER_THREAD_GLOBAL.lock().unwrap_or_else(|e| e.into_inner()) = Some(worker_global as u64);
+    JAVA_WORKER_STARTED.store(true, Ordering::Release);
+    output_message(&format!(
+        "[java worker] started ART-managed worker class={}",
+        generated.class_name
+    ));
+    Ok(())
 }
 
 fn find_dynamic_managed_helper_class(class_name: &str) -> Option<*mut std::ffi::c_void> {
@@ -237,14 +431,14 @@ unsafe fn initialize_generated_string_literals(
         let field_name = CString::new(lit.field_name.as_str())
             .map_err(|_| format!("invalid generated string field name {}", lit.field_name))?;
         let field_id = get_static_field_id(env, helper_cls, field_name.as_ptr(), string_sig.as_ptr());
-        if field_id.is_null() || jni_check_exc(env) {
+        if jni_null_or_exc(env, field_id) {
             return Err(format!("generated string field {} not found", lit.field_name));
         }
 
         let value = CString::new(lit.value.as_str())
             .map_err(|_| format!("string literal for {} contains NUL byte", lit.field_name))?;
         let jstr = new_string_utf(env, value.as_ptr());
-        if jstr.is_null() || jni_check_exc(env) {
+        if jni_null_or_exc(env, jstr) {
             return Err(format!(
                 "NewStringUTF failed for generated string field {}",
                 lit.field_name
@@ -294,7 +488,7 @@ unsafe fn initialize_generated_message_queue(
     ] {
         let name = CString::new(field).unwrap();
         let fid = get_static_field_id(env, helper_cls, name.as_ptr(), int_sig.as_ptr());
-        if fid.is_null() || jni_check_exc(env) {
+        if jni_null_or_exc(env, fid) {
             return Err(format!("generated message field {} not found", field));
         }
         set_static_int_field(env, helper_cls, fid, 0);
@@ -310,11 +504,11 @@ unsafe fn initialize_generated_message_queue(
     for field in [MANAGED_MESSAGE_CODES_FIELD, MANAGED_MESSAGE_VALUES_FIELD] {
         let name = CString::new(field).unwrap();
         let fid = get_static_field_id(env, helper_cls, name.as_ptr(), int_array_sig.as_ptr());
-        if fid.is_null() || jni_check_exc(env) {
+        if jni_null_or_exc(env, fid) {
             return Err(format!("generated message array field {} not found", field));
         }
         let array = new_int_array(env, capacity);
-        if array.is_null() || jni_check_exc(env) {
+        if jni_null_or_exc(env, array) {
             return Err(format!("NewIntArray failed for generated message array {}", field));
         }
         set_static_object_field(env, helper_cls, fid, array);
@@ -330,19 +524,19 @@ unsafe fn initialize_generated_message_queue(
     let string_array_sig = CString::new("[Ljava/lang/String;").unwrap();
     let string_array_name = CString::new(MANAGED_MESSAGE_TEXTS_FIELD).unwrap();
     let string_array_fid = get_static_field_id(env, helper_cls, string_array_name.as_ptr(), string_array_sig.as_ptr());
-    if string_array_fid.is_null() || jni_check_exc(env) {
+    if jni_null_or_exc(env, string_array_fid) {
         return Err(format!(
             "generated message array field {} not found",
             MANAGED_MESSAGE_TEXTS_FIELD
         ));
     }
     let string_cls = find_class_safe(env, "java.lang.String");
-    if string_cls.is_null() || jni_check_exc(env) {
+    if jni_null_or_exc(env, string_cls) {
         return Err("java.lang.String class not found for generated message text array".to_string());
     }
     let string_array = new_object_array(env, capacity, string_cls, std::ptr::null_mut());
     delete_local_ref(env, string_cls);
-    if string_array.is_null() || jni_check_exc(env) {
+    if jni_null_or_exc(env, string_array) {
         return Err(format!(
             "NewObjectArray failed for generated message array {}",
             MANAGED_MESSAGE_TEXTS_FIELD
@@ -374,7 +568,11 @@ unsafe fn direct_buffer_range(env: JniEnv, buffer: *mut c_void, offset: i32, len
         jni_fn!(env, GetDirectBufferCapacityFn, JNI_GET_DIRECT_BUFFER_CAPACITY);
     let base = get_address(env, buffer) as *mut u8;
     let capacity = get_capacity(env, buffer);
-    if base.is_null() || capacity <= 0 || jni_check_exc(env) {
+    let range_failed = {
+        let had_exc = jni_check_exc(env);
+        base.is_null() || capacity <= 0 || had_exc
+    };
+    if range_failed {
         return None;
     }
     let offset = offset as i64;
@@ -419,7 +617,11 @@ unsafe extern "C" fn managed_dbb_copy_from_byte_array(
     let get_array_length: GetArrayLengthFn = jni_fn!(env, GetArrayLengthFn, JNI_GET_ARRAY_LENGTH);
     let get_region: GetByteArrayRegionFn = jni_fn!(env, GetByteArrayRegionFn, JNI_GET_BYTE_ARRAY_REGION);
     let src_len = get_array_length(env, src);
-    if src_len <= 0 || src_offset >= src_len || jni_check_exc(env) {
+    let src_len_failed = {
+        let had_exc = jni_check_exc(env);
+        src_len <= 0 || src_offset >= src_len || had_exc
+    };
+    if src_len_failed {
         return 0;
     }
     let Some((dst, dst_len)) = direct_buffer_range(env, buffer, dst_offset, length) else {
@@ -454,7 +656,11 @@ unsafe extern "C" fn managed_dbb_copy_to_byte_array(
     let get_array_length: GetArrayLengthFn = jni_fn!(env, GetArrayLengthFn, JNI_GET_ARRAY_LENGTH);
     let set_region: SetByteArrayRegionFn = jni_fn!(env, SetByteArrayRegionFn, JNI_SET_BYTE_ARRAY_REGION);
     let dst_len = get_array_length(env, dst);
-    if dst_len <= 0 || dst_offset >= dst_len || jni_check_exc(env) {
+    let dst_len_failed = {
+        let had_exc = jni_check_exc(env);
+        dst_len <= 0 || dst_offset >= dst_len || had_exc
+    };
+    if dst_len_failed {
         return 0;
     }
     let Some((src, src_len)) = direct_buffer_range(env, buffer, src_offset, length) else {
@@ -479,7 +685,11 @@ unsafe extern "C" fn managed_dbb_capacity(env: JniEnv, _cls: *mut c_void, buffer
     let get_capacity: GetDirectBufferCapacityFn =
         jni_fn!(env, GetDirectBufferCapacityFn, JNI_GET_DIRECT_BUFFER_CAPACITY);
     let capacity = get_capacity(env, buffer);
-    if jni_check_exc(env) || capacity < 0 {
+    let capacity_failed = {
+        let had_exc = jni_check_exc(env);
+        capacity < 0 || had_exc
+    };
+    if capacity_failed {
         return -1;
     }
     std::cmp::min(capacity, i32::MAX as i64) as i32
@@ -519,7 +729,12 @@ unsafe fn register_managed_guard_helpers(env: JniEnv, helper_cls: *mut c_void) -
             fn_ptr: managed_reentry_guard_leave as *mut c_void,
         },
     ];
-    if register_natives(env, helper_cls, methods.as_ptr(), methods.len() as i32) != 0 || jni_check_exc(env) {
+    let register_result = register_natives(env, helper_cls, methods.as_ptr(), methods.len() as i32);
+    let register_failed = {
+        let had_exc = jni_check_exc(env);
+        register_result != 0 || had_exc
+    };
+    if register_failed {
         return Err("RegisterNatives failed for managed reentrancy guard helpers".to_string());
     }
     Ok(())
@@ -568,7 +783,12 @@ unsafe fn register_direct_buffer_helpers(env: JniEnv, helper_cls: *mut c_void) -
             fn_ptr: managed_dbb_get_u8 as *mut c_void,
         },
     ];
-    if register_natives(env, helper_cls, methods.as_ptr(), methods.len() as i32) != 0 || jni_check_exc(env) {
+    let register_result = register_natives(env, helper_cls, methods.as_ptr(), methods.len() as i32);
+    let register_failed = {
+        let had_exc = jni_check_exc(env);
+        register_result != 0 || had_exc
+    };
+    if register_failed {
         return Err("RegisterNatives failed for managed DirectByteBuffer helpers".to_string());
     }
     output_message("[managedHook] registered DirectByteBuffer native helpers");
@@ -647,7 +867,7 @@ unsafe fn install_managed_method_helper(
     let helper_method_sig = CString::new(helper_method_sig_str).unwrap();
     let helper_method_name = CString::new(helper_method_name_str).unwrap();
     let helper_method_id = get_static_mid(env, helper_cls, helper_method_name.as_ptr(), helper_method_sig.as_ptr());
-    if helper_method_id.is_null() || jni_check_exc(env) {
+    if jni_null_or_exc(env, helper_method_id) {
         let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
         delete_local_ref(env, helper_cls);
         return Err(format!("managed helper {} method not found", helper_method_name_str));
@@ -662,7 +882,7 @@ unsafe fn install_managed_method_helper(
         let backup_name = CString::new(backup_name_str).unwrap();
         let backup_sig = CString::new(backup_sig_str).unwrap();
         let backup_method_id = get_static_mid(env, helper_cls, backup_name.as_ptr(), backup_sig.as_ptr());
-        if backup_method_id.is_null() || jni_check_exc(env) {
+        if jni_null_or_exc(env, backup_method_id) {
             delete_local_ref(env, helper_cls);
             return Err(format!("managed helper {} method not found", backup_name_str));
         }
@@ -680,54 +900,19 @@ unsafe fn install_managed_method_helper(
     let data_off = spec.data_offset;
     let original_access_flags = std::ptr::read_volatile((art_method as usize + spec.access_flags_offset) as *const u32);
     let original_data = std::ptr::read_volatile((art_method as usize + data_off) as *const u64);
-    let mut original_entry_point = read_entry_point(art_method, ep_offset);
+    let original_entry_point = read_entry_point(art_method, ep_offset);
     let bridge = find_art_bridge_functions(env, ep_offset);
 
-    if is_art_quick_entrypoint(original_entry_point, bridge) {
-        let compile = compile_art_method_to_quick(env, art_method, ep_offset, bridge, RequestedCompileKind::Auto);
-        output_message(&format!(
-            "[managedHook] compile original {}.{}{}: success={} compiled={} before={:#x} after={:#x} {}",
-            class_name,
-            method_name,
-            actual_sig,
-            compile.success,
-            compile.compiled,
-            compile.before,
-            compile.after,
-            compile.message
-        ));
-        original_entry_point = read_entry_point(art_method, ep_offset);
-    }
-    if is_art_quick_entrypoint(original_entry_point, bridge) {
-        return Err(format!(
-            "{}.{}{} still has shared ART entrypoint after compile",
-            class_name, method_name, actual_sig
-        ));
-    }
+    let original_is_shared_entrypoint = is_art_quick_entrypoint(original_entry_point, bridge);
 
     let helper_spec = get_art_method_spec(env, helper_art_method);
-    let helper_compile = compile_art_method_to_quick(
-        env,
-        helper_art_method,
-        helper_spec.entry_point_offset,
-        bridge,
-        RequestedCompileKind::Auto,
-    );
-    output_message(&format!(
-        "[managedHook] compile helper: success={} compiled={} before={:#x} after={:#x} {}",
-        helper_compile.success,
-        helper_compile.compiled,
-        helper_compile.before,
-        helper_compile.after,
-        helper_compile.message
-    ));
-    if is_art_quick_entrypoint(
-        read_entry_point(helper_art_method, helper_spec.entry_point_offset),
-        bridge,
-    ) {
-        return Err("managed helper still has shared ART entrypoint after compile".to_string());
-    }
     let helper_entry_point = read_entry_point(helper_art_method, helper_spec.entry_point_offset);
+    if is_art_quick_entrypoint(helper_entry_point, bridge) {
+        output_message(&format!(
+            "[managedHook] helper still uses shared ART entrypoint {:#x}; installing via ArtMethod entrypoint",
+            helper_entry_point
+        ));
+    }
     let orig_bypass_art_method = art_method;
     let class_global_ref = create_class_global_ref(env, class_name)?;
     let mut install_guard = JavaHookInstallGuard::new(
@@ -745,45 +930,83 @@ unsafe fn install_managed_method_helper(
     update_original_method_flags_for_hook(art_method, spec.access_flags_offset, original_access_flags);
     install_guard.set_original_method_mutated();
 
-    let (hook_addr, stealth_flag) =
-        super::super::art_controller::prepare_hook_target(original_entry_point, env as *mut std::ffi::c_void)
-            .map_err(|e| format!("prepare_hook_target: {}", e))?;
-    let mut hooked_target: *mut std::ffi::c_void = std::ptr::null_mut();
-    let quick_trampoline = crate::ffi::hook::hook_install_managed_direct_router(
-        hook_addr as *mut std::ffi::c_void,
-        stealth_flag,
-        env as *mut std::ffi::c_void,
-        &mut hooked_target,
-        helper_art_method,
-        helper_entry_point,
-        orig_bypass_art_method,
-        0,
-    );
-    if quick_trampoline.is_null() {
-        delete_local_ref(env, helper_cls);
-        return Err("hook_install_managed_direct_router failed".to_string());
-    }
-    super::super::art_controller::try_fixup_trampoline_pub(quick_trampoline, original_entry_point);
-    if let Some(backup_art_method) = orig_backup_art_method {
-        let orig_stub = crate::ffi::hook::hook_create_managed_orig_stub(art_method, quick_trampoline);
-        if orig_stub.is_null() {
-            delete_local_ref(env, helper_cls);
-            return Err("hook_create_managed_orig_stub failed".to_string());
-        }
-        set_orig_backup_entrypoint(
-            backup_art_method,
-            spec.size,
-            spec.access_flags_offset,
+    let (per_method_hook_target, quick_trampoline) = if original_is_shared_entrypoint {
+        set_managed_replacement_method(art_method, helper_art_method, 0);
+        install_guard.set_replacement_registered();
+        let (per_method_hook_target, _trampoline, _use_blr, _router_thunk_body) = match install_per_method_router_hook(
+            false,
+            original_entry_point,
+            &bridge,
             ep_offset,
-            orig_stub as u64,
-        )?;
-    }
-    let per_method_hook_target = if !hooked_target.is_null() {
-        Some(hooked_target as u64)
+            env,
+            art_method,
+            (original_access_flags & K_ACC_NATIVE) != 0,
+            true,
+            false,
+        ) {
+            Ok(installed) => installed,
+            Err(e) => {
+                delete_local_ref(env, helper_cls);
+                return Err(e);
+            }
+        };
+        if let Some(backup_art_method) = orig_backup_art_method {
+            let orig_stub =
+                crate::ffi::hook::hook_create_managed_orig_stub(art_method, original_entry_point as *mut c_void);
+            if orig_stub.is_null() {
+                delete_local_ref(env, helper_cls);
+                return Err("hook_create_managed_orig_stub failed for shared entrypoint".to_string());
+            }
+            set_orig_backup_entrypoint(
+                backup_art_method,
+                spec.size,
+                spec.access_flags_offset,
+                ep_offset,
+                orig_stub as u64,
+            )?;
+        }
+        (per_method_hook_target, 0)
     } else {
-        Some(hook_addr)
+        let (hook_addr, stealth_flag) =
+            super::super::art_controller::prepare_hook_target(original_entry_point, env as *mut std::ffi::c_void)
+                .map_err(|e| format!("prepare_hook_target: {}", e))?;
+        let mut hooked_target: *mut std::ffi::c_void = std::ptr::null_mut();
+        let quick_trampoline = crate::ffi::hook::hook_install_managed_direct_router(
+            hook_addr as *mut std::ffi::c_void,
+            stealth_flag,
+            env as *mut std::ffi::c_void,
+            &mut hooked_target,
+            helper_art_method,
+            helper_entry_point,
+            orig_bypass_art_method,
+            0,
+        );
+        if quick_trampoline.is_null() {
+            delete_local_ref(env, helper_cls);
+            return Err("hook_install_managed_direct_router failed".to_string());
+        }
+        super::super::art_controller::try_fixup_trampoline_pub(quick_trampoline, original_entry_point);
+        if let Some(backup_art_method) = orig_backup_art_method {
+            let orig_stub = crate::ffi::hook::hook_create_managed_orig_stub(art_method, quick_trampoline);
+            if orig_stub.is_null() {
+                delete_local_ref(env, helper_cls);
+                return Err("hook_create_managed_orig_stub failed".to_string());
+            }
+            set_orig_backup_entrypoint(
+                backup_art_method,
+                spec.size,
+                spec.access_flags_offset,
+                ep_offset,
+                orig_stub as u64,
+            )?;
+        }
+        let per_method_hook_target = if !hooked_target.is_null() {
+            Some(hooked_target as u64)
+        } else {
+            Some(hook_addr)
+        };
+        (per_method_hook_target, quick_trampoline as u64)
     };
-    let quick_trampoline = quick_trampoline as u64;
     delete_local_ref(env, helper_cls);
     let use_blr = false;
 
@@ -849,30 +1072,10 @@ unsafe fn install_count_orig_fast_path(
     let data_off = spec.data_offset;
     let original_access_flags = std::ptr::read_volatile((art_method as usize + spec.access_flags_offset) as *const u32);
     let original_data = std::ptr::read_volatile((art_method as usize + data_off) as *const u64);
-    let mut original_entry_point = read_entry_point(art_method, ep_offset);
+    let original_entry_point = read_entry_point(art_method, ep_offset);
     let bridge = find_art_bridge_functions(env, ep_offset);
 
-    if is_art_quick_entrypoint(original_entry_point, bridge) {
-        let compile = compile_art_method_to_quick(env, art_method, ep_offset, bridge, RequestedCompileKind::Auto);
-        output_message(&format!(
-            "[managedHook] compile original {}.{}{} for count-orig: success={} compiled={} before={:#x} after={:#x} {}",
-            class_name,
-            method_name,
-            actual_sig,
-            compile.success,
-            compile.compiled,
-            compile.before,
-            compile.after,
-            compile.message
-        ));
-        original_entry_point = read_entry_point(art_method, ep_offset);
-    }
-    if is_art_quick_entrypoint(original_entry_point, bridge) {
-        return Err(format!(
-            "{}.{}{} still has shared ART entrypoint after compile",
-            class_name, method_name, actual_sig
-        ));
-    }
+    let original_is_shared_entrypoint = is_art_quick_entrypoint(original_entry_point, bridge);
 
     let class_global_ref = create_class_global_ref(env, class_name)?;
     let mut install_guard = JavaHookInstallGuard::new(
@@ -890,30 +1093,38 @@ unsafe fn install_count_orig_fast_path(
     update_original_method_flags_for_hook(art_method, spec.access_flags_offset, original_access_flags);
     install_guard.set_original_method_mutated();
 
-    let (hook_addr, stealth_flag) =
-        super::super::art_controller::prepare_hook_target(original_entry_point, env as *mut std::ffi::c_void)
-            .map_err(|e| format!("prepare_hook_target: {}", e))?;
     let mut counter_ptrs = install_native_counter_ptrs(helper_class, counter_fields);
-    let mut hooked_target: *mut std::ffi::c_void = std::ptr::null_mut();
-    let quick_trampoline = crate::ffi::hook::hook_install_count_orig_router(
-        hook_addr as *mut std::ffi::c_void,
-        stealth_flag,
-        env as *mut std::ffi::c_void,
-        &mut hooked_target,
-        counter_ptrs.as_mut_ptr() as *mut *mut u64,
-        counter_ptrs.len() as u32,
-    );
-    if quick_trampoline.is_null() {
-        return Err("hook_install_count_orig_router failed".to_string());
-    }
-    super::super::art_controller::try_fixup_trampoline_pub(quick_trampoline, original_entry_point);
 
-    let per_method_hook_target = if !hooked_target.is_null() {
-        Some(hooked_target as u64)
+    let (per_method_hook_target, quick_trampoline) = if original_is_shared_entrypoint {
+        return Err(format!(
+            "count-orig native fast path for shared ART entry {}.{}{} would require external ArtMethod entry stub; disabled",
+            class_name, method_name, actual_sig
+        ));
     } else {
-        Some(hook_addr)
+        let (hook_addr, stealth_flag) =
+            super::super::art_controller::prepare_hook_target(original_entry_point, env as *mut std::ffi::c_void)
+                .map_err(|e| format!("prepare_hook_target: {}", e))?;
+        let mut hooked_target: *mut std::ffi::c_void = std::ptr::null_mut();
+        let quick_trampoline = crate::ffi::hook::hook_install_count_orig_router(
+            hook_addr as *mut std::ffi::c_void,
+            stealth_flag,
+            env as *mut std::ffi::c_void,
+            &mut hooked_target,
+            counter_ptrs.as_mut_ptr() as *mut *mut u64,
+            counter_ptrs.len() as u32,
+        );
+        if quick_trampoline.is_null() {
+            return Err("hook_install_count_orig_router failed".to_string());
+        }
+        super::super::art_controller::try_fixup_trampoline_pub(quick_trampoline, original_entry_point);
+
+        let per_method_hook_target = if !hooked_target.is_null() {
+            Some(hooked_target as u64)
+        } else {
+            Some(hook_addr)
+        };
+        (per_method_hook_target, quick_trampoline as u64)
     };
-    let quick_trampoline = quick_trampoline as u64;
     with_registry_mut(&JAVA_HOOK_REGISTRY, |registry| {
         registry.insert(
             art_method,
@@ -962,7 +1173,7 @@ unsafe fn install_count_orig_fast_path(
     Ok(quick_trampoline)
 }
 
-struct ManagedDslInstallResult {
+pub(in crate::jsapi::java) struct ManagedDslInstallResult {
     helper_class: String,
     helper_method: String,
     helper_signature: String,
@@ -974,6 +1185,22 @@ struct ManagedDslInstallResult {
     message_capacity: i32,
 }
 
+#[derive(Clone, Debug)]
+pub(in crate::jsapi::java) struct ManagedMessageItem {
+    pub code: i32,
+    pub value: i32,
+    pub text: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(in crate::jsapi::java) struct ManagedDrainResult {
+    pub items: Vec<ManagedMessageItem>,
+    pub head: i32,
+    pub tail: i32,
+    pub dropped: i32,
+    pub capacity: i32,
+}
+
 unsafe fn install_managed_dsl_inner(
     class_name: &str,
     method_name: &str,
@@ -982,7 +1209,17 @@ unsafe fn install_managed_dsl_inner(
     message_capacity: i32,
 ) -> Result<ManagedDslInstallResult, String> {
     let scoped_env = scoped_jni_env()?;
-    let env = scoped_env.env();
+    install_managed_dsl_with_env(scoped_env.env(), class_name, method_name, sig, dsl, message_capacity)
+}
+
+pub(in crate::jsapi::java) unsafe fn install_managed_dsl_with_env(
+    env: JniEnv,
+    class_name: &str,
+    method_name: &str,
+    sig: &str,
+    dsl: &str,
+    message_capacity: i32,
+) -> Result<ManagedDslInstallResult, String> {
     let (art_method, is_static) = resolve_art_method(env, class_name, method_name, sig, false)?;
     init_java_registry();
     if crate::jsapi::callback_util::with_registry(&JAVA_HOOK_REGISTRY, |r| r.contains_key(&art_method)).unwrap_or(false)
@@ -1041,8 +1278,9 @@ unsafe fn install_managed_dsl_inner(
             message_capacity,
         });
     }
+    let mut optimized_native_count_orig_installed = false;
     if optimized_native_count_orig {
-        install_count_orig_fast_path(
+        match install_count_orig_fast_path(
             env,
             class_name,
             method_name,
@@ -1051,19 +1289,29 @@ unsafe fn install_managed_dsl_inner(
             is_static,
             &helper_class,
             &generated.fast_tail_orig_counter_fields,
-        )?;
-        refresh_walkstack_sigsegv_guard();
-        return Ok(ManagedDslInstallResult {
-            helper_class,
-            helper_method,
-            helper_signature,
-            uses_orig,
-            optimized_passthrough,
-            optimized_native_count_orig,
-            counters,
-            message_channels,
-            message_capacity,
-        });
+        ) {
+            Ok(_) => {
+                optimized_native_count_orig_installed = true;
+                refresh_walkstack_sigsegv_guard();
+                return Ok(ManagedDslInstallResult {
+                    helper_class,
+                    helper_method,
+                    helper_signature,
+                    uses_orig,
+                    optimized_passthrough,
+                    optimized_native_count_orig: optimized_native_count_orig_installed,
+                    counters,
+                    message_channels,
+                    message_capacity,
+                });
+            }
+            Err(e) => {
+                output_message(&format!(
+                    "[managedHook] native count-orig fast path disabled for {}.{}{}: {}; falling back to generic DSL helper",
+                    class_name, method_name, sig, e
+                ));
+            }
+        }
     }
     let helper_cls = load_dynamic_managed_helper_class(env, generated.dex, &generated.class_name)?;
     register_managed_guard_helpers(env, helper_cls)?;
@@ -1095,11 +1343,38 @@ unsafe fn install_managed_dsl_inner(
         helper_signature,
         uses_orig,
         optimized_passthrough,
-        optimized_native_count_orig,
+        optimized_native_count_orig: optimized_native_count_orig_installed,
         counters,
         message_channels,
         message_capacity,
     })
+}
+
+unsafe fn wrap_managed_dsl_install_result(ctx: *mut ffi::JSContext, result: ManagedDslInstallResult) -> ffi::JSValue {
+    let obj = JSValue(ffi::JS_NewObject(ctx));
+    obj.set_property(ctx, "success", JSValue::bool(true));
+    obj.set_property(ctx, "helperClass", JSValue::string(ctx, &result.helper_class));
+    obj.set_property(ctx, "helperMethod", JSValue::string(ctx, &result.helper_method));
+    obj.set_property(ctx, "helperSignature", JSValue::string(ctx, &result.helper_signature));
+    obj.set_property(ctx, "usesOrig", JSValue::bool(result.uses_orig));
+    obj.set_property(ctx, "optimizedPassThrough", JSValue::bool(result.optimized_passthrough));
+    obj.set_property(
+        ctx,
+        "optimizedNativeCountOrig",
+        JSValue::bool(result.optimized_native_count_orig),
+    );
+    let counters = JSValue(ffi::JS_NewObject(ctx));
+    for counter in result.counters {
+        counters.set_property(ctx, &counter.name, JSValue::string(ctx, &counter.field_name));
+    }
+    obj.set_property(ctx, "counters", counters);
+    let messages = JSValue(ffi::JS_NewObject(ctx));
+    for channel in result.message_channels {
+        messages.set_property(ctx, &channel.name, JSValue::int(channel.code));
+    }
+    obj.set_property(ctx, "messages", messages);
+    obj.set_property(ctx, "buff", JSValue::int(result.message_capacity));
+    obj.raw()
 }
 
 unsafe fn extract_string_prop(
@@ -1237,35 +1512,20 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_managed_hook_dsl(
         Err(e) => return e,
     };
 
-    let result = match install_managed_dsl_inner(&class_name, &method_name, &sig, &dsl, message_capacity) {
-        Ok(result) => result,
-        Err(msg) => return throw_internal_error(ctx, msg),
+    let result = if crate::is_raw_clone_js_thread() {
+        match super::super::callback::managed_hook_dsl_via_executor(class_name, method_name, sig, dsl, message_capacity)
+        {
+            Ok(result) => result,
+            Err(msg) => return throw_internal_error(ctx, msg),
+        }
+    } else {
+        match install_managed_dsl_inner(&class_name, &method_name, &sig, &dsl, message_capacity) {
+            Ok(result) => result,
+            Err(msg) => return throw_internal_error(ctx, msg),
+        }
     };
 
-    let obj = JSValue(ffi::JS_NewObject(ctx));
-    obj.set_property(ctx, "success", JSValue::bool(true));
-    obj.set_property(ctx, "helperClass", JSValue::string(ctx, &result.helper_class));
-    obj.set_property(ctx, "helperMethod", JSValue::string(ctx, &result.helper_method));
-    obj.set_property(ctx, "helperSignature", JSValue::string(ctx, &result.helper_signature));
-    obj.set_property(ctx, "usesOrig", JSValue::bool(result.uses_orig));
-    obj.set_property(ctx, "optimizedPassThrough", JSValue::bool(result.optimized_passthrough));
-    obj.set_property(
-        ctx,
-        "optimizedNativeCountOrig",
-        JSValue::bool(result.optimized_native_count_orig),
-    );
-    let counters = JSValue(ffi::JS_NewObject(ctx));
-    for counter in result.counters {
-        counters.set_property(ctx, &counter.name, JSValue::string(ctx, &counter.field_name));
-    }
-    obj.set_property(ctx, "counters", counters);
-    let messages = JSValue(ffi::JS_NewObject(ctx));
-    for channel in result.message_channels {
-        messages.set_property(ctx, &channel.name, JSValue::int(channel.code));
-    }
-    obj.set_property(ctx, "messages", messages);
-    obj.set_property(ctx, "buff", JSValue::int(result.message_capacity));
-    obj.raw()
+    wrap_managed_dsl_install_result(ctx, result)
 }
 
 unsafe fn extract_helper_class_arg(
@@ -1291,10 +1551,191 @@ unsafe fn managed_static_field_id(
     let name = CString::new(name).map_err(|_| format!("invalid managed field name {}", name))?;
     let sig = CString::new(sig).map_err(|_| format!("invalid managed field sig {}", sig))?;
     let fid = get_static_field_id(env, helper_cls, name.as_ptr(), sig.as_ptr());
-    if fid.is_null() || jni_check_exc(env) {
+    if jni_null_or_exc(env, fid) {
         return Err("managed message field not found".to_string());
     }
     Ok(fid)
+}
+
+pub(in crate::jsapi::java) unsafe fn drain_managed_messages_inner(
+    env: JniEnv,
+    helper_class: &str,
+    max_items_requested: Option<i64>,
+) -> Result<ManagedDrainResult, String> {
+    let Some(helper_cls) = find_dynamic_managed_helper_class(helper_class) else {
+        return Err(format!("managed helper class not found: {}", helper_class));
+    };
+    let get_static_int_field: GetStaticIntFieldFn = jni_fn!(env, GetStaticIntFieldFn, JNI_GET_STATIC_INT_FIELD);
+    let set_static_int_field: SetStaticIntFieldFn = jni_fn!(env, SetStaticIntFieldFn, JNI_SET_STATIC_INT_FIELD);
+    let get_static_object_field: GetStaticObjectFieldFn =
+        jni_fn!(env, GetStaticObjectFieldFn, JNI_GET_STATIC_OBJECT_FIELD);
+    let get_array_length: GetArrayLengthFn = jni_fn!(env, GetArrayLengthFn, JNI_GET_ARRAY_LENGTH);
+    let get_int_array_region: GetIntArrayRegionFn = jni_fn!(env, GetIntArrayRegionFn, JNI_GET_INT_ARRAY_REGION);
+    let get_object_array_element: GetObjectArrayElementFn =
+        jni_fn!(env, GetObjectArrayElementFn, JNI_GET_OBJECT_ARRAY_ELEMENT);
+    let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+
+    let head_fid = managed_static_field_id(env, helper_cls, MANAGED_MESSAGE_HEAD_FIELD, "I")?;
+    let tail_fid = managed_static_field_id(env, helper_cls, MANAGED_MESSAGE_TAIL_FIELD, "I")?;
+    let dropped_fid = managed_static_field_id(env, helper_cls, MANAGED_MESSAGE_DROPPED_FIELD, "I")?;
+    let codes_fid = managed_static_field_id(env, helper_cls, MANAGED_MESSAGE_CODES_FIELD, "[I")?;
+    let values_fid = managed_static_field_id(env, helper_cls, MANAGED_MESSAGE_VALUES_FIELD, "[I")?;
+    let texts_fid = managed_static_field_id(env, helper_cls, MANAGED_MESSAGE_TEXTS_FIELD, "[Ljava/lang/String;")?;
+
+    let head = get_static_int_field(env, helper_cls, head_fid);
+    let tail = get_static_int_field(env, helper_cls, tail_fid);
+    let dropped = get_static_int_field(env, helper_cls, dropped_fid);
+    if jni_check_exc(env) {
+        return Err("managedDrainMessages failed to read queue counters".to_string());
+    }
+    let codes_array = get_static_object_field(env, helper_cls, codes_fid);
+    let values_array = get_static_object_field(env, helper_cls, values_fid);
+    let texts_array = get_static_object_field(env, helper_cls, texts_fid);
+    let arrays_failed = {
+        let had_exc = jni_check_exc(env);
+        codes_array.is_null() || values_array.is_null() || texts_array.is_null() || had_exc
+    };
+    if arrays_failed {
+        return Err("managedDrainMessages message arrays are not initialized".to_string());
+    }
+
+    struct LocalArrayRefs {
+        env: JniEnv,
+        delete_local_ref: DeleteLocalRefFn,
+        codes: *mut std::ffi::c_void,
+        values: *mut std::ffi::c_void,
+        texts: *mut std::ffi::c_void,
+    }
+    impl Drop for LocalArrayRefs {
+        fn drop(&mut self) {
+            unsafe {
+                if !self.codes.is_null() {
+                    (self.delete_local_ref)(self.env, self.codes);
+                }
+                if !self.values.is_null() {
+                    (self.delete_local_ref)(self.env, self.values);
+                }
+                if !self.texts.is_null() {
+                    (self.delete_local_ref)(self.env, self.texts);
+                }
+            }
+        }
+    }
+    let _array_refs = LocalArrayRefs {
+        env,
+        delete_local_ref,
+        codes: codes_array,
+        values: values_array,
+        texts: texts_array,
+    };
+
+    let capacity = get_array_length(env, codes_array)
+        .min(get_array_length(env, values_array))
+        .min(get_array_length(env, texts_array));
+    let capacity_failed = {
+        let had_exc = jni_check_exc(env);
+        capacity <= 0 || had_exc
+    };
+    if capacity_failed {
+        return Err("managedDrainMessages message arrays have invalid capacity".to_string());
+    }
+    let available = (head as i64 - tail as i64).clamp(0, capacity as i64) as i32;
+    let max_items = max_items_requested
+        .map(|value| value.clamp(0, capacity as i64) as i32)
+        .unwrap_or(capacity);
+    let count = available.min(max_items);
+
+    let mut items = Vec::with_capacity(count.max(0) as usize);
+    if count > 0 {
+        let mut codes = vec![0i32; capacity as usize];
+        let mut values = vec![0i32; capacity as usize];
+        get_int_array_region(env, codes_array, 0, capacity, codes.as_mut_ptr());
+        get_int_array_region(env, values_array, 0, capacity, values.as_mut_ptr());
+        if jni_check_exc(env) {
+            return Err("managedDrainMessages failed to read message arrays".to_string());
+        }
+        let mask = capacity - 1;
+        for i in 0..count {
+            let slot = ((tail + i) & mask) as usize;
+            let text_obj = get_object_array_element(env, texts_array, slot as i32);
+            let text_failed = jni_null_or_exc(env, text_obj);
+            let text = if !text_failed {
+                let text = super::super::try_read_jstring(env as u64, text_obj as u64);
+                delete_local_ref(env, text_obj);
+                text
+            } else {
+                None
+            };
+            items.push(ManagedMessageItem {
+                code: codes[slot],
+                value: values[slot],
+                text,
+            });
+        }
+    }
+
+    let new_tail = tail.wrapping_add(count);
+    set_static_int_field(env, helper_cls, tail_fid, new_tail);
+    if jni_check_exc(env) {
+        return Err("managedDrainMessages failed to update queue tail".to_string());
+    }
+
+    Ok(ManagedDrainResult {
+        items,
+        head,
+        tail: new_tail,
+        dropped,
+        capacity,
+    })
+}
+
+pub(in crate::jsapi::java) unsafe fn read_managed_counter_inner(
+    env: JniEnv,
+    helper_class: &str,
+    field_name: &str,
+) -> Result<u64, String> {
+    if let Some(value) = read_native_counter(helper_class, field_name) {
+        return Ok(value);
+    }
+    let Some(helper_cls) = find_dynamic_managed_helper_class(helper_class) else {
+        return Err(format!("managed helper class not found: {}", helper_class));
+    };
+    let get_static_field_id: GetStaticFieldIdFn = jni_fn!(env, GetStaticFieldIdFn, JNI_GET_STATIC_FIELD_ID);
+    let get_static_int_field: GetStaticIntFieldFn = jni_fn!(env, GetStaticIntFieldFn, JNI_GET_STATIC_INT_FIELD);
+    let field_name =
+        CString::new(field_name).map_err(|_| "managedReadCounter fieldName contains NUL byte".to_string())?;
+    let int_sig = CString::new("I").unwrap();
+    let field_id = get_static_field_id(env, helper_cls, field_name.as_ptr(), int_sig.as_ptr());
+    if jni_null_or_exc(env, field_id) {
+        return Err("managedReadCounter counter field not found".to_string());
+    }
+    let value = get_static_int_field(env, helper_cls, field_id);
+    if jni_check_exc(env) {
+        return Err("managedReadCounter GetStaticIntField failed".to_string());
+    }
+    Ok(value as u32 as u64)
+}
+
+unsafe fn wrap_managed_drain_result(ctx: *mut ffi::JSContext, result: ManagedDrainResult) -> ffi::JSValue {
+    let arr = ffi::JS_NewArray(ctx);
+    for (i, message) in result.items.into_iter().enumerate() {
+        let item = JSValue(ffi::JS_NewObject(ctx));
+        item.set_property(ctx, "code", JSValue::int(message.code));
+        if let Some(text) = message.text {
+            let value = JSValue::string(ctx, &text);
+            item.set_property(ctx, "value", value);
+            item.set_property(ctx, "text", JSValue::string(ctx, &text));
+        } else {
+            item.set_property(ctx, "value", JSValue::int(message.value));
+        }
+        ffi::JS_SetPropertyUint32(ctx, arr, i as u32, item.raw());
+    }
+    let out = JSValue(arr);
+    out.set_property(ctx, "head", JSValue::int(result.head));
+    out.set_property(ctx, "tail", JSValue::int(result.tail));
+    out.set_property(ctx, "dropped", JSValue::int(result.dropped));
+    out.set_property(ctx, "capacity", JSValue::int(result.capacity));
+    out.raw()
 }
 
 pub(in crate::jsapi::java) unsafe extern "C" fn js_managed_drain_messages(
@@ -1318,125 +1759,22 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_managed_drain_messages(
     } else {
         None
     };
-    let Some(helper_cls) = find_dynamic_managed_helper_class(&helper_class) else {
-        return throw_internal_error(ctx, format!("managed helper class not found: {}", helper_class));
-    };
-    let scoped_env = match scoped_jni_env() {
-        Ok(env) => env,
-        Err(msg) => return throw_internal_error(ctx, msg),
-    };
-    let env = scoped_env.env();
-    let get_static_int_field: GetStaticIntFieldFn = jni_fn!(env, GetStaticIntFieldFn, JNI_GET_STATIC_INT_FIELD);
-    let set_static_int_field: SetStaticIntFieldFn = jni_fn!(env, SetStaticIntFieldFn, JNI_SET_STATIC_INT_FIELD);
-    let get_static_object_field: GetStaticObjectFieldFn =
-        jni_fn!(env, GetStaticObjectFieldFn, JNI_GET_STATIC_OBJECT_FIELD);
-    let get_array_length: GetArrayLengthFn = jni_fn!(env, GetArrayLengthFn, JNI_GET_ARRAY_LENGTH);
-    let get_int_array_region: GetIntArrayRegionFn = jni_fn!(env, GetIntArrayRegionFn, JNI_GET_INT_ARRAY_REGION);
-    let get_object_array_element: GetObjectArrayElementFn =
-        jni_fn!(env, GetObjectArrayElementFn, JNI_GET_OBJECT_ARRAY_ELEMENT);
-    let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
-
-    let head_fid = match managed_static_field_id(env, helper_cls, MANAGED_MESSAGE_HEAD_FIELD, "I") {
-        Ok(fid) => fid,
-        Err(msg) => return throw_internal_error(ctx, msg),
-    };
-    let tail_fid = match managed_static_field_id(env, helper_cls, MANAGED_MESSAGE_TAIL_FIELD, "I") {
-        Ok(fid) => fid,
-        Err(msg) => return throw_internal_error(ctx, msg),
-    };
-    let dropped_fid = match managed_static_field_id(env, helper_cls, MANAGED_MESSAGE_DROPPED_FIELD, "I") {
-        Ok(fid) => fid,
-        Err(msg) => return throw_internal_error(ctx, msg),
-    };
-    let codes_fid = match managed_static_field_id(env, helper_cls, MANAGED_MESSAGE_CODES_FIELD, "[I") {
-        Ok(fid) => fid,
-        Err(msg) => return throw_internal_error(ctx, msg),
-    };
-    let values_fid = match managed_static_field_id(env, helper_cls, MANAGED_MESSAGE_VALUES_FIELD, "[I") {
-        Ok(fid) => fid,
-        Err(msg) => return throw_internal_error(ctx, msg),
-    };
-    let texts_fid = match managed_static_field_id(env, helper_cls, MANAGED_MESSAGE_TEXTS_FIELD, "[Ljava/lang/String;") {
-        Ok(fid) => fid,
-        Err(msg) => return throw_internal_error(ctx, msg),
-    };
-
-    let head = get_static_int_field(env, helper_cls, head_fid);
-    let tail = get_static_int_field(env, helper_cls, tail_fid);
-    let dropped = get_static_int_field(env, helper_cls, dropped_fid);
-    if jni_check_exc(env) {
-        return throw_internal_error(ctx, "managedDrainMessages failed to read queue counters");
-    }
-    let codes_array = get_static_object_field(env, helper_cls, codes_fid);
-    let values_array = get_static_object_field(env, helper_cls, values_fid);
-    let texts_array = get_static_object_field(env, helper_cls, texts_fid);
-    if codes_array.is_null() || values_array.is_null() || texts_array.is_null() || jni_check_exc(env) {
-        return throw_internal_error(ctx, "managedDrainMessages message arrays are not initialized");
-    }
-    let capacity = get_array_length(env, codes_array)
-        .min(get_array_length(env, values_array))
-        .min(get_array_length(env, texts_array));
-    if capacity <= 0 || jni_check_exc(env) {
-        delete_local_ref(env, codes_array);
-        delete_local_ref(env, values_array);
-        delete_local_ref(env, texts_array);
-        return throw_internal_error(ctx, "managedDrainMessages message arrays have invalid capacity");
-    }
-    let available = (head as i64 - tail as i64).clamp(0, capacity as i64) as i32;
-    let max_items = max_items_requested
-        .map(|value| value.clamp(0, capacity as i64) as i32)
-        .unwrap_or(capacity);
-    let count = available.min(max_items);
-
-    let arr = ffi::JS_NewArray(ctx);
-    if count > 0 {
-        let mut codes = vec![0i32; capacity as usize];
-        let mut values = vec![0i32; capacity as usize];
-        get_int_array_region(env, codes_array, 0, capacity, codes.as_mut_ptr());
-        get_int_array_region(env, values_array, 0, capacity, values.as_mut_ptr());
-        if jni_check_exc(env) {
-            delete_local_ref(env, codes_array);
-            delete_local_ref(env, values_array);
-            delete_local_ref(env, texts_array);
-            return throw_internal_error(ctx, "managedDrainMessages failed to read message arrays");
+    let result = if crate::is_raw_clone_js_thread() {
+        match super::super::callback::managed_drain_messages_via_executor(helper_class, max_items_requested) {
+            Ok(value) => value,
+            Err(msg) => return throw_internal_error(ctx, msg),
         }
-        let mask = capacity - 1;
-        for i in 0..count {
-            let slot = ((tail + i) & mask) as usize;
-            let item = JSValue(ffi::JS_NewObject(ctx));
-            item.set_property(ctx, "code", JSValue::int(codes[slot]));
-            let text_obj = get_object_array_element(env, texts_array, slot as i32);
-            if !text_obj.is_null() && !jni_check_exc(env) {
-                if let Some(text) = unsafe { super::super::try_read_jstring(env as u64, text_obj as u64) } {
-                    let value = JSValue::string(ctx, &text);
-                    item.set_property(ctx, "value", value);
-                    item.set_property(ctx, "text", JSValue::string(ctx, &text));
-                } else {
-                    item.set_property(ctx, "value", JSValue::int(values[slot]));
-                }
-                delete_local_ref(env, text_obj);
-            } else {
-                jni_check_exc(env);
-                item.set_property(ctx, "value", JSValue::int(values[slot]));
-            }
-            ffi::JS_SetPropertyUint32(ctx, arr, i as u32, item.raw());
+    } else {
+        let scoped_env = match scoped_jni_env() {
+            Ok(env) => env,
+            Err(msg) => return throw_internal_error(ctx, msg),
+        };
+        match drain_managed_messages_inner(scoped_env.env(), &helper_class, max_items_requested) {
+            Ok(value) => value,
+            Err(msg) => return throw_internal_error(ctx, msg),
         }
-    }
-    delete_local_ref(env, codes_array);
-    delete_local_ref(env, values_array);
-    delete_local_ref(env, texts_array);
-    let new_tail = tail.wrapping_add(count);
-    set_static_int_field(env, helper_cls, tail_fid, new_tail);
-    if jni_check_exc(env) {
-        return throw_internal_error(ctx, "managedDrainMessages failed to update queue tail");
-    }
-
-    let out = JSValue(arr);
-    out.set_property(ctx, "head", JSValue::int(head));
-    out.set_property(ctx, "tail", JSValue::int(new_tail));
-    out.set_property(ctx, "dropped", JSValue::int(dropped));
-    out.set_property(ctx, "capacity", JSValue::int(capacity));
-    out.raw()
+    };
+    wrap_managed_drain_result(ctx, result)
 }
 
 pub(in crate::jsapi::java) unsafe extern "C" fn js_managed_read_counter(
@@ -1457,28 +1795,20 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_managed_read_counter(
     if let Some(value) = read_native_counter(&helper_class, &field_name) {
         return ffi::JS_NewBigUint64(ctx, value);
     }
-    let Some(helper_cls) = find_dynamic_managed_helper_class(&helper_class) else {
-        return throw_internal_error(ctx, format!("managed helper class not found: {}", helper_class));
+    let value = if crate::is_raw_clone_js_thread() {
+        match super::super::callback::managed_read_counter_via_executor(helper_class, field_name) {
+            Ok(value) => value,
+            Err(msg) => return throw_internal_error(ctx, msg),
+        }
+    } else {
+        let scoped_env = match scoped_jni_env() {
+            Ok(env) => env,
+            Err(msg) => return throw_internal_error(ctx, msg),
+        };
+        match read_managed_counter_inner(scoped_env.env(), &helper_class, &field_name) {
+            Ok(value) => value,
+            Err(msg) => return throw_internal_error(ctx, msg),
+        }
     };
-    let scoped_env = match scoped_jni_env() {
-        Ok(env) => env,
-        Err(msg) => return throw_internal_error(ctx, msg),
-    };
-    let env = scoped_env.env();
-    let get_static_field_id: GetStaticFieldIdFn = jni_fn!(env, GetStaticFieldIdFn, JNI_GET_STATIC_FIELD_ID);
-    let get_static_int_field: GetStaticIntFieldFn = jni_fn!(env, GetStaticIntFieldFn, JNI_GET_STATIC_INT_FIELD);
-    let field_name = match CString::new(field_name.as_str()) {
-        Ok(value) => value,
-        Err(_) => return throw_internal_error(ctx, "managedReadCounter fieldName contains NUL byte"),
-    };
-    let int_sig = CString::new("I").unwrap();
-    let field_id = get_static_field_id(env, helper_cls, field_name.as_ptr(), int_sig.as_ptr());
-    if field_id.is_null() || jni_check_exc(env) {
-        return throw_internal_error(ctx, "managedReadCounter counter field not found");
-    }
-    let value = get_static_int_field(env, helper_cls, field_id);
-    if jni_check_exc(env) {
-        return throw_internal_error(ctx, "managedReadCounter GetStaticIntField failed");
-    }
-    ffi::JS_NewBigUint64(ctx, value as u32 as u64)
+    ffi::JS_NewBigUint64(ctx, value)
 }

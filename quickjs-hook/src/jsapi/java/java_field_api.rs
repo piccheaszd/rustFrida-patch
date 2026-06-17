@@ -225,6 +225,10 @@ pub(super) unsafe extern "C" fn js_java_get_field(
         }
     };
 
+    if crate::is_raw_clone_js_thread() {
+        return direct_get_field_via_executor(ctx, obj_ptr, class_name, field_name, field_sig);
+    }
+
     // Get thread-safe JNIEnv*
     let env = match get_thread_env() {
         Ok(e) => e,
@@ -271,7 +275,7 @@ pub(super) unsafe extern "C" fn js_java_get_field(
     };
 
     let field_id = get_field_id(env, cls, c_field.as_ptr(), c_sig.as_ptr());
-    if field_id.is_null() || jni_check_exc(env) {
+    if jni_null_or_exc(env, field_id) {
         delete_local_ref(env, local_obj);
         delete_local_ref(env, cls);
         let err = CString::new(format!(
@@ -328,7 +332,7 @@ pub(super) unsafe extern "C" fn js_java_get_field(
 unsafe fn lookup_field_in_cache(
     class_name: &str,
     field_name: &str,
-) -> Option<(String, *mut std::ffi::c_void, bool, String)> {
+) -> Option<(String, *mut std::ffi::c_void, u32, bool, String)> {
     let guard = FIELD_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let cache = guard.as_ref()?;
     let class_fields = cache.get(class_name)?;
@@ -341,7 +345,13 @@ unsafe fn lookup_field_in_cache(
         Some(b'[') => info.jni_sig.clone(),
         _ => String::new(),
     };
-    Some((info.jni_sig.clone(), info.field_id, info.is_static, tn))
+    Some((
+        info.jni_sig.clone(),
+        info.field_id,
+        info.field_offset,
+        info.is_static,
+        tn,
+    ))
 }
 
 /// Check if a class is already in FIELD_CACHE.
@@ -386,6 +396,11 @@ unsafe fn get_runtime_class_name(env: JniEnv, obj: *mut std::ffi::c_void) -> Opt
     rel_str(env, name_jstr, chars);
     delete_local_ref(env, name_jstr);
     Some(name)
+}
+
+unsafe fn local_ref_for_field_object(env: JniEnv, obj_ptr: u64) -> *mut std::ffi::c_void {
+    let new_local_ref: NewLocalRefFn = jni_fn!(env, NewLocalRefFn, JNI_NEW_LOCAL_REF);
+    new_local_ref(env, obj_ptr as *mut std::ffi::c_void)
 }
 
 /// 写入字段值的核心分发（实例字段和静态字段共用）
@@ -531,10 +546,14 @@ unsafe fn write_instance_field(
     field_id: *mut std::ffi::c_void,
     value: JSValue,
 ) -> bool {
-    let new_local_ref: NewLocalRefFn = jni_fn!(env, NewLocalRefFn, JNI_NEW_LOCAL_REF);
+    if crate::is_raw_clone_js_thread() {
+        crate::jsapi::console::output_verbose("[field write] raw clone direct instance write is disabled");
+        return false;
+    }
+
     let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
 
-    let local_obj = new_local_ref(env, obj_ptr as *mut std::ffi::c_void);
+    let local_obj = local_ref_for_field_object(env, obj_ptr);
     if local_obj.is_null() {
         return false;
     }
@@ -555,6 +574,11 @@ unsafe fn write_static_field(
     field_id: *mut std::ffi::c_void,
     value: JSValue,
 ) -> bool {
+    if crate::is_raw_clone_js_thread() {
+        crate::jsapi::console::output_verbose("[field write] raw clone direct static write is disabled");
+        return false;
+    }
+
     let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
     let cls = find_class_safe(env, class_name);
     if cls.is_null() {
@@ -599,6 +623,7 @@ unsafe fn make_field_meta_obj(
     obj_val.set_property(ctx, "sig", JSValue::string(ctx, sig));
     obj_val.set_property(ctx, "st", JSValue::bool(is_static));
     obj_val.set_property(ctx, "cls", JSValue::string(ctx, class_name));
+    obj_val.set_property(ctx, "off", JSValue::int(art_field_offset(field_id).unwrap_or(0) as i32));
     obj
 }
 
@@ -626,6 +651,14 @@ pub(super) unsafe extern "C" fn js_java_field_meta(
         None => return ffi::qjs_undefined(),
     };
 
+    let raw_clone = crate::is_raw_clone_js_thread();
+    if raw_clone {
+        crate::jsapi::console::output_verbose(&format!(
+            "[field meta] raw clone resolve {}.{} argc={}",
+            class_name, field_name, argc
+        ));
+        return super::callback::field_meta_via_executor(ctx, class_name, field_name);
+    }
     let env = match get_thread_env() {
         Ok(e) => e,
         Err(_) => return ffi::qjs_undefined(),
@@ -637,11 +670,11 @@ pub(super) unsafe extern "C" fn js_java_field_meta(
     }
 
     // 查找声明类
-    if let Some((sig, field_id, is_static, _)) = lookup_field_in_cache(&class_name, &field_name) {
+    if let Some((sig, field_id, _field_offset, is_static, _)) = lookup_field_in_cache(&class_name, &field_name) {
         return make_field_meta_obj(ctx, field_id, &sig, is_static, &class_name);
     }
 
-    // Runtime class fallback（需要 objPtr）
+    // Runtime class fallback（需要 objPtr）。
     if argc >= 3 {
         use crate::jsapi::ptr::get_native_pointer_addr;
         let obj_arg = JSValue(*argv.add(2));
@@ -660,7 +693,9 @@ pub(super) unsafe extern "C" fn js_java_field_meta(
                         if !is_class_cached(rt_cls) {
                             cache_fields_for_class(env, rt_cls);
                         }
-                        if let Some((sig, field_id, is_static, _)) = lookup_field_in_cache(rt_cls, &field_name) {
+                        if let Some((sig, field_id, _field_offset, is_static, _)) =
+                            lookup_field_in_cache(rt_cls, &field_name)
+                        {
                             delete_local_ref(env, local_obj);
                             return make_field_meta_obj(ctx, field_id, &sig, is_static, rt_cls);
                         }
@@ -708,14 +743,41 @@ pub(super) unsafe extern "C" fn js_java_read_field(
         None => return ffi::qjs_undefined(),
     };
 
+    let type_name = type_name_from_sig(&sig);
+    let mode = ObjectFieldMode::WrappedProxy { type_name };
+    let obj_ptr = get_native_pointer_addr(ctx, obj_arg)
+        .or_else(|| obj_arg.to_u64(ctx))
+        .unwrap_or(0);
+    let obj_is_global = if argc >= 6 {
+        JSValue(*argv.add(5)).to_bool().unwrap_or(false)
+    } else {
+        false
+    };
+
+    if crate::is_raw_clone_js_thread() {
+        if is_static || obj_is_global {
+            return super::callback::field_read_via_executor(
+                ctx,
+                obj_ptr,
+                obj_is_global,
+                cls_name,
+                field_id as u64,
+                sig,
+                is_static,
+            );
+        }
+        return ffi::JS_ThrowInternalError(
+            ctx,
+            b"raw clone field read requires an executor global-ref target\0".as_ptr() as *const _,
+        );
+    }
+
     let env = match get_thread_env() {
         Ok(e) => e,
         Err(_) => return ffi::qjs_undefined(),
     };
 
     let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
-    let type_name = type_name_from_sig(&sig);
-    let mode = ObjectFieldMode::WrappedProxy { type_name };
 
     if is_static {
         let cls = find_class_safe(env, &cls_name);
@@ -727,14 +789,10 @@ pub(super) unsafe extern "C" fn js_java_read_field(
         delete_local_ref(env, cls);
         result
     } else {
-        let obj_ptr = get_native_pointer_addr(ctx, obj_arg)
-            .or_else(|| obj_arg.to_u64(ctx))
-            .unwrap_or(0);
         if obj_ptr == 0 {
             return ffi::qjs_undefined();
         }
-        let new_local_ref: NewLocalRefFn = jni_fn!(env, NewLocalRefFn, JNI_NEW_LOCAL_REF);
-        let local_obj = new_local_ref(env, obj_ptr as *mut std::ffi::c_void);
+        let local_obj = local_ref_for_field_object(env, obj_ptr);
         if local_obj.is_null() {
             return ffi::qjs_undefined();
         }
@@ -765,6 +823,11 @@ pub(super) unsafe extern "C" fn js_java_write_field(
     let static_arg = JSValue(*argv.add(3));
     let cls_arg = JSValue(*argv.add(4));
     let value_arg = JSValue(*argv.add(5));
+    let obj_is_global = if argc >= 7 {
+        JSValue(*argv.add(6)).to_bool().unwrap_or(false)
+    } else {
+        false
+    };
 
     let field_id = id_arg.to_u64(ctx).unwrap_or(0) as *mut std::ffi::c_void;
     if field_id.is_null() {
@@ -780,18 +843,51 @@ pub(super) unsafe extern "C" fn js_java_write_field(
         None => return ffi::qjs_undefined(),
     };
 
-    let env = match get_thread_env() {
-        Ok(e) => e,
-        Err(_) => return ffi::qjs_undefined(),
-    };
-
     if is_static {
+        if crate::is_raw_clone_js_thread() {
+            return super::callback::field_write_via_executor(
+                ctx,
+                0,
+                false,
+                cls_name,
+                field_id as u64,
+                sig,
+                true,
+                value_arg,
+            );
+        }
+        let env = match get_thread_env() {
+            Ok(e) => e,
+            Err(_) => return ffi::qjs_undefined(),
+        };
         write_static_field(ctx, env, &cls_name, &sig, field_id, value_arg);
     } else {
         let obj_ptr = get_native_pointer_addr(ctx, obj_arg)
             .or_else(|| obj_arg.to_u64(ctx))
             .unwrap_or(0);
         if obj_ptr != 0 {
+            if crate::is_raw_clone_js_thread() {
+                if obj_is_global {
+                    return super::callback::field_write_via_executor(
+                        ctx,
+                        obj_ptr,
+                        true,
+                        cls_name,
+                        field_id as u64,
+                        sig,
+                        false,
+                        value_arg,
+                    );
+                }
+                return ffi::JS_ThrowInternalError(
+                    ctx,
+                    b"raw clone field write requires an executor global-ref target\0".as_ptr() as *const _,
+                );
+            }
+            let env = match get_thread_env() {
+                Ok(e) => e,
+                Err(_) => return ffi::qjs_undefined(),
+            };
             write_instance_field(ctx, env, obj_ptr, &sig, field_id, value_arg);
         }
     }

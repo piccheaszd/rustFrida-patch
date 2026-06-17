@@ -10,7 +10,6 @@
 
 #include <stdint.h>
 #include <stddef.h>
-#include <pthread.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -76,6 +75,10 @@ typedef struct HookRedirectEntry {
 #define EXEC_POOL_SIZE (64 * 1024)  /* 每个 pool 64KB */
 
 typedef struct {
+    volatile int state;             /* 0=unlocked, 1=locked */
+} HookLock;
+
+typedef struct {
     void* base;
     size_t size;
     size_t used;
@@ -91,7 +94,7 @@ typedef struct {
     HookEntry* hooks;               /* Linked list of hooks */
     HookEntry* free_list;           /* Freed entries for reuse */
     HookRedirectEntry* redirects;   /* Linked list of redirect hooks */
-    pthread_mutex_t lock;           /* Thread safety lock */
+    HookLock lock;                  /* Thread safety lock without libc pthread */
     size_t exec_mem_page_size;      /* Page size for mprotect */
     int initialized;                /* Initialization flag */
 } HookEngine;
@@ -142,6 +145,19 @@ int hook_remove(void* target);
  * @return              Trampoline address, NULL if not found
  */
 void* hook_get_trampoline(void* target);
+
+/*
+ * Mark an already-installed hook as recomp-backed.
+ *
+ * The hook target is an anonymous recomp slot; removal/cleanup must not
+ * restore it as a normal inline patch because the recomp layer owns route
+ * activation and rollback.
+ */
+int hook_mark_recomp_hook(void* target);
+
+/* Same as hook_mark_recomp_hook(), but finds the hook by its trampoline.
+ * Useful for recomp callers that receive the trampoline after hook_install. */
+int hook_mark_recomp_hook_by_trampoline(void* trampoline);
 
 /*
  * Cleanup and free all hooks
@@ -544,6 +560,14 @@ void* hook_install_count_orig_router(void* target,
                                      void** out_hooked_target,
                                      volatile uint64_t** counters,
                                      uint32_t counter_count);
+
+/*
+ * Create a standalone count+orig stub for methods whose entry_point_ is a
+ * shared ART bridge and therefore cannot be safely inline-patched.
+ */
+void* hook_create_count_orig_stub(uint64_t fallback_target,
+                                  volatile uint64_t** counters,
+                                  uint32_t counter_count);
 
 void* hook_install_managed_direct_entrypoint(void* target,
                                              void* jni_env,

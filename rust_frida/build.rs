@@ -1,21 +1,58 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 fn main() {
-    let target = std::env::var("TARGET").expect("TARGET not set");
+    let target = std::env::var("TARGET").unwrap_or_default();
     let profile = std::env::var("PROFILE").expect("PROFILE not set");
-    let manifest_dir =
-        std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
+    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
     let workspace_root = manifest_dir.parent().expect("rust_frida must be inside workspace root");
     let profile_dir = if profile == "release" { "release" } else { "debug" };
     let noptrace = std::env::var_os("CARGO_FEATURE_NOPTRACE").is_some();
-    let release_flag = if profile_dir == "release" { " --release" } else { "" };
-    let agent_feature_flag = if noptrace {
-        " --no-default-features --features quickjs,noptrace"
-    } else {
-        ""
-    };
-    let agent_build_flag = format!("{}{}", release_flag, agent_feature_flag);
+
+    let loader_inputs = [
+        "loader/build_helpers.py",
+        "loader/helpers/bootstrapper.c",
+        "loader/helpers/elf-parser.c",
+        "loader/helpers/elf-parser.h",
+        "loader/helpers/helper.lds",
+        "loader/helpers/inject-context.h",
+        "loader/helpers/nolibc-compat.h",
+        "loader/helpers/rustfrida-loader.c",
+        "loader/helpers/syscall.c",
+        "loader/helpers/syscall.h",
+    ];
+    for input in loader_inputs {
+        println!("cargo:rerun-if-changed=../{}", input);
+    }
+
+    let loader_bootstrapper = workspace_root.join("loader").join("build").join("bootstrapper.bin");
+    let loader_blob = workspace_root.join("loader").join("build").join("rustfrida-loader.bin");
+    if target == "aarch64-linux-android" && helpers_are_stale(workspace_root) {
+        let status = std::process::Command::new("python3")
+            .arg(workspace_root.join("loader/build_helpers.py"))
+            .current_dir(workspace_root)
+            .status()
+            .expect("failed to run loader/build_helpers.py");
+        if !status.success() {
+            panic!("loader/build_helpers.py failed with status {}", status);
+        }
+    }
+    ensure_generated_blob(&loader_bootstrapper, "python3 loader/build_helpers.py");
+    ensure_generated_blob(&loader_blob, "python3 loader/build_helpers.py");
+
+    let zymbiote_sources = [
+        "zymbiote/build.sh",
+        "zymbiote/zymbiote.c",
+        "zymbiote/zymbiote_pure.c",
+        "zymbiote/zymbiote_restore.c",
+    ];
+    for input in zymbiote_sources {
+        println!("cargo:rerun-if-changed=../{}", input);
+    }
+    println!("cargo:rerun-if-changed=../zymbiote/build/zymbiote.elf");
+    println!("cargo:rerun-if-changed=../zymbiote/build/zymbiote-pure.elf");
+    println!("cargo:rerun-if-changed=../zymbiote/build/zymbiote-restore.elf");
+
     let target_profile_dir = workspace_root.join("target").join(&target).join(profile_dir);
     let built_agent_so = target_profile_dir.join("libagent.so");
     let built_agent_feature_marker = target_profile_dir.join("libagent.features");
@@ -23,30 +60,10 @@ fn main() {
     let agent_so = target_profile_dir.join(format!("libagent.{}.so", agent_variant));
     let agent_feature_marker = target_profile_dir.join(format!("libagent.{}.features", agent_variant));
 
-    // 当 agent.so 变化时重新编译 host（include_bytes! 缓存问题）
-    println!("cargo::rerun-if-changed={}", agent_so.display());
-    println!("cargo::rerun-if-changed={}", agent_feature_marker.display());
-    println!("cargo::rerun-if-changed={}", built_agent_so.display());
-    println!("cargo::rerun-if-changed={}", built_agent_feature_marker.display());
-    println!("cargo::rerun-if-changed=../loader/build/bootstrapper.bin");
-    println!("cargo::rerun-if-changed=../loader/build/rustfrida-loader.bin");
-    println!("cargo::rerun-if-changed=../zymbiote/build/zymbiote.elf");
-    println!("cargo::rerun-if-changed=../zymbiote/build/zymbiote-pure.elf");
-    println!("cargo::rerun-if-changed=../zymbiote/build/zymbiote-restore.elf");
-
-    let loader_build_script = workspace_root.join("loader").join("build_helpers.py");
-    let loader_helpers = workspace_root.join("loader").join("helpers");
-    let loader_bootstrapper = workspace_root.join("loader").join("build").join("bootstrapper.bin");
-    let loader_blob = workspace_root.join("loader").join("build").join("rustfrida-loader.bin");
-    let mut newest_loader_input = SystemTime::UNIX_EPOCH;
-    watch_inputs(loader_build_script.as_path(), &mut newest_loader_input);
-    watch_inputs(loader_helpers.as_path(), &mut newest_loader_input);
-    ensure_generated_blob(
-        &loader_bootstrapper,
-        newest_loader_input,
-        "python3 loader/build_helpers.py",
-    );
-    ensure_generated_blob(&loader_blob, newest_loader_input, "python3 loader/build_helpers.py");
+    println!("cargo:rerun-if-changed={}", built_agent_so.display());
+    println!("cargo:rerun-if-changed={}", built_agent_feature_marker.display());
+    println!("cargo:rerun-if-changed={}", agent_so.display());
+    println!("cargo:rerun-if-changed={}", agent_feature_marker.display());
 
     let mut newest_agent_input = SystemTime::UNIX_EPOCH;
     watch_inputs(
@@ -74,6 +91,13 @@ fn main() {
         &mut newest_agent_input,
     );
 
+    let release_flag = if profile_dir == "release" { " --release" } else { "" };
+    let agent_feature_flag = if noptrace {
+        " --no-default-features --features quickjs,noptrace"
+    } else {
+        ""
+    };
+    let agent_build_flag = format!("{}{}", release_flag, agent_feature_flag);
     let expected_agent_feature = if noptrace { "noptrace=1" } else { "noptrace=0" };
     ensure_agent_variant(
         &built_agent_so,
@@ -87,35 +111,24 @@ fn main() {
     println!("cargo:rustc-env=AGENT_SO_PATH={}", agent_so.display());
 
     if std::env::var_os("CARGO_FEATURE_QBDI").is_some() {
-        let helper_path = format!(
-            "{}/target/{}/{}/libqbdi_helper.so",
-            workspace_root.display(),
-            target,
-            profile_dir
-        );
-        println!("cargo:rustc-env=QBDI_HELPER_SO_PATH={}", helper_path);
-        println!("cargo:rerun-if-changed={}", helper_path);
+        let helper_path = workspace_root
+            .join("target")
+            .join(&target)
+            .join(profile_dir)
+            .join("libqbdi_helper.so");
+        println!("cargo:rustc-env=QBDI_HELPER_SO_PATH={}", helper_path.display());
+        println!("cargo:rerun-if-changed={}", helper_path.display());
     }
 }
 
-fn ensure_generated_blob(blob: &Path, newest_input: SystemTime, command: &str) {
-    match std::fs::metadata(blob).and_then(|meta| meta.modified()) {
-        Ok(blob_mtime) if blob_mtime >= newest_input => {}
-        Ok(_) => {
-            panic!(
-                "embedded loader blob is stale: run `{}` before building rust_frida ({})",
-                command,
-                blob.display()
-            );
-        }
-        Err(e) => {
-            panic!(
-                "missing embedded loader blob {}: {}. Run `{}` first",
-                blob.display(),
-                e,
-                command
-            );
-        }
+fn ensure_generated_blob(blob: &Path, command: &str) {
+    if let Err(e) = std::fs::metadata(blob) {
+        panic!(
+            "missing embedded loader blob {}: {}. Run `{}` first",
+            blob.display(),
+            e,
+            command
+        );
     }
 }
 
@@ -200,11 +213,47 @@ fn feature_marker_matches(features: &str, expected_feature: &str) -> bool {
     features.lines().any(|line| line.trim() == expected_feature)
 }
 
+fn helpers_are_stale(workspace_root: &Path) -> bool {
+    let inputs = [
+        "loader/build_helpers.py",
+        "loader/helpers/bootstrapper.c",
+        "loader/helpers/elf-parser.c",
+        "loader/helpers/elf-parser.h",
+        "loader/helpers/helper.lds",
+        "loader/helpers/inject-context.h",
+        "loader/helpers/nolibc-compat.h",
+        "loader/helpers/rustfrida-loader.c",
+        "loader/helpers/syscall.c",
+        "loader/helpers/syscall.h",
+    ];
+    let outputs = ["loader/build/bootstrapper.bin", "loader/build/rustfrida-loader.bin"];
+
+    let newest_input = inputs
+        .iter()
+        .filter_map(|path| modified_time(&workspace_root.join(path)))
+        .max();
+    let oldest_output = outputs
+        .iter()
+        .map(|path| modified_time(&workspace_root.join(path)))
+        .collect::<Option<Vec<_>>>()
+        .and_then(|times| times.into_iter().min());
+
+    match (newest_input, oldest_output) {
+        (_, None) => true,
+        (Some(input), Some(output)) => input > output,
+        (None, Some(_)) => false,
+    }
+}
+
+fn modified_time(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|metadata| metadata.modified()).ok()
+}
+
 fn watch_inputs(path: &Path, newest: &mut SystemTime) {
     if !path.exists() {
         return;
     }
-    println!("cargo::rerun-if-changed={}", path.display());
+    println!("cargo:rerun-if-changed={}", path.display());
     let Ok(meta) = std::fs::metadata(path) else {
         return;
     };

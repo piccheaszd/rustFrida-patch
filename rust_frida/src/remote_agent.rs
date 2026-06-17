@@ -4,10 +4,10 @@ use nix::sys::ptrace;
 use nix::unistd::Pid;
 use std::sync::atomic::Ordering;
 
-use crate::log_verbose;
 use crate::process::{attach_to_process, call_target_function, read_memory, write_bytes};
 use crate::session::Session;
 use crate::types::{FridaLibcApi, RustFridaLoaderContext};
+use crate::{log_info, log_verbose};
 
 pub(crate) fn eval_js_on_main_thread(
     session: &Session,
@@ -25,16 +25,21 @@ pub(crate) fn eval_js_on_main_thread(
         return Err("remote eval: agent current-thread entry missing".to_string());
     }
 
-    attach_to_process(pid)?;
+    let eval_tid = crate::injection::choose_java_eval_thread(pid);
+    if eval_tid != pid {
+        log_info!("remote eval 选择 Java 线程执行: tid={}", eval_tid);
+    }
+
+    attach_to_process(eval_tid)?;
     let result = eval_js_attached(
-        pid,
+        eval_tid,
         loader_ctx_addr as usize,
         eval_fn as usize,
         script,
         filename,
         init_engine,
     );
-    let detach_result = ptrace::detach(Pid::from_raw(pid), None).map_err(|e| e.to_string());
+    let detach_result = ptrace::detach(Pid::from_raw(eval_tid), None).map_err(|e| e.to_string());
     if detach_result.is_ok() {
         ensure_target_continued(pid);
     }
@@ -104,8 +109,20 @@ fn eval_js_attached(
         Ok(())
     })();
 
-    let _ = call_target_function(pid, libc_api.munmap_fn as usize, &[remote, total_len], None);
-    call_result
+    match call_result {
+        Ok(()) => {
+            let _ = call_target_function(pid, libc_api.munmap_fn as usize, &[remote, total_len], None);
+            Ok(())
+        }
+        Err(e) => {
+            log_verbose!(
+                "remote eval failed; skip target munmap for {:#x}+{} to avoid re-entering a faulted thread",
+                remote,
+                total_len
+            );
+            Err(e)
+        }
+    }
 }
 
 fn align_up(value: usize, align: usize) -> usize {

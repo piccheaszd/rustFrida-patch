@@ -64,6 +64,7 @@ typedef struct {
     uint64_t target_when_true;      /* branch taken target */
     uint64_t target_when_regular;   /* path for regular method (OAT lookup) */
     uint64_t target_when_runtime;   /* path for runtime method (skip OAT) */
+    int     max_redirect_size;      /* bytes safely replaceable at the inline site */
 } OatInlineMatch;
 
 /* Max inline patches we track */
@@ -303,6 +304,10 @@ static int validate_oat_inline_match(uint64_t addr, uint8_t* code_buf,
     out->target_when_true = target_when_true;
     out->target_when_regular = target_when_regular;
     out->target_when_runtime = target_when_runtime;
+    /* These matches sit in the middle of ART's inlined decision tree.
+     * Only the selector triple (LDR/CMN/B.cond) is always safe to replace;
+     * the following instruction belongs to one of the original paths. */
+    out->max_redirect_size = 12;
     return 1;
 }
 
@@ -443,26 +448,18 @@ static void emit_oat_exec_inflight_dec_preserve(Arm64Writer* w) {
 static void* generate_oat_inline_thunk(
     uint64_t patch_addr,
     uint8_t* original_bytes,
-    int patch_size,
     OatInlineMatch* match)
 {
-    /* Allocate oat_thunk: 优先在 ±128MB 内分配（recomp hook slot pool），
-     * 这样 apply_oat_inline_patch 可以用 ADRP+ADD+BR (12字节) 跳过来，
-     * 只覆盖 pattern 的 3 条指令，不会吞掉第 4 条 ADRP。
-     * 如果 near_range 失败（非 stealth2），退回 hook_alloc_near。 */
+    /* Allocate oat_thunk. OAT inline sites are only safe up to the matched
+     * selector window, so use range-constrained allocators only. */
     void* oat_thunk = hook_alloc_near_range(1024, (void*)(uintptr_t)patch_addr, (int64_t)1 << 27);
-    if (!oat_thunk) {
-        oat_thunk = hook_alloc_near(512, (void*)(uintptr_t)patch_addr);
-        /* 检查回退后实际距离: > ±4GB 则 patch 走 16/20B MOVZ 序列, 有溢出 OAT pattern (4 指令 = 16B)
-         * 写到下一个 ArtMethod / 函数 prologue 的风险, 打警告. */
+    if (!oat_thunk && match->max_redirect_size >= 12) {
+        oat_thunk = hook_alloc_near_range(1024, (void*)(uintptr_t)patch_addr, (int64_t)1 << 32);
         if (oat_thunk) {
             int64_t dist = (int64_t)(uintptr_t)oat_thunk - (int64_t)patch_addr;
-            int64_t adrp_range = (int64_t)1 << 32;  /* ±4GB */
-            if (dist <= -adrp_range || dist >= adrp_range) {
-                hook_log("\033[33m[oat_patch] WARN: oat_thunk %p 距 patch %#lx 超 ±4GB (dist=%lld), "
-                         "patch 将走 16/20B MOVZ, 可能溢出 OAT pattern 写坏相邻代码\033[0m",
-                         oat_thunk, (unsigned long)patch_addr, (long long)dist);
-            }
+            hook_log("\033[33m[oat_patch] WARN: near-B thunk unavailable for %#lx, "
+                     "using ADRP-range thunk %p (dist=%lld)\033[0m",
+                     (unsigned long)patch_addr, oat_thunk, (long long)dist);
         }
     }
     if (!oat_thunk) {
@@ -499,7 +496,6 @@ static void* generate_oat_inline_thunk(
     arm64_relocator_read_one(&reloc);
     arm64_relocator_skip_one(&reloc);
 
-    (void)patch_size;
     arm64_writer_put_b_cond_label(&w, ARM64_COND_EQ, lbl_runtime_or_replacement);
 
     /* --- Step 3: Save caller-saved registers --- */
@@ -679,7 +675,12 @@ static int apply_oat_inline_patch(
 
     uint64_t exec_pc = patch_addr;
     uintptr_t recomp_addr = 0;
-    if (g_stealth_mode == 2 && g_recomp_translate) {
+    if (g_stealth_mode == 2) {
+        if (!g_recomp_translate) {
+            hook_log("\033[31m[STEALTH 失效] oat_patch recomp 回调未设置 %#lx，拒绝降级 mprotect\033[0m",
+                     (unsigned long)patch_addr);
+            return -1;
+        }
         recomp_addr = g_recomp_translate(patch_addr);
         if (!recomp_addr) {
             hook_log("\033[31m[STEALTH 失效] oat_patch recomp 翻译失败 %#lx，patch 未安装！\033[0m",
@@ -696,11 +697,10 @@ static int apply_oat_inline_patch(
         return -1;
     }
 
-    /* OAT inline pattern 固定 4 条指令 = 16B，覆盖超过此范围会写坏相邻代码 */
-    if (jump_len > 16) {
-        hook_log("\033[31m[oat_patch] REJECTED: jump_len=%d > 16B (oat_thunk=%p 距 patch=%#lx 过远, "
-                 "MOVZ 20B 会溢出 pattern 边界)\033[0m",
-                 jump_len, oat_thunk, (unsigned long)patch_addr);
+    if (jump_len > match->max_redirect_size) {
+        hook_log("\033[31m[oat_patch] REJECTED: jump_len=%d > safe window=%d "
+                 "(oat_thunk=%p patch=%#lx)\033[0m",
+                 jump_len, match->max_redirect_size, oat_thunk, (unsigned long)patch_addr);
         return -1;
     }
 
@@ -840,12 +840,8 @@ int hook_patch_inlined_oat_header_checks(void) {
             continue;
         }
 
-        /* 生成 oat_thunk — patch_size 由 hook_write_jump 动态决定 (12 or 16) */
-        uint8_t tmp_jump[MIN_HOOK_SIZE];
-        int tmp_len = hook_write_jump(tmp_jump, (void*)(uintptr_t)match_addrs[i]);
-        int thunk_patch_size = (tmp_len > 0) ? tmp_len : 16;
         void* oat_thunk = generate_oat_inline_thunk(
-            match_addrs[i], orig_bytes, thunk_patch_size, &match_infos[i]);
+            match_addrs[i], orig_bytes, &match_infos[i]);
         if (!oat_thunk) continue;
 
         /* Apply the patch */

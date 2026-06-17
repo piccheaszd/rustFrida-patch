@@ -1918,18 +1918,18 @@ void* hook_install_managed_direct_router(void* target,
         *out_hooked_target = target;
     }
 
-    pthread_mutex_lock(&g_engine.lock);
+    hook_lock(&g_engine.lock);
 
     HookEntry* existing = find_hook(target);
     if (existing) {
         void* trampoline = existing->trampoline;
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return trampoline;
     }
 
     HookEntry* entry = setup_hook_entry(target);
     if (!entry) {
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return NULL;
     }
 
@@ -1940,13 +1940,13 @@ void* hook_install_managed_direct_router(void* target,
     }
     if (!entry->thunk) {
         free_entry(entry);
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return NULL;
     }
 
     if (build_trampoline(entry, 0) < 0) {
         free_entry(entry);
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return NULL;
     }
 
@@ -1954,18 +1954,18 @@ void* hook_install_managed_direct_router(void* target,
         entry->thunk, thunk_alloc, entry->trampoline, helper_method, helper_entry, original_method, set_orig_bypass, 0);
     if (thunk_size == 0) {
         free_entry(entry);
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return NULL;
     }
 
     if (patch_target(target, entry->thunk, stealth, entry) != 0) {
         free_entry(entry);
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return NULL;
     }
 
     finalize_hook(entry, entry->thunk, thunk_size);
-    pthread_mutex_unlock(&g_engine.lock);
+    hook_unlock(&g_engine.lock);
     return entry->trampoline;
 }
 
@@ -2030,18 +2030,18 @@ void* hook_install_count_orig_router(void* target,
         *out_hooked_target = target;
     }
 
-    pthread_mutex_lock(&g_engine.lock);
+    hook_lock(&g_engine.lock);
 
     HookEntry* existing = find_hook(target);
     if (existing) {
         void* trampoline = existing->trampoline;
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return trampoline;
     }
 
     HookEntry* entry = setup_hook_entry(target);
     if (!entry) {
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return NULL;
     }
 
@@ -2052,13 +2052,13 @@ void* hook_install_count_orig_router(void* target,
     }
     if (!entry->thunk) {
         free_entry(entry);
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return NULL;
     }
 
     if (build_trampoline(entry, 0) < 0) {
         free_entry(entry);
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return NULL;
     }
 
@@ -2066,20 +2066,47 @@ void* hook_install_count_orig_router(void* target,
         entry->thunk, thunk_alloc, entry->trampoline, counters, counter_count);
     if (thunk_size == 0) {
         free_entry(entry);
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return NULL;
     }
 
     void* patch_dest = (uint8_t*)entry->thunk + FAKE_OAT_PREFIX_SIZE;
     if (patch_target(target, patch_dest, stealth, entry) != 0) {
         free_entry(entry);
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return NULL;
     }
 
     finalize_hook(entry, entry->thunk, thunk_size);
-    pthread_mutex_unlock(&g_engine.lock);
+    hook_unlock(&g_engine.lock);
     return entry->trampoline;
+}
+
+void* hook_create_count_orig_stub(uint64_t fallback_target,
+                                  volatile uint64_t** counters,
+                                  uint32_t counter_count) {
+    if (!g_engine.initialized || !fallback_target || !counters || counter_count == 0) {
+        return NULL;
+    }
+
+    hook_lock(&g_engine.lock);
+
+    size_t stub_alloc = 4096;
+    void* stub_mem = hook_alloc(stub_alloc);
+    if (!stub_mem) {
+        hook_unlock(&g_engine.lock);
+        return NULL;
+    }
+
+    size_t thunk_size = generate_count_orig_thunk(
+        stub_mem, stub_alloc, (void*)fallback_target, counters, counter_count);
+    if (thunk_size == 0) {
+        hook_unlock(&g_engine.lock);
+        return NULL;
+    }
+
+    hook_unlock(&g_engine.lock);
+    return (uint8_t*)stub_mem + FAKE_OAT_PREFIX_SIZE;
 }
 
 void* hook_create_managed_orig_stub(uint64_t original_method,
@@ -2088,10 +2115,10 @@ void* hook_create_managed_orig_stub(uint64_t original_method,
         return NULL;
     }
 
-    pthread_mutex_lock(&g_engine.lock);
+    hook_lock(&g_engine.lock);
     void* stub = hook_alloc(128);
     if (!stub) {
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return NULL;
     }
 
@@ -2101,13 +2128,13 @@ void* hook_create_managed_orig_stub(uint64_t original_method,
     arm64_writer_put_ldr_reg_u64(&w, ARM64_REG_X16, (uint64_t)trampoline);
     arm64_writer_put_br_reg(&w, ARM64_REG_X16);
     if (arm64_writer_flush(&w) != 0) {
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return NULL;
     }
 
     size_t size = arm64_writer_offset(&w);
     hook_flush_cache(stub, size);
-    pthread_mutex_unlock(&g_engine.lock);
+    hook_unlock(&g_engine.lock);
     hook_log("[managed_orig] stub size=%zu original=%llx trampoline=%p stub=%p",
              size, (unsigned long long)original_method, trampoline, stub);
     return stub;
@@ -2132,24 +2159,24 @@ void* hook_install_managed_direct_entrypoint(void* target,
         *out_resolved_target = target;
     }
 
-    pthread_mutex_lock(&g_engine.lock);
+    hook_lock(&g_engine.lock);
 
     size_t thunk_alloc = 16384;
     void* thunk = hook_alloc_near(thunk_alloc, target);
     if (!thunk) {
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return NULL;
     }
 
     size_t thunk_size = generate_managed_direct_thunk(
         thunk, thunk_alloc, target, helper_method, helper_entry, original_method, set_orig_bypass, 0);
     if (thunk_size == 0) {
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return NULL;
     }
 
     hook_flush_cache(thunk, thunk_size);
-    pthread_mutex_unlock(&g_engine.lock);
+    hook_unlock(&g_engine.lock);
 
     hook_log("[managed_direct_ep] thunk size=%zu helper=%llx entry=%llx original=%llx original_entry=%p thunk=%p",
              thunk_size, (unsigned long long)helper_method, (unsigned long long)helper_entry,
@@ -2188,19 +2215,19 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
         *out_hooked_target = target;
     }
 
-    pthread_mutex_lock(&g_engine.lock);
+    hook_lock(&g_engine.lock);
 
     /* Check if already hooked — return existing trampoline */
     HookEntry* existing = find_hook(target);
     if (existing) {
         void* trampoline = existing->trampoline;
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return trampoline;
     }
 
     HookEntry* entry = setup_hook_entry(target);
     if (!entry) {
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return NULL;
     }
 
@@ -2213,13 +2240,13 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
     }
     if (!entry->thunk) {
         free_entry(entry);
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return NULL;
     }
 
     if (build_trampoline(entry, 0) < 0) {
         free_entry(entry);
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return NULL;
     }
 
@@ -2231,7 +2258,7 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
         entry->trampoline, quickcode_offset, current_pc_hint, use_blr);
     if (thunk_size == 0) {
         free_entry(entry);
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return NULL;
     }
 
@@ -2239,14 +2266,14 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
     void* patch_dest = (uint8_t*)entry->thunk + FAKE_OAT_PREFIX_SIZE;
     if (patch_target(target, patch_dest, stealth, entry) != 0) {
         free_entry(entry);
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return NULL;
     }
 
     finalize_hook(entry, entry->thunk, thunk_size);
 
     void* trampoline = entry->trampoline;
-    pthread_mutex_unlock(&g_engine.lock);
+    hook_unlock(&g_engine.lock);
 
     hook_log("[art_router] installed: target=%p, thunk=%p, trampoline=%p",
              target, entry->thunk, trampoline);
@@ -2259,13 +2286,13 @@ void* hook_art_router_get_thunk_body(void* target) {
         return NULL;
     }
 
-    pthread_mutex_lock(&g_engine.lock);
+    hook_lock(&g_engine.lock);
     HookEntry* entry = find_hook(target);
     void* body = NULL;
     if (entry && entry->thunk) {
         body = (uint8_t*)entry->thunk + FAKE_OAT_PREFIX_SIZE;
     }
-    pthread_mutex_unlock(&g_engine.lock);
+    hook_unlock(&g_engine.lock);
     return body;
 }
 
@@ -2283,14 +2310,14 @@ void* hook_create_art_router_stub(uint64_t fallback_target,
         return NULL;
     }
 
-    pthread_mutex_lock(&g_engine.lock);
+    hook_lock(&g_engine.lock);
 
     /* stub 通过 ArtMethod.entry_point_ 指针间接调用，不需要 near.
      * 布局: [12B 伪 OAT header/CodeInfo] [stub body]. 返回 body 起点. */
     size_t stub_alloc = 16384;
     void* stub_mem = hook_alloc(stub_alloc);
     if (!stub_mem) {
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return NULL;
     }
 
@@ -2325,7 +2352,7 @@ void* hook_create_art_router_stub(uint64_t fallback_target,
 
     hook_flush_cache(stub_mem, FAKE_OAT_PREFIX_SIZE + body_size);
 
-    pthread_mutex_unlock(&g_engine.lock);
+    hook_unlock(&g_engine.lock);
 
     hook_log("[art_router] stub created: %p (body=%p, fallback=%llx, body_size=%zu)",
              stub_mem, body_mem, (unsigned long long)fallback_target, body_size);

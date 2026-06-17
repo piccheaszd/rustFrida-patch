@@ -21,7 +21,7 @@ use std::ffi::CString;
 use std::sync::Mutex;
 
 use super::jni_core::*;
-use super::reflect::{decode_method_id, find_class_safe, MethodInfo, REFLECT_IDS};
+use super::reflect::{decode_method_id, find_class_safe, ClassLoaderInfo, MethodInfo, REFLECT_IDS};
 
 thread_local! {
     static IN_JAVA_HOOK_CALLBACK: Cell<bool> = const { Cell::new(false) };
@@ -49,6 +49,7 @@ pub(super) fn in_java_hook_callback() -> bool {
 include!("registry.rs");
 include!("signature.rs");
 include!("marshal.rs");
+include!("executor.rs");
 include!("invoke.rs");
 include!("original_call.rs");
 include!("hook.rs");

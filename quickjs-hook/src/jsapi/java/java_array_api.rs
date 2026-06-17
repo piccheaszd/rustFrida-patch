@@ -5,8 +5,8 @@
 // - `Java._arrayLength(jptr)`：返回长度
 // - `Java._arrayGet(jptr, idx, arrClass)`：返回元素的 wrapper / 原始值
 //
-// 目前只支持 object 数组（[L... / [[...）。原始类型数组（[I / [J / [Z ...）
-// 返回时需要 GetIntArrayRegion 等，暂未实现。
+// raw clone 线程不能安全重入 JNI，因此 raw clone 分支只允许把全局引用
+// 投递到 Java executor，在真实 Java 线程上执行数组 JNI 操作。
 // ============================================================================
 
 use crate::ffi;
@@ -15,9 +15,29 @@ use crate::value::JSValue;
 use super::callback::wrap_java_object_ref_for_array_elem;
 use super::jni_core::get_thread_env;
 use super::jni_core::{
-    jni_check_exc, jni_fn_ptr, GetArrayLengthFn, GetObjectArrayElementFn, JNI_GET_ARRAY_LENGTH,
+    jni_check_exc, jni_fn_ptr, jni_null_or_exc, GetArrayLengthFn, GetObjectArrayElementFn, JNI_GET_ARRAY_LENGTH,
     JNI_GET_OBJECT_ARRAY_ELEMENT,
 };
+
+fn element_class_from_array_class(arr_class: &str) -> String {
+    if !arr_class.starts_with('[') {
+        return arr_class.to_string();
+    }
+    let inner = &arr_class[1..];
+    if inner.starts_with('L') && inner.ends_with(';') && inner.len() >= 2 {
+        inner[1..inner.len() - 1].to_string()
+    } else {
+        inner.to_string()
+    }
+}
+
+fn element_sig_from_array_class(arr_class: &str) -> String {
+    if arr_class.starts_with('[') && arr_class.len() > 1 {
+        arr_class[1..].to_string()
+    } else {
+        format!("L{};", arr_class.replace('.', "/"))
+    }
+}
 
 /// JS: `_arrayLength(jptr) -> number`
 pub(super) unsafe extern "C" fn js_java_array_length(
@@ -34,6 +54,18 @@ pub(super) unsafe extern "C" fn js_java_array_length(
         Some(p) if p != 0 => p,
         _ => return JSValue::int(-1).raw(),
     };
+    let is_global = if argc >= 2 {
+        JSValue(*argv.add(1)).to_bool().unwrap_or(false)
+    } else {
+        false
+    };
+
+    if crate::is_raw_clone_js_thread() {
+        if is_global {
+            return super::callback::array_length_via_executor(ctx, jptr, true);
+        }
+        return JSValue::int(-1).raw();
+    }
 
     let env = match get_thread_env() {
         Ok(e) => e,
@@ -77,19 +109,26 @@ pub(super) unsafe extern "C" fn js_java_array_get(
         Some(s) => s,
         None => return ffi::qjs_undefined(),
     };
-
-    // 元素类名: `[Lfoo.Bar;` → `foo.Bar`; `[[Lfoo;` → `[Lfoo;`; `[I` → `I`(暂不支持)
-    let elem_class = if !arr_class.starts_with('[') {
-        arr_class.clone()
+    let is_global = if argc >= 4 {
+        JSValue(*argv.add(3)).to_bool().unwrap_or(false)
     } else {
-        let inner = &arr_class[1..];
-        if inner.starts_with('L') && inner.ends_with(';') && inner.len() >= 2 {
-            inner[1..inner.len() - 1].to_string()
-        } else {
-            // 多维数组或原始类型数组 — 把内层 signature 原样带走
-            inner.to_string()
-        }
+        false
     };
+
+    let elem_class = element_class_from_array_class(&arr_class);
+
+    if crate::is_raw_clone_js_thread() {
+        if is_global {
+            return super::callback::array_get_via_executor(
+                ctx,
+                jptr,
+                true,
+                idx,
+                element_sig_from_array_class(&arr_class),
+            );
+        }
+        return ffi::qjs_undefined();
+    }
 
     let env = match get_thread_env() {
         Ok(e) => e,
@@ -100,7 +139,7 @@ pub(super) unsafe extern "C" fn js_java_array_get(
         jni_fn_ptr(env, JNI_GET_OBJECT_ARRAY_ELEMENT),
     );
     let obj = get_elem(env, jptr as *mut std::ffi::c_void, idx);
-    if obj.is_null() || jni_check_exc(env) {
+    if jni_null_or_exc(env, obj) {
         return ffi::qjs_null();
     }
 

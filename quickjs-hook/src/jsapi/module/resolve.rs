@@ -137,6 +137,129 @@ pub(crate) unsafe fn find_export_in_loaded_modules(symbol: &str) -> *mut std::ff
     std::ptr::null_mut()
 }
 
+/// Resolve a symbol by name substring from one loaded module's .symtab/.dynsym.
+///
+/// This is intended for Android framework native methods where the C++ mangled
+/// signature drifts, but the stable JNI function stem remains in the symbol
+/// name on debuggable/system builds.
+pub(crate) unsafe fn module_find_symbol_contains(module_name: &str, needle: &str) -> Option<(String, u64)> {
+    if needle.is_empty() {
+        return None;
+    }
+    let (path, base) = find_module_path_and_base(module_name)?;
+    let symbols = elf_module_enumerate_symbols(&path, base);
+    let mut fallback: Option<(String, u64)> = None;
+    for symbol in symbols {
+        if symbol.address == 0 || !symbol.is_defined || symbol.kind != "function" {
+            continue;
+        }
+        if !symbol.name.contains(needle) {
+            continue;
+        }
+        if symbol.name.contains(needle) && !symbol.name.contains("CheckJNI") {
+            return Some((symbol.name, symbol.address));
+        }
+        if fallback.is_none() {
+            fallback = Some((symbol.name, symbol.address));
+        }
+    }
+    fallback
+}
+
+/// Resolve a JNI registered native method by scanning the module's relocated
+/// `JNINativeMethod { name, signature, fnPtr }` tables in memory.
+///
+/// This is intentionally independent from .symtab/.dynsym: Android framework
+/// JNI method functions are often local symbols, and production system images
+/// may strip their names while keeping the registration table relocated.
+pub(crate) unsafe fn module_find_jni_native_method(module_name: &str, name: &str, sig: &str) -> Option<u64> {
+    if name.is_empty() || sig.is_empty() {
+        return None;
+    }
+
+    let ranges = module_memory_ranges(module_name);
+    if ranges.is_empty() {
+        return None;
+    }
+    let readable: Vec<MemoryRange> = ranges.iter().copied().filter(|r| r.readable).collect();
+    let executable: Vec<MemoryRange> = ranges.iter().copied().filter(|r| r.executable).collect();
+    if readable.is_empty() || executable.is_empty() {
+        return None;
+    }
+
+    for range in &readable {
+        let mut addr = align_up(range.start, 8);
+        let end = range.end.saturating_sub(24);
+        while addr <= end {
+            let name_ptr = std::ptr::read_unaligned(addr as *const u64);
+            let sig_ptr = std::ptr::read_unaligned((addr + 8) as *const u64);
+            let fn_ptr = std::ptr::read_unaligned((addr + 16) as *const u64) & 0x0000_FFFF_FFFF_FFFF;
+            if contains_addr(&executable, fn_ptr, 4)
+                && cstr_equals_in_ranges(&readable, name_ptr, name)
+                && cstr_equals_in_ranges(&readable, sig_ptr, sig)
+            {
+                return Some(fn_ptr);
+            }
+            addr += 8;
+        }
+    }
+    None
+}
+
+#[derive(Clone, Copy)]
+struct MemoryRange {
+    start: u64,
+    end: u64,
+    readable: bool,
+    executable: bool,
+}
+
+fn module_memory_ranges(module_name: &str) -> Vec<MemoryRange> {
+    let maps = match crate::jsapi::util::read_proc_self_maps() {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    crate::jsapi::util::proc_maps_entries(&maps)
+        .filter_map(|entry| {
+            let path = entry.path?;
+            if !matches_module_lookup_name(path, module_name) {
+                return None;
+            }
+            let prot = entry.prot_flags();
+            Some(MemoryRange {
+                start: entry.start,
+                end: entry.end,
+                readable: prot & libc::PROT_READ != 0,
+                executable: prot & libc::PROT_EXEC != 0,
+            })
+        })
+        .collect()
+}
+
+fn align_up(value: u64, align: u64) -> u64 {
+    (value + align - 1) & !(align - 1)
+}
+
+fn contains_addr(ranges: &[MemoryRange], addr: u64, len: u64) -> bool {
+    if addr == 0 {
+        return false;
+    }
+    let Some(end) = addr.checked_add(len) else {
+        return false;
+    };
+    ranges.iter().any(|range| addr >= range.start && end <= range.end)
+}
+
+unsafe fn cstr_equals_in_ranges(ranges: &[MemoryRange], ptr: u64, expected: &str) -> bool {
+    let bytes = expected.as_bytes();
+    let total_len = bytes.len() as u64 + 1;
+    if !contains_addr(ranges, ptr, total_len) {
+        return false;
+    }
+    let actual = std::slice::from_raw_parts(ptr as *const u8, bytes.len());
+    actual == bytes && std::ptr::read(ptr.wrapping_add(bytes.len() as u64) as *const u8) == 0
+}
+
 /// Load a shared object from disk via unrestricted linker API (no NOLOAD, fresh load).
 /// 走 linker64 的 __loader_dlopen, 绕过 namespace 限制; trusted_caller 用 linker 内部地址
 /// 避开 hide_soinfo 摘链后 caller 解析失败的问题。
@@ -390,12 +513,6 @@ unsafe fn enumerate_soinfo() -> Vec<(u64, String)> {
 
     let mut result = Vec::new();
 
-    // Lock dl_mutex for thread safety
-    let has_mutex = !api.dl_mutex.is_null();
-    if has_mutex {
-        libc::pthread_mutex_lock(api.dl_mutex);
-    }
-
     let mut current = head;
     let mut count = 0u32;
     while !current.is_null() && count < 4096 {
@@ -425,10 +542,6 @@ unsafe fn enumerate_soinfo() -> Vec<(u64, String)> {
         // next is at offset 0
         let next = *(current as *const *mut std::ffi::c_void);
         current = next;
-    }
-
-    if has_mutex {
-        libc::pthread_mutex_unlock(api.dl_mutex);
     }
 
     result

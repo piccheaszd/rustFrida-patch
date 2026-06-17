@@ -42,7 +42,7 @@ fn try_ldmonitor(ctx: &ProbeContext) -> Result<u32, u32> {
     Ok(0)
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), target_arch = "bpf"))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {}

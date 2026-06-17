@@ -49,6 +49,7 @@ pub use jsapi::hook_api::preload_qbdi_helper;
 #[cfg(feature = "qbdi")]
 pub use jsapi::hook_api::shutdown_qbdi_helper;
 pub use jsapi::hook_api::{cut_native_hooks, free_native_hooks};
+pub use jsapi::java::abort_raw_clone_java_executor_for_unload;
 pub use jsapi::java::art_controller::{
     cut_art_controller_hooks, cut_art_controller_routing_hooks, cut_art_controller_walkstack_guards,
     free_art_controller_state, set_art_controller_reload_paused,
@@ -56,6 +57,8 @@ pub use jsapi::java::art_controller::{
 pub use jsapi::java::cleanup_java_hooks;
 pub use jsapi::java::detach_current_jni_thread;
 pub use jsapi::java::java_subsystem_active_for_cleanup;
+pub use jsapi::java::raw_clone_java_executor_hook_active;
+pub use jsapi::java::start_java_worker_thread;
 pub use jsapi::java::{cut_java_hooks, drain_thunk_in_flight, free_java_hooks};
 pub use jsapi::memory::cleanup_wxshadow_patches;
 pub use runtime::JSRuntime;
@@ -64,9 +67,12 @@ pub use value::JSValue;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+const JS_TOP_LEVEL_EXECUTION_TIMEOUT_MS: u64 = 6_500;
+
 static QBDI_OUTPUT_DIR: OnceLock<String> = OnceLock::new();
 static QBDI_HELPER_BLOB: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 static API_PROFILE: AtomicU8 = AtomicU8::new(API_PROFILE_FULL);
+static JS_EXECUTION_DEADLINE_MS: AtomicU64 = AtomicU64::new(0);
 
 const API_PROFILE_FULL: u8 = 0;
 const API_PROFILE_MINIMAL: u8 = 1;
@@ -120,6 +126,64 @@ pub(crate) static JS_ENGINE: Mutex<Option<JSEngine>> = Mutex::new(None);
 /// Used by hook callbacks to distinguish same-thread reentrancy from ordinary contention.
 pub(crate) static JS_ENGINE_OWNER_THREAD: AtomicU64 = AtomicU64::new(0);
 
+static RAW_CLONE_JS_THREAD_0: AtomicU64 = AtomicU64::new(0);
+static RAW_CLONE_JS_THREAD_1: AtomicU64 = AtomicU64::new(0);
+static RAW_CLONE_JS_THREAD_2: AtomicU64 = AtomicU64::new(0);
+static RAW_CLONE_JS_THREAD_3: AtomicU64 = AtomicU64::new(0);
+static RAW_CLONE_JS_THREAD_4: AtomicU64 = AtomicU64::new(0);
+static RAW_CLONE_JS_THREAD_5: AtomicU64 = AtomicU64::new(0);
+static RAW_CLONE_JS_THREAD_6: AtomicU64 = AtomicU64::new(0);
+static RAW_CLONE_JS_THREAD_7: AtomicU64 = AtomicU64::new(0);
+
+fn raw_clone_js_thread_slots() -> [&'static AtomicU64; 8] {
+    [
+        &RAW_CLONE_JS_THREAD_0,
+        &RAW_CLONE_JS_THREAD_1,
+        &RAW_CLONE_JS_THREAD_2,
+        &RAW_CLONE_JS_THREAD_3,
+        &RAW_CLONE_JS_THREAD_4,
+        &RAW_CLONE_JS_THREAD_5,
+        &RAW_CLONE_JS_THREAD_6,
+        &RAW_CLONE_JS_THREAD_7,
+    ]
+}
+
+pub struct RawCloneJsThreadGuard {
+    id: u64,
+}
+
+impl Drop for RawCloneJsThreadGuard {
+    fn drop(&mut self) {
+        for slot in raw_clone_js_thread_slots() {
+            if slot.load(Ordering::Acquire) == self.id {
+                let _ = slot.compare_exchange(self.id, 0, Ordering::AcqRel, Ordering::Acquire);
+                break;
+            }
+        }
+    }
+}
+
+pub fn mark_raw_clone_js_thread() -> RawCloneJsThreadGuard {
+    let id = current_thread_id_u64();
+    for slot in raw_clone_js_thread_slots() {
+        if slot.load(Ordering::Acquire) == id
+            || slot
+                .compare_exchange(0, id, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            return RawCloneJsThreadGuard { id };
+        }
+    }
+    RawCloneJsThreadGuard { id }
+}
+
+pub(crate) fn is_raw_clone_js_thread() -> bool {
+    let id = current_thread_id_u64();
+    raw_clone_js_thread_slots()
+        .iter()
+        .any(|slot| slot.load(Ordering::Acquire) == id)
+}
+
 #[inline]
 pub(crate) fn current_thread_id_u64() -> u64 {
     // Must use TPIDR_EL0 directly — on API 36, pthread_self() != TPIDR_EL0.
@@ -153,6 +217,45 @@ impl Drop for JsEngineOwnerGuard {
     fn drop(&mut self) {
         clear_js_engine_owner_current_thread();
     }
+}
+
+struct JsExecutionDeadlineGuard {
+    previous_deadline_ms: u64,
+}
+
+impl JsExecutionDeadlineGuard {
+    fn begin(timeout_ms: u64) -> Self {
+        let previous_deadline_ms = JS_EXECUTION_DEADLINE_MS.load(Ordering::Acquire);
+        let deadline_ms = if timeout_ms == 0 {
+            0
+        } else {
+            monotonic_ms().saturating_add(timeout_ms)
+        };
+        JS_EXECUTION_DEADLINE_MS.store(deadline_ms, Ordering::Release);
+        Self { previous_deadline_ms }
+    }
+}
+
+impl Drop for JsExecutionDeadlineGuard {
+    fn drop(&mut self) {
+        JS_EXECUTION_DEADLINE_MS.store(self.previous_deadline_ms, Ordering::Release);
+    }
+}
+
+fn monotonic_ms() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let ret = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    if ret != 0 {
+        return 0;
+    }
+    (ts.tv_sec as u64)
+        .saturating_mul(1_000)
+        .saturating_add((ts.tv_nsec as u64) / 1_000_000)
+}
+
+pub(crate) fn js_execution_deadline_expired() -> bool {
+    let deadline_ms = JS_EXECUTION_DEADLINE_MS.load(Ordering::Acquire);
+    deadline_ms != 0 && monotonic_ms() >= deadline_ms
 }
 
 /// Log callback registered with the C hook engine.
@@ -265,6 +368,9 @@ impl JSEngine {
     /// has finished, so callbacks can reference helpers declared later in the
     /// same loadjs payload.
     pub fn flush_java_ready_callbacks(&self) -> Result<(), String> {
+        if is_raw_clone_js_thread() {
+            return Ok(());
+        }
         let value = self.context.eval(
             "if (globalThis.Java && typeof Java._flushReadyCallbacks === 'function') Java._flushReadyCallbacks();",
             "<java_ready_flush>",
@@ -324,6 +430,7 @@ pub fn load_script_with_filename(script: &str, filename: &str) -> Result<String,
     }
     let engine = engine.as_ref().ok_or("JS engine not initialized")?;
     let _owner_guard = JsEngineOwnerGuard::acquire();
+    let _deadline_guard = JsExecutionDeadlineGuard::begin(JS_TOP_LEVEL_EXECUTION_TIMEOUT_MS);
     let value = engine.eval_file(script, filename)?;
     engine.flush_java_ready_callbacks()?;
     engine.run_pending_jobs();
@@ -379,6 +486,7 @@ pub fn dispatch_rpc(method: &str, args_json: &str) -> Result<String, String> {
         .map_err(|e| format!("Failed to lock JS engine: {}", e))?;
     let engine = engine.as_ref().ok_or("JS engine not initialized")?;
     let _owner_guard = JsEngineOwnerGuard::acquire();
+    let _deadline_guard = JsExecutionDeadlineGuard::begin(JS_TOP_LEVEL_EXECUTION_TIMEOUT_MS);
 
     // 构造 `__rpc_dispatch("method", "args_json")` 表达式。
     let script = format!(

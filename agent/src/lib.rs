@@ -47,7 +47,7 @@ use std::ffi::c_void;
 #[cfg(not(feature = "noptrace"))]
 use std::process;
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 struct RawMmapAllocator;
@@ -202,8 +202,6 @@ type Result<T> = std::result::Result<T, String>;
 pub struct StringTable {
     pub sym_name: u64,
     pub sym_name_len: u32,
-    pub pthread_err: u64,
-    pub pthread_err_len: u32,
     pub dlsym_err: u64,
     pub dlsym_err_len: u32,
     pub cmdline: u64,
@@ -255,6 +253,11 @@ pub static OUTPUT_PATH: OnceLock<String> = OnceLock::new();
 fn trace_entry_raw(fd: i32, msg: &'static [u8]) {
     let _ = write_log_raw_fd(fd, msg);
 }
+
+#[cfg(feature = "quickjs")]
+static JS_TASKS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "quickjs")]
+const JS_TASK_UNLOAD_WAIT_MS: u64 = 500;
 
 fn read_exact_raw_fd(fd: i32, buf: &mut [u8]) -> std::io::Result<()> {
     const EINTR: i32 = 4;
@@ -323,6 +326,8 @@ pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
     trace_entry_raw(ctrl_fd, b"[agent-trace] 02 before-panic-hook\n");
     install_panic_hook();
     trace_entry_raw(ctrl_fd, b"[agent-trace] 03 after-panic-hook\n");
+    SHOULD_EXIT.store(false, Ordering::Relaxed);
+    SHOULD_DETACH.store(false, Ordering::Relaxed);
     // Keep native crash handlers disabled for this target.
     // install_crash_handlers();
 
@@ -369,7 +374,10 @@ pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
             trace_entry_raw(ctrl_fd, b"[agent-trace] 26 cmdline-read\n");
             if cmd != "novalue" {
                 trace_entry_raw(ctrl_fd, b"[agent-trace] 27 before-process-cmd\n");
-                process_cmd(&cmd);
+                let first = cmd.split_whitespace().next().unwrap_or("");
+                if first != "shutdown" && first != "detach" {
+                    process_cmd(&cmd);
+                }
                 trace_entry_raw(ctrl_fd, b"[agent-trace] 28 after-process-cmd\n");
             }
         }
@@ -431,8 +439,22 @@ pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
     }
     if SHOULD_EXIT.load(Ordering::Relaxed) {
         #[cfg(feature = "quickjs")]
-        stop_js_worker_for_unload();
-        cleanup_agent_runtime_for_unload();
+        {
+            let fast_unload_ok = quickjs_loader::prepare_unload_fast();
+            let safe_to_return = if stop_js_worker_for_unload(JS_TASK_UNLOAD_WAIT_MS) {
+                cleanup_agent_runtime_for_unload(fast_unload_ok)
+            } else {
+                log_msg_sync("JS worker 未在 500ms 内退出，保留 agent 驻留以避免卸载仍在执行的代码\n".to_string());
+                false
+            };
+            if !safe_to_return {
+                park_agent_after_unsafe_unload();
+            }
+        }
+        #[cfg(not(feature = "quickjs"))]
+        {
+            let _ = cleanup_agent_runtime_for_unload(true);
+        }
     }
     if SHOULD_EXIT.load(Ordering::Relaxed) {
         log_msg_sync("退出清理完成，准备关闭 socket\n".to_string());
@@ -520,6 +542,35 @@ fn eval_and_respond(script: &str, filename: &str, empty_err: &[u8]) {
                 send_eval_err(&e);
             }
         }
+    }
+}
+
+#[cfg(feature = "quickjs")]
+fn eval_on_java_worker_and_respond(script: String, filename: String, init_engine: bool, empty_err: &[u8]) {
+    if script.is_empty() {
+        send_eval_err(std::str::from_utf8(empty_err).unwrap_or("[quickjs] empty script"));
+        return;
+    }
+    match quickjs_loader::eval_on_java_worker(script, filename, init_engine) {
+        Ok(result) => send_eval_ok(&result),
+        Err(e) => send_eval_err(&e),
+    }
+}
+
+#[cfg(feature = "quickjs")]
+fn start_java_worker_and_respond() {
+    match quickjs_loader::start_java_worker() {
+        Ok(()) => send_eval_ok("java-worker-ready"),
+        Err(e) => send_eval_err(&format!("java worker start failed: {}", e)),
+    }
+}
+
+#[cfg(feature = "quickjs")]
+fn cut_java_executor_hook_and_respond() {
+    match quickjs_loader::cut_java_executor_hook() {
+        Ok(true) => send_eval_ok("java-executor-cut"),
+        Ok(false) => send_eval_err("java executor hook still active after cut"),
+        Err(e) => send_eval_err(&format!("java executor hook cut failed: {}", e)),
     }
 }
 
@@ -615,32 +666,69 @@ fn set_java_stealth_and_respond(mode: i64) {
 #[cfg(feature = "quickjs")]
 fn dispatch_js_task<F>(label: &'static str, task: F)
 where
-    F: FnOnce(),
+    F: FnOnce() + Send + 'static,
 {
-    log_msg(format!("[quickjs-inline] begin task: {}\n", label));
-    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task)) {
-        let panic_msg = if let Some(msg) = payload.downcast_ref::<&str>() {
-            *msg
-        } else if let Some(msg) = payload.downcast_ref::<String>() {
-            msg.as_str()
-        } else {
-            "unknown panic payload"
-        };
-        log_msg(format!("[quickjs-inline] task panicked: {}\n", panic_msg));
-        send_eval_err(&format!("[quickjs] task panicked: {}", panic_msg));
+    JS_TASKS_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
+    match raw_thread::spawn_detached(b"wwb-js\0", move || {
+        let _raw_clone_js = quickjs_hook::mark_raw_clone_js_thread();
+        log_msg(format!("[quickjs-worker] begin task: {}\n", label));
+        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task)) {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("unknown panic");
+            send_eval_err(&format!("[quickjs] JS worker panic: {}", msg));
+        }
+        log_msg(format!("[quickjs-worker] end task: {}\n", label));
+        JS_TASKS_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+    }) {
+        Ok(_) => {}
+        Err(e) => {
+            JS_TASKS_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+            send_eval_err(&format!("[quickjs] JS worker 启动失败: {}", e));
+        }
     }
-    log_msg(format!("[quickjs-inline] end task: {}\n", label));
 }
 
 #[cfg(feature = "quickjs")]
-fn stop_js_worker_for_unload() {}
-
-fn cleanup_agent_runtime_for_unload() {
-    #[cfg(feature = "quickjs")]
-    if quickjs_loader::is_initialized() {
-        quickjs_loader::cleanup_for_unload_leak_safe();
+fn stop_js_worker_for_unload(timeout_ms: u64) -> bool {
+    let start = std::time::Instant::now();
+    while JS_TASKS_IN_FLIGHT.load(Ordering::Acquire) != 0 {
+        if start.elapsed() >= std::time::Duration::from_millis(timeout_ms) {
+            return false;
+        }
+        raw_thread::sleep_ms(10);
     }
-    crash_handler::uninstall_crash_handlers();
+    true
+}
+
+fn cleanup_agent_runtime_for_unload(fast_unload_ok: bool) -> bool {
+    let mut safe_to_return = true;
+    #[cfg(feature = "quickjs")]
+    {
+        if !fast_unload_ok {
+            log_msg_sync(
+                "Java executor hook 未确认切断，跳过目标进程内破坏性清理以避免释放仍可能被 ART 调用的 recomp 页\n"
+                    .to_string(),
+            );
+            return false;
+        }
+        if quickjs_loader::is_initialized() {
+            safe_to_return = quickjs_loader::cleanup_for_unload_leak_safe();
+        }
+    }
+    if safe_to_return {
+        crash_handler::uninstall_crash_handlers();
+    }
+    safe_to_return
+}
+
+fn park_agent_after_unsafe_unload() -> ! {
+    log_msg_sync("agent 保持驻留：已切断 hook 入口，等待目标进程退出，避免 loader 卸载 agent 本体\n".to_string());
+    loop {
+        raw_thread::sleep_ms(60_000);
+    }
 }
 
 fn process_cmd(command: &str) {
@@ -766,6 +854,55 @@ fn process_cmd(command: &str) {
             dispatch_js_task("loadjs_init", move || init_eval_and_respond(&script, &filename));
         }
         #[cfg(feature = "quickjs")]
+        Some("javaworker_init") => dispatch_js_task("javaworker_init", start_java_worker_and_respond),
+        #[cfg(feature = "quickjs")]
+        Some("javaexecutor_cut") => dispatch_js_task("javaexecutor_cut", cut_java_executor_hook_and_respond),
+        #[cfg(feature = "quickjs")]
+        Some("java_loadjs_init") => {
+            let rest = command
+                .strip_prefix("java_loadjs_init ")
+                .or_else(|| command.strip_prefix("java_loadjs_init\n"))
+                .or_else(|| command.strip_prefix("java_loadjs_init"))
+                .unwrap_or("");
+            let (filename, script) = parse_loadjs_payload(rest);
+            eval_on_java_worker_and_respond(
+                script.to_string(),
+                filename.to_string(),
+                true,
+                b"[quickjs] Error: empty script",
+            );
+        }
+        #[cfg(feature = "quickjs")]
+        Some("java_loadjs") => {
+            let rest = command
+                .strip_prefix("java_loadjs ")
+                .or_else(|| command.strip_prefix("java_loadjs\n"))
+                .or_else(|| command.strip_prefix("java_loadjs"))
+                .unwrap_or("");
+            let (filename, script) = parse_loadjs_payload(rest);
+            eval_on_java_worker_and_respond(
+                script.to_string(),
+                filename.to_string(),
+                true,
+                b"[quickjs] Error: empty script",
+            );
+        }
+        #[cfg(feature = "quickjs")]
+        Some("java_jseval") => {
+            let expr = command
+                .strip_prefix("java_jseval ")
+                .or_else(|| command.strip_prefix("java_jseval"))
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            eval_on_java_worker_and_respond(
+                expr,
+                String::new(),
+                true,
+                "[quickjs] 用法: jseval <expression>".as_bytes(),
+            );
+        }
+        #[cfg(feature = "quickjs")]
         Some("jsworker_stop") => {
             send_eval_ok("jsworker_inline");
         }
@@ -792,9 +929,13 @@ fn process_cmd(command: &str) {
             let (filename, script) = parse_loadjs_payload(rest);
             let filename = filename.to_string();
             let script = script.to_string();
-            dispatch_js_task("loadjs", move || {
-                eval_and_respond(&script, &filename, b"[quickjs] Error: empty script")
-            });
+            if quickjs_loader::is_java_worker_started() {
+                eval_on_java_worker_and_respond(script, filename, true, b"[quickjs] Error: empty script");
+            } else {
+                dispatch_js_task("loadjs", move || {
+                    eval_and_respond(&script, &filename, b"[quickjs] Error: empty script")
+                });
+            }
         }
         #[cfg(feature = "quickjs")]
         Some("jseval") => {
@@ -805,9 +946,18 @@ fn process_cmd(command: &str) {
                 .unwrap_or("")
                 .trim();
             let expr = expr.to_string();
-            dispatch_js_task("jseval", move || {
-                eval_and_respond(&expr, "", "[quickjs] 用法: jseval <expression>".as_bytes())
-            });
+            if quickjs_loader::is_java_worker_started() {
+                eval_on_java_worker_and_respond(
+                    expr,
+                    String::new(),
+                    false,
+                    "[quickjs] 用法: jseval <expression>".as_bytes(),
+                );
+            } else {
+                dispatch_js_task("jseval", move || {
+                    eval_and_respond(&expr, "", "[quickjs] 用法: jseval <expression>".as_bytes())
+                });
+            }
         }
         // rpccall <method> <args_json>
         //   method    — 注册在 rpc.exports 上的函数名
@@ -858,8 +1008,11 @@ fn process_cmd(command: &str) {
         }
         #[cfg(feature = "quickjs")]
         Some("jsclean") => dispatch_js_task("jsclean", || {
-            quickjs_loader::cleanup();
-            send_eval_ok("cleaned up");
+            if quickjs_loader::cleanup() {
+                send_eval_ok("cleaned up");
+            } else {
+                send_eval_err("[quickjs] cleanup timeout; destructive free/unmap skipped");
+            }
         }),
         // jsclean_soft: %reload 专用。完整 unhook + drain=0 + 销毁 runtime，
         // 但保留 art_controller / pool / recomp / wxshadow（同进程 reload 复用）。

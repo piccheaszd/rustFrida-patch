@@ -1,4 +1,6 @@
 fn main() -> anyhow::Result<()> {
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NOPTRACE");
+
     // 编译 C 代码
     cc::Build::new().file("src/transform.c").compile("my_c_lib");
 

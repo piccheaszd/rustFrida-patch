@@ -2,14 +2,11 @@
 #define __FRIDA_INJECT_CONTEXT_H__
 
 #ifdef NOLIBC
-typedef void * pthread_t;
-typedef struct _pthread_attr_t pthread_attr_t;
 struct msghdr;
 struct sockaddr;
 typedef unsigned int socklen_t;
 #else
 # include <dlfcn.h>
-# include <pthread.h>
 # include <stdint.h>
 # include <sys/mman.h>
 # include <sys/socket.h>
@@ -60,7 +57,7 @@ struct _FridaLoaderContext
   const char * fallback_address;
   FridaLibcApi * libc;
 
-  pthread_t worker;
+  uintptr_t worker;
   void * agent_handle;
   void (* agent_entrypoint_impl) (const char * data, int * unload_policy, void * injector_state);
 };
@@ -79,9 +76,6 @@ struct _FridaLibcApi
   ssize_t (* send) (int sockfd, const void * buf, size_t len, int flags);
   int (* fcntl) (int fd, int cmd, ...);
   int (* close) (int fd);
-
-  int (* pthread_create) (pthread_t * thread, const pthread_attr_t * attr, void * (* start_routine) (void *), void * arg);
-  int (* pthread_detach) (pthread_t thread);
 
   void * (* dlopen) (const char * filename, int flags, const void * caller_addr);
   int dlopen_flags;

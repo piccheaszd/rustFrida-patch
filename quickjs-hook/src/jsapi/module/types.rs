@@ -34,6 +34,13 @@ struct Elf64Phdr {
     _p_align: u64,
 }
 
+/// ELF64 dynamic table entry.
+#[repr(C)]
+struct Elf64Dyn {
+    d_tag: i64,
+    d_val: u64,
+}
+
 /// ELF64 symbol table entry
 #[repr(C)]
 struct Elf64Sym {
@@ -95,10 +102,19 @@ struct Elf64Shdr {
 }
 
 const PT_LOAD: u32 = 1;
+const PT_DYNAMIC: u32 = 2;
+const ET_DYN: u16 = 3;
 const SHT_SYMTAB: u32 = 2;
 const SHT_STRTAB: u32 = 3;
 const SHT_RELA: u32 = 4;
 const SHT_DYNSYM: u32 = 11;
+
+const DT_NULL: i64 = 0;
+const DT_HASH: i64 = 4;
+const DT_STRTAB: i64 = 5;
+const DT_SYMTAB: i64 = 6;
+const DT_STRSZ: i64 = 10;
+const DT_GNU_HASH: i64 = 0x6ffffef5;
 
 /// Special section index: undefined (imported) symbol.
 const SHN_UNDEF: u16 = 0;
@@ -147,8 +163,8 @@ struct UnrestrictedLinkerApi {
     ) -> *mut std::ffi::c_void,
     /// Trusted caller address (linker64 内部地址，dlopen_addr)
     trusted_caller: *const std::ffi::c_void,
-    /// dl_mutex — __dl__ZL10g_dl_mutex
-    dl_mutex: *mut libc::pthread_mutex_t,
+    /// dl_mutex address, kept only for diagnostics. We never call pthread mutex APIs.
+    dl_mutex: *mut std::ffi::c_void,
     /// solist_get_head() — __dl__Z15solist_get_headv
     solist_get_head: Option<unsafe extern "C" fn() -> *mut std::ffi::c_void>,
     /// solist global variable (fallback) — __dl__ZL6solist

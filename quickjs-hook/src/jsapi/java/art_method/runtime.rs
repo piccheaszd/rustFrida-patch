@@ -7,14 +7,7 @@
 /// 扫描 Runtime 结构体查找 JavaVM* 指针位置。
 /// 返回 (runtime_addr, java_vm_offset)，如果获取失败返回 None。
 pub(super) unsafe fn find_runtime_java_vm() -> Option<(u64, usize)> {
-    let vm_ptr = {
-        let guard = JNI_STATE.lock().unwrap_or_else(|e| e.into_inner());
-        match guard.as_ref() {
-            Some(state) => state.vm,
-            None => return None,
-        }
-    };
-
+    let vm_ptr = get_or_init_vm().ok()?;
     let runtime = get_runtime_addr()?;
 
     refresh_mem_regions();

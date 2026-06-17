@@ -146,15 +146,14 @@ pub(crate) struct Args {
     #[arg(short = 't', long = "timeout")]
     pub(crate) timeout: Option<u64>,
 
-    /// 等待 agent 连接的超时时间（秒），默认 30 秒
-    #[arg(long = "connect-timeout", default_value = "30")]
+    /// 等待 agent 连接的超时时间（秒），默认 10 秒
+    #[arg(long = "connect-timeout", default_value = "10")]
     pub(crate) connect_timeout: u64,
 
     /// 覆盖字符串表中的指定值（可多次使用），格式: name=value
     ///
     /// 可用名称及用途:
     ///   sym_name     — loader 查找的导出符号（高级调试）
-    ///   pthread_err  — pthread 库错误消息前缀
     ///   dlsym_err    — dlsym 调用错误消息前缀
     ///   cmdline      — procfs cmdline 路径
     ///   output_path  — 日志输出路径

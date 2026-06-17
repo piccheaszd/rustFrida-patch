@@ -117,6 +117,7 @@ struct ZygotePatch {
     payload_backup: Vec<u8>,
     payload_protection: u64,
     page_size: u64,
+    #[cfg_attr(not(feature = "noptrace"), allow(dead_code))]
     payload_context_offset: u64,
     /// payload 的 backing 文件路径和偏移（用于 COW 场景下读取真正的原始数据）
     #[allow(dead_code)]
@@ -141,6 +142,12 @@ static SPAWN_REQUESTS: OnceLock<Mutex<HashMap<String, Arc<SpawnNotifier>>>> = On
 /// 属性 profile 目录（由 --profile 设置，None = 禁用）
 #[cfg(not(feature = "noptrace"))]
 static PROP_PROFILE_DIR: OnceLock<Option<String>> = OnceLock::new();
+
+fn diag_env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
+        .unwrap_or(false)
+}
 
 /// 设置属性 profile 目录（在 spawn_and_inject 之前调用）
 #[cfg(not(feature = "noptrace"))]
@@ -275,6 +282,7 @@ const CTX_SETCONTEXT_GOT_PROTECTION: usize = 288;
 const CTX_CAPSET_GOT_SLOT: usize = 296;
 const CTX_CAPSET_ORIGINAL: usize = 304;
 const CTX_CAPSET_GOT_PROTECTION: usize = 312;
+const CTX_PASSIVE_SETARGV0: usize = 320;
 
 fn map_protection_bits(entry: &MapEntry) -> u64 {
     let mut prot = 0u64;
@@ -327,7 +335,7 @@ fn drain_until_eof(stream: &mut std::os::unix::net::UnixStream, timeout: std::ti
     }
 }
 
-/// 判断 maps 条目是否为 boot heap 区域（boot.art / dalvik-LinearAlloc）
+/// 判断 maps 条目是否为 boot heap 区域（boot image / dalvik-LinearAlloc）
 fn is_boot_heap(entry: &MapEntry) -> bool {
     entry.is_readable()
         && entry.is_writable()
@@ -335,6 +343,7 @@ fn is_boot_heap(entry: &MapEntry) -> bool {
         && !entry.is_shared()
         && (entry.path.contains("boot.art")
             || entry.path.contains("boot-framework.art")
+            || entry.path.contains("boot-image-methods.art")
             || entry.path.contains("dalvik-LinearAlloc"))
 }
 
@@ -344,6 +353,22 @@ fn is_private_rw_mapping(entry: &MapEntry) -> bool {
 
 fn is_readable_mapping(entry: &MapEntry) -> bool {
     entry.is_readable()
+}
+
+fn is_setargv0_rw_fallback_candidate(entry: &MapEntry) -> bool {
+    entry.path.contains("dalvik-")
+        || entry.path.contains("boot-image")
+        || entry.path.contains("boot.art")
+        || entry.path.contains("boot-framework")
+        || entry.path.contains("[anon:stack_and_tls:")
+}
+
+fn is_setargv0_readable_fallback_candidate(entry: &MapEntry) -> bool {
+    entry.path.contains("dalvik-")
+        || entry.path.contains("boot-image")
+        || entry.path.contains("boot.art")
+        || entry.path.contains("boot-framework")
+        || entry.path.contains("libandroid_runtime")
 }
 
 /// 在 ELF dynsyms 中查找符号地址
@@ -1053,6 +1078,40 @@ pub(crate) fn spawn_resume_then_inject(
     Ok((pid, injection))
 }
 
+/// Diagnostic path: run only the zygote spawn handshake and resume the child.
+/// No loader, agent, memfd, or agent threads are installed.
+pub(crate) fn spawn_only_and_resume(package: &str, timeout_secs: u64) -> Result<u32, String> {
+    log_info!("Spawn-only 诊断: 只启动并恢复 {}", package);
+    let hello = spawn_and_wait_hello(package, timeout_secs)?;
+    resume_child(hello.pid)?;
+    Ok(hello.pid)
+}
+
+/// Diagnostic path: patch zygote and launch the app, but use a passive setArgV0
+/// replacement that only calls the original function. No zymbiote hello is expected.
+pub(crate) fn spawn_passive_setargv0_launch(package: &str, timeout_secs: u64) -> Result<u32, String> {
+    log_info!("Passive setArgV0 诊断: 只保留 setArgV0 指针改写并启动 {}", package);
+    ensure_zymbiote_loaded()?;
+
+    let target = resolve_spawn_target(package);
+    if target.process_name != target.package {
+        log_info!("主进程解析: {} -> {}", target.package, target.process_name);
+    } else {
+        log_verbose!("主进程解析: {} 使用默认包进程", target.package);
+    }
+
+    launch_app(&target.package)?;
+    wait_for_process_name(&target.process_name, std::time::Duration::from_secs(timeout_secs)).ok_or_else(|| {
+        let live_processes = list_package_processes(&target.package);
+        let live_hint = if live_processes.is_empty() {
+            "未发现目标包相关进程".to_string()
+        } else {
+            format!("当前目标包相关进程:\n{}", live_processes.join("\n"))
+        };
+        format!("等待进程 {} 启动超时: {}", target.process_name, live_hint)
+    })
+}
+
 /// 确保 zymbiote 已加载到所有 zygote 进程
 /// 与 Frida ensure_loaded 一致：可重入，检测新出现的 USAP 进程
 pub(crate) fn ensure_zymbiote_loaded() -> Result<(), String> {
@@ -1756,6 +1815,47 @@ fn list_package_processes(package: &str) -> Vec<String> {
     out
 }
 
+fn wait_for_process_name(process_name: &str, timeout: std::time::Duration) -> Option<u32> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(pid) = find_process_by_exact_name(process_name) {
+            return Some(pid);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+fn find_process_by_exact_name(process_name: &str) -> Option<u32> {
+    let proc_dir = std::fs::read_dir("/proc").ok()?;
+    for entry in proc_dir.flatten() {
+        let fname = entry.file_name();
+        let fname_str = fname.to_string_lossy();
+        if !fname_str.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let pid: u32 = match fname_str.parse() {
+            Ok(pid) => pid,
+            Err(_) => continue,
+        };
+        let cmdline_path = format!("/proc/{}/cmdline", pid);
+        let Ok(data) = std::fs::read(cmdline_path) else {
+            continue;
+        };
+        let proc_name = data
+            .split(|&b| b == 0)
+            .next()
+            .and_then(|s| std::str::from_utf8(s).ok())
+            .unwrap_or("");
+        if proc_name == process_name {
+            return Some(pid);
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone)]
 struct BinaryManifest {
     package_name: Option<String>,
@@ -2074,6 +2174,25 @@ fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
 fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
     let maps = parse_proc_maps(pid)?;
     let page_size = system_page_size();
+    let diag_passive_setargv0 = diag_env_flag("RF_DIAG_ZYM_PASSIVE_SETARGV0");
+    let diag_no_setcontext = diag_env_flag("RF_DIAG_ZYM_NO_SETCONTEXT") || diag_passive_setargv0;
+    let diag_no_setargv0 = diag_env_flag("RF_DIAG_ZYM_NO_SETARGV0");
+
+    if diag_no_setcontext && diag_no_setargv0 {
+        return Err("RF_DIAG_ZYM_NO_SETCONTEXT 和 RF_DIAG_ZYM_NO_SETARGV0 不能同时启用".to_string());
+    }
+    if diag_passive_setargv0 && diag_no_setargv0 {
+        return Err("RF_DIAG_ZYM_PASSIVE_SETARGV0 和 RF_DIAG_ZYM_NO_SETARGV0 不能同时启用".to_string());
+    }
+    if diag_no_setcontext {
+        log_warn!("诊断模式: 跳过 zymbiote setcontext GOT hook");
+    }
+    if diag_no_setargv0 {
+        log_warn!("诊断模式: 跳过 zymbiote setArgV0 指针 hook，强制 setcontext-only 阻塞");
+    }
+    if diag_passive_setargv0 {
+        log_warn!("诊断模式: setArgV0 replacement 只调用原函数并返回，不发 hello/ACK/SIGSTOP");
+    }
 
     // 1. 找到 payload 写入位置（libstagefright.so 的 R+X 段末尾页）
     let loc = find_payload_location(&maps)?;
@@ -2087,7 +2206,7 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
     // 2. 与 Frida 一致：提前检查 boot heap 候选区是否存在
     let has_heap_candidates = maps.iter().any(is_boot_heap);
     if !has_heap_candidates {
-        return Err("未检测到 VM heap 候选区域（boot.art / dalvik-LinearAlloc）".to_string());
+        return Err("未检测到 VM heap 候选区域（boot image / dalvik-LinearAlloc）".to_string());
     }
 
     // 3. 解析 libc.so 获取函数地址
@@ -2107,6 +2226,7 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
     if let Some((addr, _)) = &setcontext_info {
         log_verbose!("selinux_android_setcontext 地址: 0x{:x}", addr);
     }
+    let setcontext_info = if diag_no_setcontext { None } else { setcontext_info };
 
     // 6. 先构建 payload 获取替换函数地址（用于 already-patched 检测）
     let (
@@ -2135,10 +2255,14 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
         ));
     }
 
-    // 7. 找到 setArgV0 指针（三层兜底扫描：boot heap → RW private → 全读）
+    // 7. 找到 setArgV0 指针（三层兜底扫描：boot heap → ART RW private → ART readable）
     //    None: 三层全 miss，启用 setcontext-only 降级阻塞（要求 setcontext GOT 可用）
     let mut payload_data = payload_data;
-    let setargv0_search = find_setargv0_pointer_in_heap(pid, &maps, setargv0_addr, Some(replacement_setargv0_addr))?;
+    let setargv0_search = if diag_no_setargv0 {
+        None
+    } else {
+        find_setargv0_pointer_in_heap(pid, &maps, setargv0_addr, Some(replacement_setargv0_addr))?
+    };
     let already_patched = setargv0_search.as_ref().map(|(_, _, p)| *p).unwrap_or(false);
 
     if let Some((addr, backup, patched)) = &setargv0_search {
@@ -2149,13 +2273,17 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
             if *patched { " [already patched]" } else { "" }
         );
     } else {
-        // 降级模式：要求 setcontext GOT 必须可用
+        // 降级模式或诊断模式：要求 setcontext GOT 必须可用
         if !matches!(&setcontext_info, Some((_, Some(_)))) {
-            return Err("boot heap / RW private / 全读映射均未命中 setArgV0 指针，\
+            return Err("boot heap / ART RW private / ART readable 映射均未命中 setArgV0 指针，\
                  且 setcontext GOT 不可用 — 无法建立阻塞点，目标 Android 版本可能不兼容。"
                 .to_string());
         }
-        log_warn!("降级为 setcontext-only 阻塞（Android 版本兼容路径）");
+        if diag_no_setargv0 {
+            log_warn!("诊断模式: setcontext-only 阻塞已启用");
+        } else {
+            log_warn!("降级为 setcontext-only 阻塞（Android 版本兼容路径）");
+        }
         let flag_offset = ctx_base_in_payload + CTX_BLOCK_IN_SETCONTEXT - CTX_SOCKET_PATH;
         if flag_offset + 8 > payload_data.len() {
             return Err(format!(
@@ -2685,9 +2813,9 @@ fn find_got_entry_for_import(maps: &[MapEntry], so_name: &str, import_name: &str
     None
 }
 
-/// 在 boot heap 中搜索 setArgV0 函数指针
+/// 在 boot image 相关映射中搜索 setArgV0 函数指针
 /// 与 Frida 一致：同时搜索原始指针和已被替换的指针（already-patched 检测）。
-/// 如果发现 boot heap 中指针已被替换（如另一个 rustFrida 实例），仍能正确定位 slot。
+/// 如果发现指针已被替换（如另一个 rustFrida 实例），仍能正确定位 slot。
 fn find_setargv0_pointer_in_heap(
     pid: u32,
     maps: &[MapEntry],
@@ -2793,7 +2921,7 @@ fn find_setargv0_pointer_in_heap(
         Ok(Some((addr, backup, already_patched)))
     };
 
-    // 搜索候选区域：boot.art / boot-framework.art / dalvik-LinearAlloc（R+W 非 X 非 shared）
+    // 搜索候选区域：boot image / dalvik-LinearAlloc（R+W 非 X 非 shared）
     // 与 Frida is_boot_heap() 一致
     let preferred: Vec<&MapEntry> = maps.iter().filter(|e| is_boot_heap(e)).collect();
     log_verbose!("搜索 {} 个 boot heap 区域查找 setArgV0 指针", preferred.len());
@@ -2802,14 +2930,15 @@ fn find_setargv0_pointer_in_heap(
     }
 
     // Android 16 / 新版本 ART 上，slot 可能不再落在传统 boot heap/LinearAlloc 区域。
-    // 回退到所有 RW private 映射，并要求唯一命中，避免误改。
+    // 回退只扫描 ART 相关 RW private 映射，并要求唯一命中，避免误扫 malloc/stack/random 残留值。
     let fallback: Vec<&MapEntry> = maps
         .iter()
         .filter(|e| is_private_rw_mapping(e))
         .filter(|e| !is_boot_heap(e))
+        .filter(|e| is_setargv0_rw_fallback_candidate(e))
         .collect();
     log_warn!(
-        "boot heap 中未命中 setArgV0 指针，回退扫描 {} 个 RW private 区域",
+        "boot heap 中未命中 setArgV0 指针，回退扫描 {} 个 ART 相关 RW private 区域",
         fallback.len()
     );
     if let Some(found) = search_candidates(&fallback)? {
@@ -2817,14 +2946,15 @@ fn find_setargv0_pointer_in_heap(
     }
 
     // 再退一层：某些新系统可能把 slot 放在只读或 shared 映射中。
-    // 这里扩大到所有可读映射，但仍要求唯一命中。
+    // 继续限制在 ART 相关可读映射，仍要求唯一命中。
     let final_fallback: Vec<&MapEntry> = maps
         .iter()
         .filter(|e| is_readable_mapping(e))
         .filter(|e| !is_private_rw_mapping(e))
+        .filter(|e| is_setargv0_readable_fallback_candidate(e))
         .collect();
     log_warn!(
-        "RW private 区域未命中 setArgV0 指针，继续扫描 {} 个其余可读区域",
+        "ART 相关 RW private 区域未命中 setArgV0 指针，继续扫描 {} 个 ART 相关可读区域",
         final_fallback.len()
     );
     if let Some(found) = search_candidates(&final_fallback)? {
@@ -2833,7 +2963,7 @@ fn find_setargv0_pointer_in_heap(
 
     // 所有层均未命中：返回 None，上层降级为 setcontext GOT 阻塞（最后的兼容路径）
     log_warn!(
-        "未在 boot heap、RW private 或其余可读区域中找到 setArgV0 指针 (0x{:x})，切换降级模式",
+        "未在 boot heap、ART 相关 RW private 或 ART 相关可读区域中找到 setArgV0 指针 (0x{:x})，切换降级模式",
         setargv0_addr
     );
     Ok(None)
@@ -2994,6 +3124,12 @@ fn build_payload(
     write_u64(ctx, CTX_CAPSET_GOT_SLOT - CTX_SOCKET_PATH, 0);
     write_u64(ctx, CTX_CAPSET_ORIGINAL - CTX_SOCKET_PATH, 0);
     write_u64(ctx, CTX_CAPSET_GOT_PROTECTION - CTX_SOCKET_PATH, 0);
+    let passive_setargv0 = if diag_env_flag("RF_DIAG_ZYM_PASSIVE_SETARGV0") {
+        1u64
+    } else {
+        0u64
+    };
+    write_u64(ctx, CTX_PASSIVE_SETARGV0 - CTX_SOCKET_PATH, passive_setargv0);
     // 无需 GOT 重定位：zymbiote 用 -shared -nostdlib 构建，
     // ARM64 ADRP+ADD 为 PC-relative 寻址，代码和数据在同一段内，
     // 移动到新地址后相对偏移不变。实测 .got 为空且无动态重定位。
@@ -3023,9 +3159,16 @@ fn write_ctx_u64(payload: &mut [u8], ctx_base: usize, field_offset: usize, value
     Ok(())
 }
 
-/// 恢复所有挂起的子进程连接（发 ACK → 等 EOF → 等 SIGSTOP → 还原 → SIGCONT）
-/// 与 Frida close() 一致：退出前先恢复所有 gated connections，防止子进程永远卡在 recv(ACK)
-fn cleanup_pending_connections() {
+#[derive(Clone, Copy)]
+enum PendingConnectionCleanup {
+    Resume,
+    KillAfterRevert,
+}
+
+/// 处理所有挂起的子进程连接。
+/// 正常退出走 Resume，避免 child 永远卡在 recv(ACK)；
+/// pre-resume Java hook 失败走 KillAfterRevert，避免放行后错过早期 hook。
+fn cleanup_pending_connections(mode: PendingConnectionCleanup) {
     let conns = match ACTIVE_CONNECTIONS.get() {
         Some(lock) => lock,
         None => return,
@@ -3043,14 +3186,22 @@ fn cleanup_pending_connections() {
         return;
     }
 
-    log_info!("正在恢复 {} 个挂起的子进程...", entries.len());
+    match mode {
+        PendingConnectionCleanup::Resume => log_info!("正在恢复 {} 个挂起的子进程...", entries.len()),
+        PendingConnectionCleanup::KillAfterRevert => log_info!("正在终止 {} 个未放行的子进程...", entries.len()),
+    }
 
     for (pid, (stream, ppid)) in entries {
-        log_verbose!("恢复挂起的子进程 {} (ppid={})...", pid, ppid);
+        match mode {
+            PendingConnectionCleanup::Resume => log_verbose!("恢复挂起的子进程 {} (ppid={})...", pid, ppid),
+            PendingConnectionCleanup::KillAfterRevert => {
+                log_verbose!("终止未放行的子进程 {} (ppid={})...", pid, ppid)
+            }
+        }
 
         // 检查子进程是否仍存在
         if !std::path::Path::new(&format!("/proc/{}", pid)).exists() {
-            log_verbose!("子进程 {} 已不存在，跳过恢复", pid);
+            log_verbose!("子进程 {} 已不存在，跳过处理", pid);
             drop(stream);
             continue;
         }
@@ -3060,6 +3211,12 @@ fn cleanup_pending_connections() {
             if let Err(e) = request_child_side_restore(pid, ppid, stream, std::time::Duration::from_secs(2)) {
                 log_warn!("{}", e);
             }
+            match mode {
+                PendingConnectionCleanup::Resume => {}
+                PendingConnectionCleanup::KillAfterRevert => unsafe {
+                    libc::kill(pid as i32, libc::SIGKILL);
+                },
+            };
             continue;
         }
 
@@ -3068,8 +3225,11 @@ fn cleanup_pending_connections() {
             let mut stream = stream;
             // 1. 发送 ACK 解除子进程阻塞
             if stream.write_all(&[ACK_BYTE]).is_err() {
-                // 连接已断开，子进程可能已退出，仍尝试 SIGCONT
-                unsafe { libc::kill(pid as i32, libc::SIGCONT) };
+                // 连接已断开，子进程可能已退出；按清理模式处理剩余进程。
+                match mode {
+                    PendingConnectionCleanup::Resume => unsafe { libc::kill(pid as i32, libc::SIGCONT) },
+                    PendingConnectionCleanup::KillAfterRevert => unsafe { libc::kill(pid as i32, libc::SIGKILL) },
+                };
                 continue;
             }
 
@@ -3081,14 +3241,15 @@ fn cleanup_pending_connections() {
             if wait_until_stopped(pid).is_ok() {
                 let _ = revert_child_patch_by_ppid(pid, ppid);
             }
-            unsafe { libc::kill(pid as i32, libc::SIGCONT) };
+            match mode {
+                PendingConnectionCleanup::Resume => unsafe { libc::kill(pid as i32, libc::SIGCONT) },
+                PendingConnectionCleanup::KillAfterRevert => unsafe { libc::kill(pid as i32, libc::SIGKILL) },
+            };
         }
     }
 }
 
-/// 退出时还原所有 Zygote patch（幂等：多次调用只执行一次）
-/// 与 Frida close() 顺序一致：先恢复挂起的子进程，再还原 Zygote patch
-pub(crate) fn cleanup_zygote_patches() {
+fn cleanup_zygote_patches_with_pending_mode(mode: PendingConnectionCleanup) {
     CLEANUP_STARTED.store(true, Ordering::SeqCst);
 
     // 幂等保护：所有调用路径（正常退出 + 信号处理）共享此检查
@@ -3098,7 +3259,7 @@ pub(crate) fn cleanup_zygote_patches() {
 
     // 1. 先恢复所有挂起的子进程连接（与 Frida close() 顺序一致）
     //    必须在还原 Zygote 之前执行：子进程持有 COW 副本，需要独立还原
-    cleanup_pending_connections();
+    cleanup_pending_connections(mode);
 
     // 2. 再还原 Zygote patch
     let patches = match ZYGOTE_PATCHES.get() {
@@ -3181,6 +3342,17 @@ pub(crate) fn cleanup_zygote_patches() {
     // 还原 SELinux 状态
     #[cfg(not(feature = "noptrace"))]
     crate::selinux::restore_selinux();
+}
+
+/// 退出时还原所有 Zygote patch（幂等：多次调用只执行一次）
+/// 与 Frida close() 顺序一致：先恢复挂起的子进程，再还原 Zygote patch
+pub(crate) fn cleanup_zygote_patches() {
+    cleanup_zygote_patches_with_pending_mode(PendingConnectionCleanup::Resume);
+}
+
+/// pre-resume Java hook 失败时使用：还原 child patch 后终止 child，避免放行错过早期 hook。
+pub(crate) fn abort_pending_children_and_cleanup_zygote_patches() {
+    cleanup_zygote_patches_with_pending_mode(PendingConnectionCleanup::KillAfterRevert);
 }
 
 /// 是否已执行过清理（幂等保护，cleanup_zygote_patches 内部使用）

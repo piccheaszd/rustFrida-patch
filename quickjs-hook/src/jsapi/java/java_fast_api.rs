@@ -88,6 +88,22 @@ struct ArtCalleeSaveProfile {
     suspend_method_offset: u64,
 }
 
+#[derive(Clone, Copy)]
+struct ArtCalleeSaveDynamicResolution {
+    label: &'static str,
+    method: u64,
+    suspend_method_offset: u64,
+    set_base_offset: Option<u64>,
+    init_sequence_offset: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeRegExpr {
+    Unknown,
+    RuntimePlus(u64),
+    RuntimePlusTypeIndex(u64),
+}
+
 const ART_CALLEE_SAVE_SYMBOLS: &[ArtSymbolCandidate] = &[
     ArtSymbolCandidate {
         label: "getCalleeSaveMethod",
@@ -127,6 +143,17 @@ const ART_CALLEE_SAVE_PROFILES: &[ArtCalleeSaveProfile] = &[ArtCalleeSaveProfile
     max_sdk: 36,
     suspend_method_offset: 0x28,
 }];
+
+const ART_SET_CALLEE_SAVE_METHOD_SYMBOL: &str =
+    "_ZN3art7Runtime19SetCalleeSaveMethodEPNS_9ArtMethodENS_14CalleeSaveTypeE";
+const ART_CREATE_CALLEE_SAVE_METHOD_SYMBOL: &str = "_ZN3art7Runtime22CreateCalleeSaveMethodEv";
+const CALLEE_SAVE_EVERYTHING_FOR_SUSPEND_CHECK: u32 = 5;
+const CALLEE_SAVE_METHOD_COUNT: u64 = 6;
+const CALLEE_SAVE_SLOT_SIZE: u64 = 8;
+const CALLEE_SAVE_MAX_RUNTIME_OFFSET: u64 = 0x400;
+const SET_CALLEE_SAVE_SCAN_BYTES: usize = 192;
+const INIT_CALLEE_SAVE_VERIFY_WINDOW: u64 = 0x140;
+const INIT_CALLEE_SAVE_BLOCK_BACK_INSNS: u64 = 12;
 
 const QUICK_ENTRYPOINTS_OFFSET_FAILED: usize = usize::MAX;
 const QUICK_ENTRYPOINT_COUNT: usize = 174;
@@ -241,6 +268,9 @@ pub unsafe extern "C" fn art_quick_callee_save_suspend_method() -> *mut std::ffi
 
 #[no_mangle]
 pub unsafe extern "C" fn art_quick_test_suspend_entrypoint() -> *mut std::ffi::c_void {
+    if crate::is_raw_clone_js_thread() {
+        return std::ptr::null_mut();
+    }
     *ART_QUICK_TEST_SUSPEND_ENTRYPOINT.get_or_init(|| unsafe {
         let env = get_thread_env().unwrap_or(std::ptr::null_mut());
         current_art_thread(env)
@@ -257,7 +287,6 @@ pub unsafe extern "C" fn art_quick_top_quick_frame_offset() -> u64 {
 }
 
 unsafe fn resolve_callee_save_suspend_method() -> Option<u64> {
-    const CALLEE_SAVE_EVERYTHING_FOR_SUSPEND_CHECK: u32 = 5;
     let runtime = resolve_art_runtime_instance()?;
 
     type GetCalleeSaveMethodFn = unsafe extern "C" fn(*mut std::ffi::c_void, u32) -> *mut std::ffi::c_void;
@@ -277,9 +306,21 @@ unsafe fn resolve_callee_save_suspend_method() -> Option<u64> {
         }
     }
 
-    crate::jsapi::console::output_message(
-        "[fast] ART callee-save exported Runtime::GetCalleeSaveMethod symbols missing; trying profile fallback",
-    );
+    output_verbose("[fast] ART Runtime::GetCalleeSaveMethod not exported; trying dynamic callee-save anchors");
+
+    if let Some(anchor) = probe_callee_save_dynamic_anchor(runtime) {
+        crate::jsapi::console::output_message(&format!(
+            "[fast] ART callee-save suspend method via {}: method={:#x}, runtime_off=0x{:x}, set_base={}, init_seq={}",
+            anchor.label,
+            anchor.method,
+            anchor.suspend_method_offset,
+            fmt_optional_hex(anchor.set_base_offset),
+            fmt_optional_hex(anchor.init_sequence_offset)
+        ));
+        return Some(anchor.method);
+    }
+
+    output_verbose("[fast] ART callee-save dynamic anchors unavailable; trying profile fallback");
 
     if let Some(method) = resolve_callee_save_suspend_method_from_profile(runtime) {
         return Some(method);
@@ -287,6 +328,380 @@ unsafe fn resolve_callee_save_suspend_method() -> Option<u64> {
 
     crate::jsapi::console::output_message("[fast] ART callee-save suspend method unavailable");
     None
+}
+
+unsafe fn probe_callee_save_dynamic_anchor(runtime: *mut std::ffi::c_void) -> Option<ArtCalleeSaveDynamicResolution> {
+    let runtime_addr = runtime as u64;
+    let set_base_offset = decode_callee_save_base_offset_from_setter();
+    let init_sequence_offset = scan_callee_save_suspend_offset_from_runtime_init();
+
+    if let Some(base_offset) = set_base_offset {
+        let suspend_method_offset =
+            base_offset + CALLEE_SAVE_EVERYTHING_FOR_SUSPEND_CHECK as u64 * CALLEE_SAVE_SLOT_SIZE;
+        if suspend_method_offset <= CALLEE_SAVE_MAX_RUNTIME_OFFSET
+            && looks_like_callee_save_method_array(runtime_addr, suspend_method_offset)
+        {
+            let method = read_runtime_callee_save_method(runtime_addr, suspend_method_offset);
+            if method != 0 {
+                let label = if init_sequence_offset == Some(suspend_method_offset) {
+                    "setCalleeSaveMethod+runtimeInitSequence"
+                } else {
+                    if let Some(init_offset) = init_sequence_offset {
+                        output_verbose(&format!(
+                            "[fast] ART callee-save init sequence offset 0x{:x} differs from setter offset 0x{:x}",
+                            init_offset, suspend_method_offset
+                        ));
+                    }
+                    "setCalleeSaveMethod"
+                };
+                return Some(ArtCalleeSaveDynamicResolution {
+                    label,
+                    method,
+                    suspend_method_offset,
+                    set_base_offset,
+                    init_sequence_offset,
+                });
+            }
+        } else {
+            output_verbose(&format!(
+                "[fast] ART SetCalleeSaveMethod decoded base offset 0x{:x}, but runtime array validation failed",
+                base_offset
+            ));
+        }
+    }
+
+    if let Some(suspend_method_offset) = init_sequence_offset {
+        if suspend_method_offset <= CALLEE_SAVE_MAX_RUNTIME_OFFSET
+            && looks_like_callee_save_method_array(runtime_addr, suspend_method_offset)
+        {
+            let method = read_runtime_callee_save_method(runtime_addr, suspend_method_offset);
+            if method != 0 {
+                return Some(ArtCalleeSaveDynamicResolution {
+                    label: "runtimeInitSequence",
+                    method,
+                    suspend_method_offset,
+                    set_base_offset,
+                    init_sequence_offset,
+                });
+            }
+        } else {
+            output_verbose(&format!(
+                "[fast] ART callee-save runtime init sequence offset 0x{:x}, but runtime array validation failed",
+                suspend_method_offset
+            ));
+        }
+    }
+
+    None
+}
+
+unsafe fn decode_callee_save_base_offset_from_setter() -> Option<u64> {
+    let setter = crate::jsapi::module::libart_dlsym(ART_SET_CALLEE_SAVE_METHOD_SYMBOL) as u64;
+    if setter == 0 || !crate::jsapi::module::is_in_libart(setter) {
+        return None;
+    }
+
+    let mut regs = [RuntimeRegExpr::Unknown; 32];
+    regs[0] = RuntimeRegExpr::RuntimePlus(0);
+
+    for off in (0..SET_CALLEE_SAVE_SCAN_BYTES).step_by(4) {
+        let instr = std::ptr::read_unaligned((setter + off as u64) as *const u32);
+        if let Some(base_offset) = decode_callee_save_setter_store(instr, &regs) {
+            if base_offset <= CALLEE_SAVE_MAX_RUNTIME_OFFSET {
+                return Some(base_offset);
+            }
+        }
+        update_runtime_reg_exprs(instr, &mut regs);
+    }
+
+    None
+}
+
+fn decode_callee_save_setter_store(instr: u32, regs: &[RuntimeRegExpr; 32]) -> Option<u64> {
+    if let Some((rt, rn, rm, option, scaled)) = decode_str64_register_offset(instr) {
+        if rt == 1 && rm == 2 && scaled && matches!(option, 0b010 | 0b011) {
+            if let RuntimeRegExpr::RuntimePlus(base_offset) = regs[rn as usize] {
+                return Some(base_offset);
+            }
+        }
+    }
+
+    if let Some((rt, rn, imm)) = decode_str64_unsigned_imm(instr) {
+        if rt == 1 {
+            if let RuntimeRegExpr::RuntimePlusTypeIndex(base_offset) = regs[rn as usize] {
+                return base_offset.checked_add(imm);
+            }
+        }
+    }
+
+    None
+}
+
+fn update_runtime_reg_exprs(instr: u32, regs: &mut [RuntimeRegExpr; 32]) {
+    if let Some((rd, rn, imm)) = decode_add64_immediate(instr) {
+        regs[rd as usize] = match regs[rn as usize] {
+            RuntimeRegExpr::RuntimePlus(base) => base
+                .checked_add(imm)
+                .map(RuntimeRegExpr::RuntimePlus)
+                .unwrap_or(RuntimeRegExpr::Unknown),
+            RuntimeRegExpr::RuntimePlusTypeIndex(base) => base
+                .checked_add(imm)
+                .map(RuntimeRegExpr::RuntimePlusTypeIndex)
+                .unwrap_or(RuntimeRegExpr::Unknown),
+            RuntimeRegExpr::Unknown => RuntimeRegExpr::Unknown,
+        };
+        return;
+    }
+
+    if let Some((rd, rn, rm, shift)) = decode_add64_shifted_register(instr) {
+        regs[rd as usize] = if rm == 2 && shift == 3 {
+            match regs[rn as usize] {
+                RuntimeRegExpr::RuntimePlus(base) => RuntimeRegExpr::RuntimePlusTypeIndex(base),
+                _ => RuntimeRegExpr::Unknown,
+            }
+        } else {
+            RuntimeRegExpr::Unknown
+        };
+        return;
+    }
+
+    if let Some((rd, rm)) = decode_mov64_register(instr) {
+        regs[rd as usize] = regs[rm as usize];
+    }
+}
+
+unsafe fn scan_callee_save_suspend_offset_from_runtime_init() -> Option<u64> {
+    for (start, end) in libart_executable_ranges() {
+        if let Some(offset) = scan_callee_save_suspend_offset_in_range(start, end) {
+            return Some(offset);
+        }
+    }
+    None
+}
+
+unsafe fn scan_callee_save_suspend_offset_in_range(start: u64, end: u64) -> Option<u64> {
+    let mut addr = start;
+    while addr + 4 <= end {
+        if decode_callee_save_type_mov(addr).is_some_and(|imm| imm == CALLEE_SAVE_EVERYTHING_FOR_SUSPEND_CHECK) {
+            if let Some((base_reg, suspend_offset)) =
+                decode_callee_save_init_block(addr, CALLEE_SAVE_EVERYTHING_FOR_SUSPEND_CHECK, start, end)
+            {
+                if suspend_offset >= CALLEE_SAVE_EVERYTHING_FOR_SUSPEND_CHECK as u64 * CALLEE_SAVE_SLOT_SIZE
+                    && suspend_offset <= CALLEE_SAVE_MAX_RUNTIME_OFFSET
+                {
+                    let base_offset =
+                        suspend_offset - CALLEE_SAVE_EVERYTHING_FOR_SUSPEND_CHECK as u64 * CALLEE_SAVE_SLOT_SIZE;
+                    if verify_callee_save_init_sequence(addr, base_reg, base_offset, start, end) {
+                        return Some(suspend_offset);
+                    }
+                }
+            }
+        }
+        addr += 4;
+    }
+    None
+}
+
+unsafe fn verify_callee_save_init_sequence(
+    type5_mov_addr: u64,
+    base_reg: u32,
+    base_offset: u64,
+    range_start: u64,
+    range_end: u64,
+) -> bool {
+    let window_start = type5_mov_addr
+        .saturating_sub(INIT_CALLEE_SAVE_VERIFY_WINDOW)
+        .max(range_start);
+    let window_end = type5_mov_addr.saturating_add(16).min(range_end);
+    let mut seen_mask = 0u32;
+    let mut addr = window_start;
+
+    while addr + 4 <= window_end {
+        if let Some(ty) = decode_callee_save_type_mov(addr) {
+            if ty < CALLEE_SAVE_METHOD_COUNT as u32 {
+                if let Some((candidate_base_reg, slot_offset)) =
+                    decode_callee_save_init_block(addr, ty, range_start, range_end)
+                {
+                    if candidate_base_reg == base_reg && slot_offset == base_offset + ty as u64 * CALLEE_SAVE_SLOT_SIZE
+                    {
+                        seen_mask |= 1u32 << ty;
+                    }
+                }
+            }
+        }
+        addr += 4;
+    }
+
+    seen_mask & ((1u32 << CALLEE_SAVE_METHOD_COUNT) - 1) == (1u32 << CALLEE_SAVE_METHOD_COUNT) - 1
+}
+
+unsafe fn decode_callee_save_init_block(
+    mov_w2_addr: u64,
+    expected_type: u32,
+    range_start: u64,
+    range_end: u64,
+) -> Option<(u32, u64)> {
+    if decode_callee_save_type_mov(mov_w2_addr) != Some(expected_type) {
+        return None;
+    }
+    if !has_following_bl(mov_w2_addr, range_end) {
+        return None;
+    }
+
+    let search_start = mov_w2_addr
+        .saturating_sub(INIT_CALLEE_SAVE_BLOCK_BACK_INSNS * 4)
+        .max(range_start);
+    let mut addr = mov_w2_addr;
+    while addr >= search_start + 4 {
+        addr -= 4;
+        let instr = std::ptr::read_unaligned(addr as *const u32);
+        if let Some((_rt, rn, imm)) = decode_ldr64_unsigned_imm(instr) {
+            if rn != 31 && imm % CALLEE_SAVE_SLOT_SIZE == 0 && imm <= CALLEE_SAVE_MAX_RUNTIME_OFFSET {
+                return Some((rn, imm));
+            }
+        }
+    }
+    None
+}
+
+unsafe fn has_following_bl(mov_w2_addr: u64, range_end: u64) -> bool {
+    let mut addr = mov_w2_addr + 4;
+    let end = mov_w2_addr.saturating_add(12).min(range_end);
+    while addr + 4 <= end {
+        let instr = std::ptr::read_unaligned(addr as *const u32);
+        if is_bl_immediate(instr) {
+            return true;
+        }
+        addr += 4;
+    }
+    false
+}
+
+fn libart_executable_ranges() -> Vec<(u64, u64)> {
+    let maps = match crate::jsapi::util::read_proc_self_maps() {
+        Some(maps) => maps,
+        None => return Vec::new(),
+    };
+
+    crate::jsapi::util::proc_maps_entries(&maps)
+        .filter_map(|entry| {
+            let path = entry.path?;
+            let prot = entry.prot_flags();
+            if prot & libc::PROT_READ == 0 || prot & libc::PROT_EXEC == 0 {
+                return None;
+            }
+            if !path.ends_with("/libart.so") {
+                return None;
+            }
+            if !(path.starts_with("/apex/") || path.starts_with("/system/") || path.starts_with("/system_ext/")) {
+                return None;
+            }
+            Some((entry.start, entry.end))
+        })
+        .collect()
+}
+
+fn decode_str64_register_offset(instr: u32) -> Option<(u32, u32, u32, u32, bool)> {
+    if instr & 0x3b60_0c00 != 0x3820_0800 {
+        return None;
+    }
+    let rt = instr & 0x1f;
+    let rn = (instr >> 5) & 0x1f;
+    let scaled = ((instr >> 12) & 1) != 0;
+    let option = (instr >> 13) & 0x7;
+    let rm = (instr >> 16) & 0x1f;
+    Some((rt, rn, rm, option, scaled))
+}
+
+fn decode_str64_unsigned_imm(instr: u32) -> Option<(u32, u32, u64)> {
+    if instr & 0xffc0_0000 != 0xf900_0000 {
+        return None;
+    }
+    let rt = instr & 0x1f;
+    let rn = (instr >> 5) & 0x1f;
+    let imm = ((instr >> 10) & 0xfff) as u64 * 8;
+    Some((rt, rn, imm))
+}
+
+fn decode_ldr64_unsigned_imm(instr: u32) -> Option<(u32, u32, u64)> {
+    if instr & 0xffc0_0000 != 0xf940_0000 {
+        return None;
+    }
+    let rt = instr & 0x1f;
+    let rn = (instr >> 5) & 0x1f;
+    let imm = ((instr >> 10) & 0xfff) as u64 * 8;
+    Some((rt, rn, imm))
+}
+
+fn decode_add64_immediate(instr: u32) -> Option<(u32, u32, u64)> {
+    if instr & 0xffc0_0000 != 0x9100_0000 {
+        return None;
+    }
+    let rd = instr & 0x1f;
+    let rn = (instr >> 5) & 0x1f;
+    let shift = (instr >> 22) & 0x3;
+    if shift > 1 {
+        return None;
+    }
+    let mut imm = ((instr >> 10) & 0xfff) as u64;
+    if shift == 1 {
+        imm <<= 12;
+    }
+    Some((rd, rn, imm))
+}
+
+fn decode_add64_shifted_register(instr: u32) -> Option<(u32, u32, u32, u32)> {
+    if instr & 0xff20_0000 != 0x8b00_0000 {
+        return None;
+    }
+    if (instr >> 22) & 0x3 != 0 {
+        return None;
+    }
+    let rd = instr & 0x1f;
+    let rn = (instr >> 5) & 0x1f;
+    let shift = (instr >> 10) & 0x3f;
+    let rm = (instr >> 16) & 0x1f;
+    Some((rd, rn, rm, shift))
+}
+
+fn decode_mov64_register(instr: u32) -> Option<(u32, u32)> {
+    if instr & 0xffe0_ffe0 != 0xaa00_03e0 {
+        return None;
+    }
+    let rd = instr & 0x1f;
+    let rm = (instr >> 16) & 0x1f;
+    if rd == 31 || rm == 31 {
+        return None;
+    }
+    Some((rd, rm))
+}
+
+unsafe fn decode_callee_save_type_mov(addr: u64) -> Option<u32> {
+    let instr = std::ptr::read_unaligned(addr as *const u32);
+    if instr == 0x2a1f_03e2 {
+        return Some(0);
+    }
+    if instr & 0xffe0_001f != 0x5280_0002 {
+        return None;
+    }
+    if ((instr >> 21) & 0x3) != 0 {
+        return None;
+    }
+    Some((instr >> 5) & 0xffff)
+}
+
+fn is_bl_immediate(instr: u32) -> bool {
+    instr & 0xfc00_0000 == 0x9400_0000
+}
+
+unsafe fn read_runtime_callee_save_method(runtime_addr: u64, suspend_method_offset: u64) -> u64 {
+    std::ptr::read_volatile((runtime_addr + suspend_method_offset) as *const u64) & super::PAC_STRIP_MASK
+}
+
+fn fmt_optional_hex(value: Option<u64>) -> String {
+    value
+        .map(|v| format!("0x{:x}", v))
+        .unwrap_or_else(|| "none".to_string())
 }
 
 unsafe fn resolve_callee_save_suspend_method_from_profile(runtime: *mut std::ffi::c_void) -> Option<u64> {
@@ -298,8 +713,7 @@ unsafe fn resolve_callee_save_suspend_method_from_profile(runtime: *mut std::ffi
             continue;
         }
 
-        let method = std::ptr::read_volatile((runtime_addr + profile.suspend_method_offset) as *const u64)
-            & 0x00ff_ffff_ffff_ffff;
+        let method = read_runtime_callee_save_method(runtime_addr, profile.suspend_method_offset);
         if method == 0 || !looks_like_callee_save_method_array(runtime_addr, profile.suspend_method_offset) {
             continue;
         }
@@ -325,8 +739,7 @@ unsafe fn probe_callee_save_profile_fallback(
             continue;
         }
 
-        let method = std::ptr::read_volatile((runtime_addr + profile.suspend_method_offset) as *const u64)
-            & 0x00ff_ffff_ffff_ffff;
+        let method = read_runtime_callee_save_method(runtime_addr, profile.suspend_method_offset);
         if method != 0 && looks_like_callee_save_method_array(runtime_addr, profile.suspend_method_offset) {
             return Some((profile, method));
         }
@@ -339,7 +752,7 @@ unsafe fn looks_like_callee_save_method_array(runtime: u64, suspend_method_offse
     let first = runtime + suspend_method_offset - 5 * 8;
     let mut previous = 0u64;
     for i in 0..6u64 {
-        let method = std::ptr::read_volatile((first + i * 8) as *const u64) & 0x00ff_ffff_ffff_ffff;
+        let method = std::ptr::read_volatile((first + i * 8) as *const u64) & super::PAC_STRIP_MASK;
         if method == 0 || (method & 0x3) != 0 {
             return false;
         }
@@ -366,6 +779,8 @@ pub(super) unsafe extern "C" fn js_art_symbol_probe(
 
     let runtime_instance = crate::jsapi::module::libart_dlsym("_ZN3art7Runtime9instance_E") as u64;
     let runtime_current = crate::jsapi::module::libart_dlsym("_ZN3art7Runtime7CurrentEv") as u64;
+    let set_callee_save = crate::jsapi::module::libart_dlsym(ART_SET_CALLEE_SAVE_METHOD_SYMBOL) as u64;
+    let create_callee_save = crate::jsapi::module::libart_dlsym(ART_CREATE_CALLEE_SAVE_METHOD_SYMBOL) as u64;
     obj.set_property(
         ctx,
         "runtimeInstanceSymbol",
@@ -375,6 +790,16 @@ pub(super) unsafe extern "C" fn js_art_symbol_probe(
         ctx,
         "runtimeCurrentSymbol",
         JSValue(ffi::JS_NewBigUint64(ctx, runtime_current)),
+    );
+    obj.set_property(
+        ctx,
+        "setCalleeSaveMethodSymbol",
+        JSValue(ffi::JS_NewBigUint64(ctx, set_callee_save)),
+    );
+    obj.set_property(
+        ctx,
+        "createCalleeSaveMethodSymbol",
+        JSValue(ffi::JS_NewBigUint64(ctx, create_callee_save)),
     );
 
     let symbols = JSValue(ffi::JS_NewObject(ctx));
@@ -410,6 +835,52 @@ pub(super) unsafe extern "C" fn js_art_symbol_probe(
         JSValue(ffi::JS_NewBigUint64(ctx, selected_addr)),
     );
 
+    let dynamic = JSValue(ffi::JS_NewObject(ctx));
+    let mut dynamic_valid = false;
+    if let Some(runtime) = resolve_art_runtime_instance() {
+        let runtime_addr = runtime as u64;
+        dynamic.set_property(ctx, "runtime", JSValue(ffi::JS_NewBigUint64(ctx, runtime_addr)));
+        dynamic.set_property(
+            ctx,
+            "setBaseOffset",
+            JSValue(ffi::JS_NewBigUint64(
+                ctx,
+                decode_callee_save_base_offset_from_setter().unwrap_or(u64::MAX),
+            )),
+        );
+        dynamic.set_property(
+            ctx,
+            "initSequenceOffset",
+            JSValue(ffi::JS_NewBigUint64(
+                ctx,
+                scan_callee_save_suspend_offset_from_runtime_init().unwrap_or(u64::MAX),
+            )),
+        );
+        if let Some(anchor) = probe_callee_save_dynamic_anchor(runtime) {
+            dynamic_valid = true;
+            dynamic.set_property(ctx, "valid", JSValue::bool(true));
+            dynamic.set_property(ctx, "source", JSValue::string(ctx, anchor.label));
+            dynamic.set_property(
+                ctx,
+                "runtimeOffset",
+                JSValue(ffi::JS_NewBigUint64(ctx, anchor.suspend_method_offset)),
+            );
+            dynamic.set_property(
+                ctx,
+                "candidateMethod",
+                JSValue(ffi::JS_NewBigUint64(ctx, anchor.method)),
+            );
+        } else {
+            dynamic.set_property(ctx, "valid", JSValue::bool(false));
+        }
+    } else {
+        dynamic.set_property(ctx, "valid", JSValue::bool(false));
+        dynamic.set_property(ctx, "runtime", JSValue(ffi::JS_NewBigUint64(ctx, 0)));
+        dynamic.set_property(ctx, "setBaseOffset", JSValue(ffi::JS_NewBigUint64(ctx, u64::MAX)));
+        dynamic.set_property(ctx, "initSequenceOffset", JSValue(ffi::JS_NewBigUint64(ctx, u64::MAX)));
+    }
+    obj.set_property(ctx, "calleeSaveDynamicAnchor", dynamic);
+
     let fallback = JSValue(ffi::JS_NewObject(ctx));
     let mut fallback_valid = false;
     if let Some(runtime) = resolve_art_runtime_instance() {
@@ -439,7 +910,7 @@ pub(super) unsafe extern "C" fn js_art_symbol_probe(
     obj.set_property(
         ctx,
         "quickCalleeSaveFrameSupported",
-        JSValue::bool(selected_addr != 0 || fallback_valid),
+        JSValue::bool(selected_addr != 0 || dynamic_valid || fallback_valid),
     );
     obj.0
 }
@@ -447,7 +918,7 @@ pub(super) unsafe extern "C" fn js_art_symbol_probe(
 unsafe fn resolve_art_runtime_instance() -> Option<*mut std::ffi::c_void> {
     let instance_ptr = crate::jsapi::module::libart_dlsym("_ZN3art7Runtime9instance_E");
     if !instance_ptr.is_null() {
-        let raw = std::ptr::read_volatile(instance_ptr as *const u64) & 0x00ff_ffff_ffff_ffff;
+        let raw = std::ptr::read_volatile(instance_ptr as *const u64) & super::PAC_STRIP_MASK;
         if raw != 0 {
             return Some(raw as *mut std::ffi::c_void);
         }
@@ -499,7 +970,7 @@ fn shorty_char(type_sig: &str) -> u8 {
     }
 }
 
-unsafe fn resolve_fast_method(
+pub(in crate::jsapi::java) unsafe fn resolve_fast_method(
     env: JniEnv,
     class_name: &str,
     method_name: &str,
@@ -518,7 +989,7 @@ unsafe fn resolve_fast_method(
     let delete_global_ref: DeleteGlobalRefFn = jni_fn!(env, DeleteGlobalRefFn, JNI_DELETE_GLOBAL_REF);
     let new_global_ref: NewGlobalRefFn = jni_fn!(env, NewGlobalRefFn, JNI_NEW_GLOBAL_REF);
     let class_global = new_global_ref(env, cls);
-    if class_global.is_null() || jni_check_exc(env) {
+    if jni_null_or_exc(env, class_global) {
         delete_local_ref(env, cls);
         return Err(format!("NewGlobalRef failed for {}", class_name));
     }
@@ -526,26 +997,111 @@ unsafe fn resolve_fast_method(
     if !force_static {
         let get_method_id: GetMethodIdFn = jni_fn!(env, GetMethodIdFn, JNI_GET_METHOD_ID);
         let method_id = get_method_id(env, cls, c_method.as_ptr(), c_sig.as_ptr());
-        if !method_id.is_null() && !jni_check_exc(env) {
+        if !jni_null_or_exc(env, method_id) {
             let art_method = decode_method_id(env, cls, method_id as u64, false);
             delete_local_ref(env, cls);
             return Ok((art_method, method_id as u64, class_global as u64, false));
         }
-        jni_check_exc(env);
     }
 
     let get_static_method_id: GetStaticMethodIdFn = jni_fn!(env, GetStaticMethodIdFn, JNI_GET_STATIC_METHOD_ID);
     let method_id = get_static_method_id(env, cls, c_method.as_ptr(), c_sig.as_ptr());
-    if !method_id.is_null() && !jni_check_exc(env) {
+    if !jni_null_or_exc(env, method_id) {
         let art_method = decode_method_id(env, cls, method_id as u64, true);
         delete_local_ref(env, cls);
         return Ok((art_method, method_id as u64, class_global as u64, true));
     }
-    jni_check_exc(env);
     delete_local_ref(env, cls);
     delete_global_ref(env, class_global);
 
     Err(format!("method not found: {}.{}{}", class_name, method_name, signature))
+}
+
+pub(in crate::jsapi::java) unsafe fn resolve_fast_field(
+    env: JniEnv,
+    class_name: String,
+    field_name: String,
+    requested_sig: Option<String>,
+) -> Result<FastField, String> {
+    let Some(spec) = get_art_field_spec() else {
+        return Err("unsupported ArtField layout".to_string());
+    };
+
+    cache_fields_for_class(env, &class_name);
+    let (jni_sig, field_id, is_static) = {
+        let guard = FIELD_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let cached = guard
+            .as_ref()
+            .and_then(|cache| cache.get(&class_name))
+            .and_then(|fields| fields.get(&field_name))
+            .map(|info| (info.jni_sig.clone(), info.field_id, info.is_static));
+        match cached {
+            Some(v) => v,
+            None => {
+                let Some(sig) = requested_sig.clone() else {
+                    return Err(format!("field not found: {}.{}", class_name, field_name));
+                };
+                let cls = find_class_safe(env, &class_name);
+                if cls.is_null() {
+                    return Err(format!("class not found: {}", class_name));
+                }
+                let c_name = CString::new(field_name.as_str()).map_err(|_| "invalid field name".to_string())?;
+                let c_sig = CString::new(sig.as_str()).map_err(|_| "invalid field signature".to_string())?;
+                jni_check_exc(env);
+                let get_field_id: GetFieldIdFn = jni_fn!(env, GetFieldIdFn, JNI_GET_FIELD_ID);
+                let field_id = get_field_id(env, cls, c_name.as_ptr(), c_sig.as_ptr());
+                if !jni_null_or_exc(env, field_id) {
+                    (sig, field_id, false)
+                } else {
+                    let get_static_field_id: GetStaticFieldIdFn =
+                        jni_fn!(env, GetStaticFieldIdFn, JNI_GET_STATIC_FIELD_ID);
+                    let field_id = get_static_field_id(env, cls, c_name.as_ptr(), c_sig.as_ptr());
+                    if !jni_null_or_exc(env, field_id) {
+                        (sig, field_id, true)
+                    } else {
+                        return Err(format!("field not found: {}.{}{}", class_name, field_name, sig));
+                    }
+                }
+            }
+        }
+    };
+
+    if let Some(sig) = requested_sig.as_ref() {
+        if sig != &jni_sig {
+            return Err("field signature mismatch".to_string());
+        }
+    }
+    if is_static {
+        return Err("fastField only supports instance fields".to_string());
+    }
+    if !is_fast_field_type(&jni_sig) {
+        return Err("fastField only supports primitive/object instance fields".to_string());
+    }
+
+    let cls = find_class_safe(env, &class_name);
+    if cls.is_null() {
+        return Err(format!("class not found: {}", class_name));
+    }
+    let art_field = decode_field_id(env, cls, field_id as u64, is_static);
+    jni_check_exc(env);
+    if art_field == 0 {
+        return Err(format!("failed to decode field id: {}.{}", class_name, field_name));
+    }
+    refresh_mem_regions();
+    let offset = safe_read_u32(art_field + spec.offset_offset as u64);
+    if offset == 0 {
+        return Err(format!("invalid field offset: {}.{}", class_name, field_name));
+    }
+
+    Ok(FastField {
+        art_field,
+        offset,
+        is_static,
+        value_type: jni_sig.as_bytes()[0],
+        jni_sig,
+        class_name,
+        field_name,
+    })
 }
 
 pub(crate) fn get_fast_method(handle: u64) -> Option<FastMethod> {
@@ -654,54 +1210,77 @@ pub(crate) unsafe extern "C" fn js_java_fast_method(
         (sig_str, false)
     };
 
-    let env = match ensure_jni_initialized() {
-        Ok(e) => e,
-        Err(msg) => return throw_internal_error(ctx, msg),
-    };
-
-    let (art_method, _method_id, class_global_ref, is_static) =
-        match resolve_fast_method(env, &class_name, &method_name, &actual_sig, force_static) {
-            Ok(v) => v,
-            Err(msg) => return throw_internal_error(ctx, msg),
-        };
-
     let (should_compile, compile_kind) = match parse_fast_options(ctx, argc, argv, 3) {
         Ok(v) => v,
         Err(e) => return e,
     };
 
-    let spec = get_art_method_spec(env, art_method);
-    let bridge = find_art_bridge_functions(env, spec.entry_point_offset);
-    let mut entry_point = read_entry_point(art_method, spec.entry_point_offset);
-    if is_art_quick_entrypoint(entry_point, &bridge) && should_compile {
-        let compile = compile_art_method_to_quick(env, art_method, spec.entry_point_offset, bridge, compile_kind);
-        entry_point = compile.after;
-        crate::jsapi::console::output_verbose(&format!(
-            "[fastMethod] compile {}.{}{} kind={} success={} before={:#x} after={:#x} msg={}",
-            class_name,
-            method_name,
-            actual_sig,
-            compile.kind,
-            compile.success,
-            compile.before,
-            compile.after,
-            compile.message
-        ));
-    }
-    if is_art_quick_entrypoint(entry_point, &bridge) {
-        return throw_internal_error(
-            ctx,
-            format!(
-                "fastMethod rejected {}.{}{}: no independent quick entrypoint (entry={:#x})",
-                class_name, method_name, actual_sig, entry_point
-            ),
-        );
-    }
+    let raw_clone = crate::is_raw_clone_js_thread();
+    let (art_method, class_global_ref, class_mirror, is_static) = if raw_clone {
+        match super::callback::resolve_fast_method_via_executor(
+            class_name.clone(),
+            method_name.clone(),
+            actual_sig.clone(),
+            force_static,
+            should_compile,
+            compile_kind,
+        ) {
+            Ok((art_method, class_global_ref, class_mirror, is_static)) => {
+                (art_method, class_global_ref, class_mirror, is_static)
+            }
+            Err(msg) => return throw_internal_error(ctx, msg),
+        }
+    } else {
+        let env = match ensure_jni_initialized() {
+            Ok(e) => e,
+            Err(msg) => return throw_internal_error(ctx, msg),
+        };
+
+        let (art_method, _method_id, class_global_ref, is_static) =
+            match resolve_fast_method(env, &class_name, &method_name, &actual_sig, force_static) {
+                Ok(v) => v,
+                Err(msg) => return throw_internal_error(ctx, msg),
+            };
+
+        let spec = get_art_method_spec(env, art_method);
+        let bridge = find_art_bridge_functions(env, spec.entry_point_offset);
+        let mut entry_point = read_entry_point(art_method, spec.entry_point_offset);
+        if is_art_quick_entrypoint(entry_point, bridge) && should_compile {
+            let compile = compile_art_method_to_quick(env, art_method, spec.entry_point_offset, bridge, compile_kind);
+            entry_point = compile.after;
+            crate::jsapi::console::output_verbose(&format!(
+                "[fastMethod] compile {}.{}{} kind={} success={} before={:#x} after={:#x} msg={}",
+                class_name,
+                method_name,
+                actual_sig,
+                compile.kind,
+                compile.success,
+                compile.before,
+                compile.after,
+                compile.message
+            ));
+        }
+        if is_art_quick_entrypoint(entry_point, bridge) {
+            return throw_internal_error(
+                ctx,
+                format!(
+                    "fastMethod rejected {}.{}{}: no independent quick entrypoint (entry={:#x})",
+                    class_name, method_name, actual_sig, entry_point
+                ),
+            );
+        }
+        (
+            art_method,
+            class_global_ref,
+            super::decode_global_jobject_raw(env, class_global_ref as *mut std::ffi::c_void).unwrap_or(0),
+            is_static,
+        )
+    };
 
     let method = FastMethod {
         art_method,
         class_global_ref,
-        class_mirror: super::decode_global_jobject_raw(env, class_global_ref as *mut std::ffi::c_void).unwrap_or(0),
+        class_mirror,
         is_static,
         param_types: parse_jni_param_types(&actual_sig),
         shorty: make_shorty(&actual_sig),
@@ -736,16 +1315,66 @@ pub(crate) unsafe extern "C" fn js_java_fast_constructor(
         return throw_type_error(ctx, b"constructor signature must return void\0");
     }
 
-    let env = match ensure_jni_initialized() {
-        Ok(e) => e,
-        Err(msg) => return throw_internal_error(ctx, msg),
+    let (should_compile, compile_kind) = match parse_fast_options(ctx, argc, argv, 2) {
+        Ok(v) => v,
+        Err(e) => return e,
     };
 
-    let (art_method, _method_id, class_global_ref, is_static) =
-        match resolve_fast_method(env, &class_name, "<init>", &sig_str, false) {
-            Ok(v) => v,
+    let raw_clone = crate::is_raw_clone_js_thread();
+    let (art_method, class_global_ref, class_mirror, is_static) = if raw_clone {
+        match super::callback::resolve_fast_method_via_executor(
+            class_name.clone(),
+            "<init>".to_string(),
+            sig_str.clone(),
+            false,
+            should_compile,
+            compile_kind,
+        ) {
+            Ok((art_method, class_global_ref, class_mirror, is_static)) => {
+                (art_method, class_global_ref, class_mirror, is_static)
+            }
+            Err(msg) => return throw_internal_error(ctx, msg),
+        }
+    } else {
+        let env = match ensure_jni_initialized() {
+            Ok(e) => e,
             Err(msg) => return throw_internal_error(ctx, msg),
         };
+
+        let (art_method, _method_id, class_global_ref, is_static) =
+            match resolve_fast_method(env, &class_name, "<init>", &sig_str, false) {
+                Ok(v) => v,
+                Err(msg) => return throw_internal_error(ctx, msg),
+            };
+
+        let spec = get_art_method_spec(env, art_method);
+        let bridge = find_art_bridge_functions(env, spec.entry_point_offset);
+        let mut entry_point = read_entry_point(art_method, spec.entry_point_offset);
+        if is_art_quick_entrypoint(entry_point, bridge) && should_compile {
+            let compile = compile_art_method_to_quick(env, art_method, spec.entry_point_offset, bridge, compile_kind);
+            entry_point = compile.after;
+            crate::jsapi::console::output_verbose(&format!(
+                "[fastConstructor] compile {}.<init>{} kind={} success={} before={:#x} after={:#x} msg={}",
+                class_name, sig_str, compile.kind, compile.success, compile.before, compile.after, compile.message
+            ));
+        }
+        if is_art_quick_entrypoint(entry_point, bridge) {
+            return throw_internal_error(
+                ctx,
+                format!(
+                    "fastConstructor rejected {}.<init>{}: no independent quick entrypoint (entry={:#x})",
+                    class_name, sig_str, entry_point
+                ),
+            );
+        }
+        (
+            art_method,
+            class_global_ref,
+            super::decode_global_jobject_raw(env, class_global_ref as *mut std::ffi::c_void).unwrap_or(0),
+            is_static,
+        )
+    };
+
     if is_static {
         return throw_internal_error(
             ctx,
@@ -753,33 +1382,6 @@ pub(crate) unsafe extern "C" fn js_java_fast_constructor(
         );
     }
 
-    let (should_compile, compile_kind) = match parse_fast_options(ctx, argc, argv, 2) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-
-    let spec = get_art_method_spec(env, art_method);
-    let bridge = find_art_bridge_functions(env, spec.entry_point_offset);
-    let mut entry_point = read_entry_point(art_method, spec.entry_point_offset);
-    if is_art_quick_entrypoint(entry_point, &bridge) && should_compile {
-        let compile = compile_art_method_to_quick(env, art_method, spec.entry_point_offset, bridge, compile_kind);
-        entry_point = compile.after;
-        crate::jsapi::console::output_verbose(&format!(
-            "[fastConstructor] compile {}.<init>{} kind={} success={} before={:#x} after={:#x} msg={}",
-            class_name, sig_str, compile.kind, compile.success, compile.before, compile.after, compile.message
-        ));
-    }
-    if is_art_quick_entrypoint(entry_point, &bridge) {
-        return throw_internal_error(
-            ctx,
-            format!(
-                "fastConstructor rejected {}.<init>{}: no independent quick entrypoint (entry={:#x})",
-                class_name, sig_str, entry_point
-            ),
-        );
-    }
-
-    let class_mirror = super::decode_global_jobject_raw(env, class_global_ref as *mut std::ffi::c_void).unwrap_or(0);
     output_verbose(&format!(
         "[fastConstructor] {}.<init>{} class_global={:#x} class_mirror={:#x}",
         class_name, sig_str, class_global_ref as usize, class_mirror
@@ -828,64 +1430,29 @@ pub(crate) unsafe extern "C" fn js_java_fast_field(
         None
     };
 
-    let env = match ensure_jni_initialized() {
-        Ok(e) => e,
-        Err(msg) => return throw_internal_error(ctx, msg),
-    };
-    let Some(spec) = get_art_field_spec() else {
-        return throw_internal_error(ctx, "unsupported ArtField layout".to_string());
-    };
-
-    cache_fields_for_class(env, &class_name);
-    let (jni_sig, field_id, is_static) = {
-        let guard = FIELD_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(cache) = guard.as_ref() else {
-            return throw_internal_error(ctx, format!("field cache unavailable for {}", class_name));
-        };
-        let Some(fields) = cache.get(&class_name) else {
-            return throw_internal_error(ctx, format!("fields unavailable for {}", class_name));
-        };
-        let Some(info) = fields.get(&field_name) else {
-            return throw_internal_error(ctx, format!("field not found: {}.{}", class_name, field_name));
-        };
-        (info.jni_sig.clone(), info.field_id, info.is_static)
-    };
-
-    if let Some(sig) = requested_sig.as_ref() {
-        if sig != &jni_sig {
-            return throw_type_error(ctx, b"field signature mismatch\0");
+    let field = if crate::is_raw_clone_js_thread() {
+        match super::callback::resolve_fast_field_via_executor(class_name, field_name, requested_sig) {
+            Ok(field) => field,
+            Err(msg) => return throw_internal_error(ctx, msg),
         }
-    }
-    if is_static {
-        return throw_type_error(ctx, b"fastField only supports instance fields\0");
-    }
-    if !is_fast_field_type(&jni_sig) {
-        return throw_type_error(ctx, b"fastField only supports primitive/object instance fields\0");
-    }
-
-    let cls = find_class_safe(env, &class_name);
-    if cls.is_null() {
-        return throw_internal_error(ctx, format!("class not found: {}", class_name));
-    }
-    let art_field = decode_field_id(env, cls, field_id as u64, is_static);
-    jni_check_exc(env);
-    if art_field == 0 {
-        return throw_internal_error(ctx, format!("failed to decode field id: {}.{}", class_name, field_name));
-    }
-    refresh_mem_regions();
-    let offset = safe_read_u32(art_field + spec.offset_offset as u64);
-    if offset == 0 {
-        return throw_internal_error(ctx, format!("invalid field offset: {}.{}", class_name, field_name));
-    }
-
-    let field = FastField {
-        art_field,
-        offset,
-        is_static,
-        value_type: jni_sig.as_bytes()[0],
-        jni_sig,
-        class_name,
-        field_name,
+    } else {
+        let env = match ensure_jni_initialized() {
+            Ok(e) => e,
+            Err(msg) => return throw_internal_error(ctx, msg),
+        };
+        match resolve_fast_field(env, class_name, field_name, requested_sig) {
+            Ok(field) => field,
+            Err(msg) if msg == "field signature mismatch" => {
+                return throw_type_error(ctx, b"field signature mismatch\0")
+            }
+            Err(msg) if msg == "fastField only supports instance fields" => {
+                return throw_type_error(ctx, b"fastField only supports instance fields\0")
+            }
+            Err(msg) if msg == "fastField only supports primitive/object instance fields" => {
+                return throw_type_error(ctx, b"fastField only supports primitive/object instance fields\0")
+            }
+            Err(msg) => return throw_internal_error(ctx, msg),
+        }
     };
     let mut fields = fast_fields().lock().unwrap_or_else(|e| e.into_inner());
     fields.push(field);
@@ -935,17 +1502,28 @@ pub(crate) unsafe extern "C" fn js_java_compile_method(
         RequestedCompileKind::Auto
     };
 
-    let env = match ensure_jni_initialized() {
-        Ok(e) => e,
-        Err(msg) => return throw_internal_error(ctx, msg),
+    let (art_method, result) = if crate::is_raw_clone_js_thread() {
+        match super::callback::compile_method_via_executor(class_name, method_name, actual_sig, force_static, kind) {
+            Ok(v) => v,
+            Err(msg) => return throw_internal_error(ctx, msg),
+        }
+    } else {
+        let env = match ensure_jni_initialized() {
+            Ok(e) => e,
+            Err(msg) => return throw_internal_error(ctx, msg),
+        };
+        let (art_method, _is_static) =
+            match resolve_art_method(env, &class_name, &method_name, &actual_sig, force_static) {
+                Ok(v) => v,
+                Err(msg) => return throw_internal_error(ctx, msg),
+            };
+        let spec = get_art_method_spec(env, art_method);
+        let bridge = find_art_bridge_functions(env, spec.entry_point_offset);
+        (
+            art_method,
+            compile_art_method_to_quick(env, art_method, spec.entry_point_offset, bridge, kind),
+        )
     };
-    let (art_method, _is_static) = match resolve_art_method(env, &class_name, &method_name, &actual_sig, force_static) {
-        Ok(v) => v,
-        Err(msg) => return throw_internal_error(ctx, msg),
-    };
-    let spec = get_art_method_spec(env, art_method);
-    let bridge = find_art_bridge_functions(env, spec.entry_point_offset);
-    let result = compile_art_method_to_quick(env, art_method, spec.entry_point_offset, bridge, kind);
 
     let obj = ffi::JS_NewObject(ctx);
     let obj_v = JSValue(obj);
@@ -965,6 +1543,9 @@ pub(crate) unsafe extern "C" fn js_java_jit_info(
     _argc: i32,
     _argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
+    if crate::is_raw_clone_js_thread() {
+        return super::callback::jit_info_via_executor(ctx);
+    }
     let _env = match ensure_jni_initialized() {
         Ok(e) => e,
         Err(msg) => return throw_internal_error(ctx, msg),
@@ -1239,6 +1820,10 @@ unsafe fn invoke_fast_constructor_art_ready_raw(
 
 pub(crate) unsafe fn with_fast_art_handle_scope<R>(thread: u64, f: impl FnOnce() -> R) -> R {
     FAST_ART_HANDLE_SCOPE_ENTER.fetch_add(1, Ordering::Relaxed);
+    if crate::is_raw_clone_js_thread() {
+        FAST_ART_HANDLE_SCOPE_UNAVAILABLE.fetch_add(1, Ordering::Relaxed);
+        return f();
+    }
     let env = get_thread_env().unwrap_or(std::ptr::null_mut());
     if env.is_null() {
         FAST_ART_HANDLE_SCOPE_UNAVAILABLE.fetch_add(1, Ordering::Relaxed);

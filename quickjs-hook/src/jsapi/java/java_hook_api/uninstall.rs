@@ -57,7 +57,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_unhook(
         }
     };
 
-    let hook_data = with_registry_mut(&JAVA_HOOK_REGISTRY, |registry| registry.remove(&art_method_addr)).flatten();
+    let hook_data = with_registry(&JAVA_HOOK_REGISTRY, |registry| registry.get(&art_method_addr).cloned()).flatten();
 
     let hook_data = match hook_data {
         Some(d) => d,
@@ -83,19 +83,55 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_unhook(
     // Step 4: 恢复 ArtMethod 原始字段
     super::super::restore_art_method_fields(&hook_data);
 
-    // Step 5: 移除 native trampoline
-    super::super::remove_native_trampoline(&hook_data);
-
-    // Step 6: 等待 in-flight callbacks 自然退出
-    if !wait_for_in_flight_java_hook_callbacks(std::time::Duration::from_millis(200)) {
+    // Step 5: 等待 in-flight callbacks 自然退出。
+    // 若仍有线程在 callback/thunk 内，不能释放 JSValue、replacement ArtMethod 或 native
+    // trampoline；这些线程醒来后可能仍会访问它们。此时宁可 leak 到进程退出。
+    let drained = wait_for_in_flight_java_hook_callbacks(std::time::Duration::from_millis(500));
+    if !drained {
         output_verbose(&format!(
-            "[java unhook] 等待 in-flight callbacks 超时，remaining={}",
+            "[java unhook] 等待 in-flight callbacks 超时，保留资源到 cleanup 阶段释放，remaining={}",
             in_flight_java_hook_callbacks()
         ));
+
+        with_registry_mut(&JAVA_HOOK_REGISTRY, |registry| {
+            if let Some(data) = registry.get_mut(&art_method_addr) {
+                match &mut data.hook_type {
+                    HookType::NativeEntry => {}
+                    HookType::Replaced {
+                        per_method_hook_target, ..
+                    }
+                    | HookType::Quick {
+                        per_method_hook_target, ..
+                    }
+                    | HookType::Managed {
+                        per_method_hook_target, ..
+                    } => {
+                        *per_method_hook_target = None;
+                    }
+                }
+                data.native_entry_hook_target = 0;
+                data.native_entry_trampoline = 0;
+            }
+        });
+        output_verbose(&format!(
+            "[java unhook] 完成: {}.{}{}",
+            class_name, method_name, actual_sig
+        ));
+        return JSValue::bool(true).raw();
     }
 
-    // Step 7: 释放资源
-    let env_opt = get_thread_env().ok();
+    // Step 6: registry 中删除 hook data；此时 in-flight 已归零，$orig 不再需要查表。
+    let hook_data = with_registry_mut(&JAVA_HOOK_REGISTRY, |registry| registry.remove(&art_method_addr))
+        .flatten()
+        .unwrap_or(hook_data);
+
+    // Step 7: 移除 native trampoline 并释放资源。
+    super::super::remove_native_trampoline(&hook_data);
+    let env_opt = if crate::is_raw_clone_js_thread() {
+        None
+    } else {
+        get_thread_env().ok()
+    };
     super::super::free_java_hook_resources(&hook_data, env_opt);
 
     output_verbose(&format!(

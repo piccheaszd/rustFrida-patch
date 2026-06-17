@@ -57,6 +57,9 @@ unsafe fn resolve_quick_entrypoint_from_trampoline(trampoline: u64, env: JniEnv)
     if trampoline == 0 {
         return 0;
     }
+    if env.is_null() {
+        return trampoline;
+    }
 
     // 读取 trampoline 地址处的第一条 ARM64 指令
     let insn = *(trampoline as *const u32);
@@ -101,13 +104,23 @@ unsafe fn resolve_quick_entrypoint_from_trampoline(trampoline: u64, env: JniEnv)
 ///    ConcurrentCopying::CopyingPhase
 pub(super) unsafe fn find_art_bridge_functions(
     env: JniEnv,
-    _ep_offset: usize,
+    ep_offset: usize,
 ) -> &'static ArtBridgeFunctions {
     ART_BRIDGE_FUNCTIONS.get_or_init(|| {
         output_verbose("[art bridge] 开始发现 ART 内部桥接函数...");
 
         // --- ClassLinker 扫描: 一次提取 4 个 trampoline ---
-        let (jni_tramp, interp_bridge, resolution_tramp, imt_conflict) = find_classlinker_trampolines(env);
+        let (mut jni_tramp, interp_bridge, resolution_tramp, imt_conflict) = find_classlinker_trampolines(env);
+
+        if jni_tramp == 0 {
+            if let Some(native_entry) = find_jni_trampoline_from_known_native(env, ep_offset) {
+                output_verbose(&format!(
+                    "[art bridge] JNI trampoline recovered from known native ArtMethod entry_point: {:#x}",
+                    native_entry
+                ));
+                jni_tramp = native_entry;
+            }
+        }
 
         output_verbose(&format!(
             "[art bridge] ClassLinker 结果: jni_tramp={:#x}, interp_bridge={:#x}, resolution_tramp={:#x}, imt_conflict={:#x}",
@@ -184,6 +197,26 @@ pub(super) unsafe fn find_art_bridge_functions(
             resolved_resolution_entrypoint: resolved_resolution,
         }
     })
+}
+
+unsafe fn find_jni_trampoline_from_known_native(env: JniEnv, ep_offset: usize) -> Option<u64> {
+    if env.is_null() || ep_offset == 0 {
+        return None;
+    }
+    let art_method = get_known_native_art_method(env)?;
+    let entry = read_entry_point(art_method, ep_offset) & PAC_STRIP_MASK;
+    if entry == 0 {
+        output_verbose("[art bridge] known native ArtMethod entry_point is null");
+        return None;
+    }
+    if !is_code_pointer(entry) {
+        output_verbose(&format!(
+            "[art bridge] known native ArtMethod entry_point rejected: not executable ({:#x})",
+            entry
+        ));
+        return None;
+    }
+    Some(entry)
 }
 
 /// 通过 ClassLinker 结构体扫描提取 3 个 ART trampoline 地址。

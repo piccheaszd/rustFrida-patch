@@ -80,13 +80,13 @@ unsafe fn get_runtime_class_name(env: JniEnv, obj: *mut std::ffi::c_void) -> Opt
     let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
 
     let cls_obj = get_object_class(env, obj);
-    if cls_obj.is_null() || jni_check_exc(env) {
+    if jni_null_or_exc(env, cls_obj) {
         return None;
     }
 
     let name_jstr = call_obj(env, cls_obj, reflect.class_get_name_mid, std::ptr::null());
     delete_local_ref(env, cls_obj);
-    if name_jstr.is_null() || jni_check_exc(env) {
+    if jni_null_or_exc(env, name_jstr) {
         return None;
     }
 
@@ -118,6 +118,9 @@ unsafe fn wrap_java_object_value(
 
     let cls_val = JSValue::string(ctx, class_name);
     wrapper_val.set_property(ctx, "__jclass", cls_val);
+    if crate::is_raw_clone_js_thread() {
+        wrapper_val.set_property(ctx, "__jraw", JSValue::bool(true));
+    }
 
     wrapper
 }
@@ -146,6 +149,17 @@ unsafe fn wrap_java_object_ref(
         return ffi::qjs_null();
     }
 
+    if crate::is_raw_clone_js_thread() {
+        let raw = super::art_class::with_runnable_thread(env, || super::art_class::decode_jobject(env, obj));
+        if globalize {
+            raw_delete_local_ref(env, obj);
+        }
+        return match raw {
+            Some(raw) => wrap_java_object_value(ctx, raw, class_name),
+            None => ffi::qjs_null(),
+        };
+    }
+
     if !globalize {
         return wrap_java_object_value(ctx, obj as u64, class_name);
     }
@@ -154,7 +168,7 @@ unsafe fn wrap_java_object_ref(
     let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
     let global_ref = new_global_ref(env, obj);
     delete_local_ref(env, obj);
-    if global_ref.is_null() || jni_check_exc(env) {
+    if jni_null_or_exc(env, global_ref) {
         return ffi::qjs_null();
     }
 
@@ -262,6 +276,13 @@ unsafe fn marshal_java_object_to_js_inner(
         return ffi::qjs_null();
     }
 
+    if crate::is_raw_clone_js_thread() {
+        let class_name = class_name_hint
+            .map(jni_object_sig_to_class_name)
+            .unwrap_or_else(|| "java.lang.Object".to_string());
+        return wrap_java_object_ref(ctx, env, obj, &class_name, release_local);
+    }
+
     let class_name = get_runtime_class_name(env, obj).unwrap_or_else(|| {
         class_name_hint
             .map(jni_object_sig_to_class_name)
@@ -339,7 +360,7 @@ unsafe fn convert_java_array_to_js(
     let get_len: GetArrayLengthFn = jni_fn!(env, GetArrayLengthFn, JNI_GET_ARRAY_LENGTH);
 
     let len = get_len(env, array_obj);
-    if jni_check_exc(env) || len < 0 {
+    if jni_negative_or_exc(env, len) {
         if release_local {
             delete_local_ref(env, array_obj);
         }
@@ -503,13 +524,30 @@ unsafe fn read_invoke_target_ptr(
     ctx: *mut ffi::JSContext,
     arg: JSValue,
 ) -> Result<u64, ffi::JSValue> {
-    let obj_ptr = extract_pointer_address(ctx, arg, "Java._invokeMethod").map_err(|_| {
-        ffi::JS_ThrowTypeError(
-            ctx,
-            b"Java._invokeMethod() first argument must be a pointer (BigUint64/Number/NativePointer)\0"
-                .as_ptr() as *const _,
-        )
-    })?;
+    let obj_ptr = if arg.is_object() {
+        let jptr = arg.get_property(ctx, "__jptr");
+        let ptr = jptr.to_u64(ctx).unwrap_or(0);
+        jptr.free(ctx);
+        if ptr != 0 {
+            ptr
+        } else {
+            extract_pointer_address(ctx, arg, "Java._invokeMethod").map_err(|_| {
+                ffi::JS_ThrowTypeError(
+                    ctx,
+                    b"Java._invokeMethod() first argument must be a pointer or Java wrapper\0".as_ptr()
+                        as *const _,
+                )
+            })?
+        }
+    } else {
+        extract_pointer_address(ctx, arg, "Java._invokeMethod").map_err(|_| {
+            ffi::JS_ThrowTypeError(
+                ctx,
+                b"Java._invokeMethod() first argument must be a pointer or Java wrapper\0".as_ptr()
+                    as *const _,
+            )
+        })?
+    };
 
     if obj_ptr == 0 {
         return Err(ffi::JS_ThrowTypeError(
@@ -519,6 +557,16 @@ unsafe fn read_invoke_target_ptr(
     }
 
     Ok(obj_ptr)
+}
+
+unsafe fn read_invoke_target_is_global(_ctx: *mut ffi::JSContext, arg: JSValue) -> bool {
+    if !arg.is_object() {
+        return false;
+    }
+    let prop = arg.get_property(_ctx, "__jglobal");
+    let value = prop.to_bool().unwrap_or(false);
+    prop.free(_ctx);
+    value
 }
 
 unsafe fn read_string_arg(
@@ -534,6 +582,16 @@ unsafe fn cleanup_local_refs(
     local_obj: *mut std::ffi::c_void,
     cls: *mut std::ffi::c_void,
 ) {
+    if crate::is_raw_clone_js_thread() {
+        if !local_obj.is_null() {
+            raw_delete_local_ref(env, local_obj);
+        }
+        if !cls.is_null() {
+            raw_delete_local_ref(env, cls);
+        }
+        return;
+    }
+
     let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
 
     if !local_obj.is_null() {
@@ -599,6 +657,12 @@ impl Drop for JniArgList {
             return;
         }
         unsafe {
+            if crate::is_raw_clone_js_thread() {
+                for raw in self.owned_local_refs.drain(..) {
+                    raw_delete_local_ref(self.env, raw as *mut std::ffi::c_void);
+                }
+                return;
+            }
             let delete_local_ref: DeleteLocalRefFn =
                 jni_fn!(self.env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
             for raw in self.owned_local_refs.drain(..) {
@@ -647,7 +711,9 @@ unsafe fn wrap_invoke_return_object(
         return Ok(ffi::qjs_null());
     }
     let value = marshal_local_java_object_to_js(ctx, env, obj, Some(return_type_sig));
-    if JSValue(value).is_null() && !jni_check_exc(env) {
+    let value_is_null = JSValue(value).is_null();
+    let had_exc = jni_check_exc(env);
+    if value_is_null && !had_exc {
         return Err("Java._invokeMethod: failed to marshal return object".to_string());
     }
     Ok(value)

@@ -30,7 +30,7 @@ const MAX_HEADERS_LEN: usize = 16 * 1024;
 const MAX_BODY_LEN: usize = 4 * 1024 * 1024; // 4MB 足够承载任何合理 RPC payload
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
-const RPC_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+const RPC_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 启动 HTTP RPC 服务器（后台线程）。
 ///

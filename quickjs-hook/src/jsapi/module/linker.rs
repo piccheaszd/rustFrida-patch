@@ -111,7 +111,7 @@ unsafe fn init_unrestricted_linker_api() -> Option<UnrestrictedLinkerApi> {
         .get("__dl_g_dl_mutex")
         .or_else(|| symbols.get("__dl__ZL10g_dl_mutex"))
         .or_else(|| symbols.get("__dl__ZL8gDlMutex"))
-        .map(|&addr| addr as *mut libc::pthread_mutex_t)
+        .map(|&addr| addr as *mut std::ffi::c_void)
         .unwrap_or_else(|| {
             output_message("[linker api] dl_mutex not found");
             std::ptr::null_mut()

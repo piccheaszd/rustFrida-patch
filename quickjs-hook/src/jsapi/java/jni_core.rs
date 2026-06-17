@@ -11,7 +11,7 @@ use std::os::raw::c_char;
 use std::sync::Mutex;
 
 use super::reflect::decode_method_id;
-use super::safe_mem::{refresh_mem_regions, safe_read_u32, safe_read_u64};
+use super::safe_mem::{is_readable, refresh_mem_regions, safe_read_u32, safe_read_u64};
 use super::PAC_STRIP_MASK;
 
 // ============================================================================
@@ -23,6 +23,7 @@ use super::PAC_STRIP_MASK;
 /// 通过扫描已知 native 方法 (Process.getElapsedCpuTime) 的 ArtMethod 内存，
 /// 动态发现 access_flags、data_ (jniCode)、entry_point_ 偏移。
 /// 兼容厂商魔改 ArtMethod 布局。
+#[derive(Clone, Copy, Debug)]
 pub(super) struct ArtMethodSpec {
     pub(super) access_flags_offset: usize,
     pub(super) data_offset: usize,        // jniCode / data_
@@ -233,6 +234,9 @@ pub(crate) unsafe fn jni_fn_ptr(env: JniEnv, index: usize) -> *const std::ffi::c
 /// Check for and clear any pending JNI exception. Returns true if there was one.
 #[inline]
 pub(super) unsafe fn jni_check_exc(env: JniEnv) -> bool {
+    if env.is_null() {
+        return true;
+    }
     let check: ExcCheckFn = jni_fn!(env, ExcCheckFn, JNI_EXCEPTION_CHECK);
     if check(env) != 0 {
         let clear: ExcClearFn = jni_fn!(env, ExcClearFn, JNI_EXCEPTION_CLEAR);
@@ -241,6 +245,21 @@ pub(super) unsafe fn jni_check_exc(env: JniEnv) -> bool {
     } else {
         false
     }
+}
+
+#[inline]
+pub(super) unsafe fn jni_null_or_exc(env: JniEnv, ptr: *mut std::ffi::c_void) -> bool {
+    if env.is_null() {
+        return true;
+    }
+    let had_exc = jni_check_exc(env);
+    ptr.is_null() || had_exc
+}
+
+#[inline]
+pub(super) unsafe fn jni_negative_or_exc(env: JniEnv, value: i32) -> bool {
+    let had_exc = jni_check_exc(env);
+    value < 0 || had_exc
 }
 
 /// Check for a pending JNI exception and extract its toString() + cause chain
@@ -254,6 +273,10 @@ pub(super) unsafe fn jni_check_exc(env: JniEnv) -> bool {
 /// CallObjectMethod (no WalkStack). Bounded recursion depth (3 levels) on
 /// cause chain to avoid infinite loops from self-referencing causes.
 pub(super) unsafe fn jni_take_exception(env: JniEnv) -> Option<String> {
+    if crate::is_raw_clone_js_thread() {
+        return Some("JNI exception on raw clone thread; throwable inspection is disabled".to_string());
+    }
+
     let check: ExcCheckFn = jni_fn!(env, ExcCheckFn, JNI_EXCEPTION_CHECK);
     if check(env) == 0 {
         return None;
@@ -425,6 +448,28 @@ pub(super) fn get_art_method_spec(env: JniEnv, art_method: u64) -> &'static ArtM
     ART_METHOD_SPEC.get_or_init(|| probe_art_method_spec(env, art_method))
 }
 
+pub(super) fn cache_art_method_spec_from_self_parse(spec: ArtMethodSpec) {
+    match ART_METHOD_SPEC.set(spec) {
+        Ok(()) => output_verbose(&format!(
+            "[art spec] self-parse cache installed: access_flags={}, data_={}, entry_point={}, size={}",
+            spec.access_flags_offset, spec.data_offset, spec.entry_point_offset, spec.size
+        )),
+        Err(existing) => {
+            let cached = ART_METHOD_SPEC.get().unwrap_or(&existing);
+            if cached.access_flags_offset != existing.access_flags_offset
+                || cached.data_offset != existing.data_offset
+                || cached.entry_point_offset != existing.entry_point_offset
+                || cached.size != existing.size
+            {
+                output_verbose(&format!(
+                    "[art spec] self-parse cache already set: cached={:?}, new={:?}",
+                    cached, existing
+                ));
+            }
+        }
+    }
+}
+
 /// Probe ArtMethod layout specification.
 ///
 /// Strategy 1 (Frida-style): 扫描 Process.getElapsedCpuTime 的 ArtMethod 内存，
@@ -433,8 +478,12 @@ pub(super) fn get_art_method_spec(env: JniEnv, art_method: u64) -> &'static ArtM
 /// Strategy 2 (fallback): 退回 code pointer 探测逻辑，access_flags 默认 4。
 fn probe_art_method_spec(env: JniEnv, art_method: u64) -> ArtMethodSpec {
     // Strategy 1: Frida-style full scan using known native method
-    if let Some(spec) = unsafe { probe_art_method_spec_frida(env) } {
-        return spec;
+    if !crate::is_raw_clone_js_thread() || raw_clone_executor_jni_scope_active() {
+        if let Some(spec) = unsafe { probe_art_method_spec_frida(env) } {
+            return spec;
+        }
+    } else {
+        output_verbose("[art spec] raw clone thread: skip Process.getElapsedCpuTime JNI probe");
     }
 
     output_verbose("[art spec] Frida-style probe 失败，退回 entry_point 探测...");
@@ -585,13 +634,13 @@ pub(super) unsafe fn get_known_native_art_method(env: JniEnv) -> Option<u64> {
     let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
 
     let cls = find_class(env, c_class.as_ptr());
-    if cls.is_null() || jni_check_exc(env) {
+    if jni_null_or_exc(env, cls) {
         output_verbose("[art spec] FindClass(android/os/Process) 失败");
         return None;
     }
 
     let mid = get_static_mid(env, cls, c_method.as_ptr(), c_sig.as_ptr());
-    if mid.is_null() || jni_check_exc(env) {
+    if jni_null_or_exc(env, mid) {
         delete_local_ref(env, cls);
         output_verbose("[art spec] GetStaticMethodID(getElapsedCpuTime) 失败");
         return None;
@@ -617,8 +666,17 @@ pub(super) unsafe fn get_known_native_art_method(env: JniEnv) -> Option<u64> {
 /// Strategy: read values at candidate offsets (24, 32) from a known method.
 /// The entry_point is the one that looks like a valid code pointer.
 fn probe_entry_point_offset_legacy(env: JniEnv, target_art_method: u64) -> usize {
-    let val_24 = unsafe { *((target_art_method as usize + 24) as *const u64) };
-    let val_32 = unsafe { *((target_art_method as usize + 32) as *const u64) };
+    refresh_mem_regions();
+    if target_art_method < 0x1000 || !is_readable(target_art_method, 40) {
+        output_verbose(&format!(
+            "[art spec] legacy probe: invalid ArtMethod {:#x}, using ARM64 default entry_point offset=24",
+            target_art_method
+        ));
+        return 24;
+    }
+
+    let val_24 = unsafe { safe_read_u64(target_art_method + 24) };
+    let val_32 = unsafe { safe_read_u64(target_art_method + 32) };
 
     let is_24 = is_code_pointer(val_24);
     let is_32 = is_code_pointer(val_32);
@@ -633,16 +691,21 @@ fn probe_entry_point_offset_legacy(env: JniEnv, target_art_method: u64) -> usize
     } else if is_32 && !is_24 {
         32
     } else if is_24 && is_32 {
-        let cur_dex_idx = unsafe { *((target_art_method as usize + 12) as *const u32) };
-        let next_32 = unsafe { *((target_art_method as usize + 32 + 12) as *const u32) };
+        let cur_dex_idx = unsafe { safe_read_u32(target_art_method + 12) };
+        let next_32 = unsafe { safe_read_u32(target_art_method + 32 + 12) };
         if next_32 == cur_dex_idx + 1 {
             24
         } else {
             32
         }
     } else {
-        // Neither looks valid — try Object.hashCode as secondary probe
-        probe_with_known_method_legacy(env).unwrap_or(24)
+        // Neither looks valid — try Object.hashCode as secondary probe only on normal threads.
+        // Raw clone threads must not re-enter GetMethodID here; use the common ARM64 layout.
+        if crate::is_raw_clone_js_thread() {
+            24
+        } else {
+            probe_with_known_method_legacy(env).unwrap_or(24)
+        }
     };
 
     output_verbose(&format!("[art spec] legacy result: entry_point offset={}", offset));
@@ -661,19 +724,23 @@ fn probe_with_known_method_legacy(env: JniEnv) -> Option<usize> {
         let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
 
         let cls = find_class(env, c_class.as_ptr());
-        if cls.is_null() || jni_check_exc(env) {
+        if jni_null_or_exc(env, cls) {
             return None;
         }
 
         let mid = get_mid(env, cls, c_method.as_ptr(), c_sig.as_ptr());
-        delete_local_ref(env, cls);
-        if mid.is_null() || jni_check_exc(env) {
+        if jni_null_or_exc(env, mid) {
+            delete_local_ref(env, cls);
             return None;
         }
 
-        let am = mid as u64;
-        let v24 = *((am as usize + 24) as *const u64);
-        let v32 = *((am as usize + 32) as *const u64);
+        let am = decode_method_id(env, cls, mid as u64, false);
+        delete_local_ref(env, cls);
+        if am < 0x1000 || !is_readable(am, 40) {
+            return None;
+        }
+        let v24 = safe_read_u64(am + 24);
+        let v32 = safe_read_u64(am + 32);
         let c24 = is_code_pointer(v24);
         let c32 = is_code_pointer(v32);
 
@@ -861,7 +928,9 @@ struct AttachedThreadGuard {
 impl Drop for AttachedThreadGuard {
     fn drop(&mut self) {
         unsafe {
-            let _ = super::art_class::transition_current_thread_to_native_for_blocking(self.env);
+            if !self.env.is_null() {
+                let _ = super::art_class::transition_current_thread_to_native_for_blocking(self.env);
+            }
             if let Err(err) = detach_current_thread(self.vm) {
                 output_verbose(&format!("[jni] DetachCurrentThread failed: {}", err));
             }
@@ -896,15 +965,16 @@ impl Drop for ScopedJniEnv {
     }
 }
 
-/// 从 JNI_STATE 获取 Runtime 地址 (JavaVMExt.runtime_ at offset 8)
+pub(super) fn raw_clone_executor_jni_scope_active() -> bool {
+    false
+}
+
+/// 获取 Runtime 地址 (JavaVMExt.runtime_ at offset 8)。
+///
+/// raw clone pre-resume 阶段允许读取 JavaVM/Runtime 元数据，但仍禁止
+/// AttachCurrentThread/JNIEnv 初始化。
 pub(super) unsafe fn get_runtime_addr() -> Option<u64> {
-    let vm_ptr = {
-        let guard = JNI_STATE.lock().unwrap_or_else(|e| e.into_inner());
-        match guard.as_ref() {
-            Some(state) => state.vm,
-            None => return None,
-        }
-    };
+    let vm_ptr = get_or_init_vm().ok()?;
     let runtime_raw = *((vm_ptr as usize + 8) as *const u64);
     let runtime = runtime_raw & PAC_STRIP_MASK;
     if runtime == 0 {
@@ -920,12 +990,23 @@ pub(super) unsafe fn get_runtime_addr() -> Option<u64> {
 /// JNIEnv is thread-local — each thread must use its own env pointer.
 /// AttachCurrentThread is idempotent (cheap if already attached).
 pub(crate) fn ensure_jni_initialized() -> Result<JniEnv, String> {
+    if crate::is_raw_clone_js_thread() {
+        return Err("JNI initialization is disabled on raw clone JS threads".to_string());
+    }
+
     let vm = get_or_init_vm()?;
     if let Some(env) = OWNED_THREAD_ATTACHMENT.with(|slot| {
         let guard = slot.borrow();
         guard.as_ref().and_then(|owned| (owned.vm == vm).then_some(owned.env))
     }) {
-        return Ok(env);
+        if !env.is_null() {
+            return Ok(env);
+        }
+        output_verbose("[jni] discarded null cached JNIEnv");
+        OWNED_THREAD_ATTACHMENT.with(|slot| {
+            let guard = slot.borrow_mut().take();
+            drop(guard);
+        });
     }
 
     unsafe {
@@ -982,6 +1063,14 @@ pub(super) fn get_or_init_vm() -> Result<*mut std::ffi::c_void, String> {
 }
 
 pub(crate) fn scoped_jni_env() -> Result<ScopedJniEnv, String> {
+    if crate::is_raw_clone_js_thread() {
+        return Err("scoped JNIEnv is disabled on raw clone JS threads".to_string());
+    }
+
+    scoped_jni_env_inner()
+}
+
+fn scoped_jni_env_inner() -> Result<ScopedJniEnv, String> {
     let vm = get_or_init_vm()?;
     unsafe {
         if let Some(env) = get_current_thread_env(vm)? {
@@ -1001,6 +1090,9 @@ pub(crate) fn scoped_jni_env() -> Result<ScopedJniEnv, String> {
 }
 
 unsafe fn get_current_thread_env(vm_ptr: *mut std::ffi::c_void) -> Result<Option<JniEnv>, String> {
+    if vm_ptr.is_null() {
+        return Err("JavaVM pointer is null".to_string());
+    }
     let vm_table = *(vm_ptr as *const *const *const std::ffi::c_void);
     let get_env_fn: unsafe extern "C" fn(*mut std::ffi::c_void, *mut *mut std::ffi::c_void, i32) -> i32 =
         std::mem::transmute(*vm_table.add(6)); // GetEnv = index 6
@@ -1017,6 +1109,9 @@ unsafe fn get_current_thread_env(vm_ptr: *mut std::ffi::c_void) -> Result<Option
 /// Attach the current thread to the JavaVM and return its JNIEnv*.
 /// Idempotent — returns existing env if thread is already attached.
 unsafe fn attach_current_thread(vm_ptr: *mut std::ffi::c_void) -> Result<JniEnv, String> {
+    if vm_ptr.is_null() {
+        return Err("JavaVM pointer is null".to_string());
+    }
     // 先试 GetEnv — 如果当前线程已 attach，直接返回（不触发 Thread::Attach）
     if let Some(env) = get_current_thread_env(vm_ptr)? {
         return Ok(env);

@@ -17,6 +17,47 @@ use crate::session::Session;
 use crate::{log_error, log_info, log_warn};
 
 const JSEVAL_ERROR_PREFIX: &str = "__RF_JSEVAL_ERROR__:";
+pub(crate) const EVAL_DEFAULT_TIMEOUT_SECS: u64 = 5;
+pub(crate) const EVAL_RECOMP_TIMEOUT_SECS: u64 = 8;
+pub(crate) const EVAL_JAVA_TIMEOUT_SECS: u64 = 60;
+pub(crate) const LOAD_DEFAULT_TIMEOUT_SECS: u64 = 5;
+pub(crate) const LOAD_JAVA_TIMEOUT_SECS: u64 = 60;
+pub(crate) const LOAD_STOP_WORKER_TIMEOUT_SECS: u64 = 2;
+pub(crate) const LOAD_PRE_RESUME_JAVA_TIMEOUT_SECS: u64 = 30;
+pub(crate) const JAVA_EXECUTOR_BOOTSTRAP_TIMEOUT_SECS: u64 = 35;
+pub(crate) const JAVA_STEALTH_TIMEOUT_SECS: u64 = 1;
+pub(crate) const JSCLEAN_SOFT_TIMEOUT_SECS: u64 = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PostResumeJavaWorkerMode {
+    Auto,
+    Skip,
+    Full,
+}
+
+impl PostResumeJavaWorkerMode {
+    pub(crate) fn from_env() -> Result<Self, String> {
+        if let Ok(raw) = std::env::var("RF_POST_RESUME_JAVA_WORKER_MODE") {
+            return Self::parse(&raw);
+        }
+        let skip = std::env::var("RF_SKIP_POST_RESUME_JAVA_WORKER")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        Ok(if skip { Self::Skip } else { Self::Auto })
+    }
+
+    fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "auto" | "lazy" | "on-demand" => Ok(Self::Auto),
+            "full" | "start" | "worker" => Ok(Self::Full),
+            "skip" | "none" | "off" => Ok(Self::Skip),
+            _ => Err(format!(
+                "未知 RF_POST_RESUME_JAVA_WORKER_MODE='{}'，可用值: auto|skip|full",
+                raw
+            )),
+        }
+    }
+}
 
 fn script_filename(script_path: &str) -> String {
     std::path::Path::new(script_path)
@@ -26,46 +67,159 @@ fn script_filename(script_path: &str) -> String {
         .to_string()
 }
 
+fn parse_loadjs_payload_for_host(payload: &str) -> (&str, &str) {
+    if !payload.starts_with('[') {
+        return ("", payload);
+    }
+    let first_line_end = payload.find('\n').unwrap_or(payload.len());
+    let first_line = &payload[..first_line_end];
+    if !first_line.ends_with(']') {
+        return ("", payload);
+    }
+    let filename = &first_line[1..first_line.len() - 1];
+    if filename.is_empty() || filename.contains('[') || filename.contains(']') {
+        return ("", payload);
+    }
+    let script_start = if first_line_end < payload.len() {
+        first_line_end + 1
+    } else {
+        payload.len()
+    };
+    (filename, &payload[script_start..])
+}
+
 #[cfg(not(feature = "noptrace"))]
 fn remote_main_thread_available(session: &Session) -> bool {
     session.loader_ctx_addr.load(Ordering::Acquire) != 0
         && session.agent_current_thread_eval_impl.load(Ordering::Acquire) != 0
 }
 
+pub(crate) fn ensure_java_worker_ready(session: &Session) -> Result<(), String> {
+    if session.java_worker_ready.load(std::sync::atomic::Ordering::Acquire) {
+        return Ok(());
+    }
+    let sender = session.get_sender().ok_or("agent 未连接")?;
+    session.eval_state.clear();
+    crate::process::thaw_cgroup_freezer(session.pid.load(std::sync::atomic::Ordering::Acquire));
+    send_command(sender, "javaworker_init").map_err(|e| format!("发送 Java worker 初始化失败: {}", e))?;
+    match session
+        .eval_state
+        .recv_timeout(std::time::Duration::from_secs(JAVA_EXECUTOR_BOOTSTRAP_TIMEOUT_SECS))
+    {
+        Some(Ok(_)) => {
+            session
+                .java_worker_ready
+                .store(true, std::sync::atomic::Ordering::Release);
+            Ok(())
+        }
+        Some(Err(e)) => Err(format!("Java worker 初始化失败: {}", e)),
+        None => Err(format!(
+            "等待 Java worker 初始化超时({}s)",
+            JAVA_EXECUTOR_BOOTSTRAP_TIMEOUT_SECS
+        )),
+    }
+}
+
+pub(crate) fn cut_pre_resume_java_executor_hook(session: &Session) -> Result<(), String> {
+    let sender = session.get_sender().ok_or("agent 未连接")?;
+    session.eval_state.clear();
+    send_command(sender, "javaexecutor_cut").map_err(|e| format!("发送 Java executor cut 失败: {}", e))?;
+    match session
+        .eval_state
+        .recv_timeout(std::time::Duration::from_secs(JAVA_STEALTH_TIMEOUT_SECS))
+    {
+        Some(Ok(_)) => Ok(()),
+        Some(Err(e)) => Err(format!("Java executor cut 失败: {}", e)),
+        None => Err(format!("等待 Java executor cut 超时({}s)", JAVA_STEALTH_TIMEOUT_SECS)),
+    }
+}
+
+pub(crate) fn ensure_java_worker_ready_after_resume(session: &Session, java_worker_needed: bool) -> Result<(), String> {
+    run_post_resume_java_worker_mode(session, PostResumeJavaWorkerMode::from_env()?, java_worker_needed)
+}
+
+pub(crate) fn run_post_resume_java_worker_mode(
+    session: &Session,
+    mode: PostResumeJavaWorkerMode,
+    java_worker_needed: bool,
+) -> Result<(), String> {
+    match mode {
+        PostResumeJavaWorkerMode::Auto => {
+            if !java_worker_needed {
+                log_info!("spawn 已恢复，未检测到 Java 操作，Java worker 延迟到首次 Java API 时启动");
+                return Ok(());
+            }
+            if session.java_worker_ready.load(std::sync::atomic::Ordering::Acquire) {
+                return Ok(());
+            }
+            log_info!("spawn 已恢复，检测到 Java 操作，启动 Java worker");
+            ensure_java_worker_ready(session)
+        }
+        PostResumeJavaWorkerMode::Skip => {
+            log_warn!("RF_POST_RESUME_JAVA_WORKER_MODE=skip，跳过 spawn 恢复后的 Java worker 启动");
+            Ok(())
+        }
+        PostResumeJavaWorkerMode::Full => {
+            if session.java_worker_ready.load(std::sync::atomic::Ordering::Acquire) {
+                return Ok(());
+            }
+            log_info!("spawn 已恢复，启动 Java worker 作为后续 Java 操作执行线程");
+            ensure_java_worker_ready(session)
+        }
+    }
+}
+
 pub(crate) fn try_loadjs_on_main_thread_if_java(session: &Session, line: &str) -> Result<bool, String> {
-    let _ = (session, line);
+    let Some(rest) = line
+        .strip_prefix("loadjs ")
+        .or_else(|| line.strip_prefix("loadjs\n"))
+        .or_else(|| line.strip_prefix("loadjs"))
+    else {
+        return Ok(false);
+    };
+    let (_filename, script) = parse_loadjs_payload_for_host(rest);
+
+    if script_uses_java_api(script) {
+        log_info!("检测到 Java loadjs，发送到 Java worker 执行");
+        ensure_java_worker_ready(session)?;
+        let sender = session.get_sender().ok_or("agent 未连接")?;
+        crate::process::thaw_cgroup_freezer(session.pid.load(std::sync::atomic::Ordering::Acquire));
+        session.eval_state.clear();
+        send_command(sender, format!("java_loadjs {}", rest))
+            .map_err(|e| format!("发送 Java loadjs 到 Java worker 失败: {}", e))?;
+        return Ok(true);
+    }
     Ok(false)
 }
 
-pub(crate) fn try_jseval_on_main_thread_if_java(session: &Session, line: &str) -> Result<bool, String> {
-    #[cfg(feature = "noptrace")]
-    {
-        let _ = (session, line);
+pub(crate) fn try_jseval_on_main_thread_if_java_or_dsl(session: &Session, line: &str) -> Result<bool, String> {
+    let Some(expr) = line
+        .strip_prefix("jseval ")
+        .or_else(|| line.strip_prefix("jseval\n"))
+        .or_else(|| line.strip_prefix("jseval"))
+    else {
+        return Ok(false);
+    };
+
+    let uses_java_api = script_uses_java_api(expr);
+    let uses_managed_dsl = script_uses_managed_dsl_api(expr);
+    if !uses_java_api && !uses_managed_dsl {
         return Ok(false);
     }
-    #[cfg(not(feature = "noptrace"))]
-    {
-        if !remote_main_thread_available(session) {
-            return Ok(false);
-        }
-        let Some(expr) = line
-            .strip_prefix("jseval ")
-            .or_else(|| line.strip_prefix("jseval\n"))
-            .or_else(|| line.strip_prefix("jseval"))
-        else {
-            return Ok(false);
-        };
 
-        if !script_uses_java_api(expr) {
-            return Ok(false);
-        }
-
-        log_info!("检测到 Java jseval，切到目标主线程执行");
-        let expr = wrap_jseval_expr(expr);
-        crate::remote_agent::eval_js_on_main_thread(session, &expr, "", false)
-            .map_err(|e| format!("主线程执行 jseval 失败: {}", e))?;
-        Ok(true)
+    let expr = wrap_jseval_expr(expr);
+    if uses_java_api {
+        log_info!("检测到 Java jseval，发送到 Java worker 执行");
+    } else {
+        log_info!("检测到 Managed DSL jseval，发送到 Java worker 执行");
     }
+    ensure_java_worker_ready(session)?;
+    let sender = session.get_sender().ok_or("agent 未连接")?;
+    crate::process::thaw_cgroup_freezer(session.pid.load(std::sync::atomic::Ordering::Acquire));
+    session.eval_state.clear();
+    send_command(sender, format!("java_jseval {}", expr))
+        .map_err(|e| format!("发送 Java jseval 到 Java worker 失败: {}", e))?;
+    Ok(true)
 }
 
 fn js_string_literal(value: &str) -> String {
@@ -139,7 +293,17 @@ pub(crate) fn rewrite_jseval_for_agent(line: &str) -> Option<String> {
 }
 
 pub(crate) enum PreResumeLoad {
-    Loaded,
+    Loaded { uses_java_api: bool },
+    DeferredEvalCompleted,
+}
+
+impl PreResumeLoad {
+    pub(crate) fn needs_post_resume_java_worker(&self) -> bool {
+        match self {
+            Self::Loaded { uses_java_api } => *uses_java_api,
+            Self::DeferredEvalCompleted => true,
+        }
+    }
 }
 
 fn is_ident_byte(b: u8) -> bool {
@@ -232,9 +396,21 @@ fn java_member_accesses(script: &str) -> Vec<(usize, String)> {
     out
 }
 
-#[cfg(not(feature = "noptrace"))]
 pub(crate) fn script_uses_java_api(script: &str) -> bool {
     !java_member_accesses(script).is_empty()
+}
+
+pub(crate) fn script_uses_managed_dsl_api(script: &str) -> bool {
+    const NEEDLES: &[&str] = &[
+        "dslRead",
+        "dslDrain",
+        "dslTake",
+        "dslInfo",
+        "dslImpl",
+        "managedDrainMessages",
+        "managedReadCounter",
+    ];
+    NEEDLES.iter().any(|needle| script.contains(needle))
 }
 
 pub(crate) fn detect_java_stealth_mode(script: &str) -> Option<i32> {
@@ -267,8 +443,11 @@ pub(crate) fn preconfigure_java_stealth_if_declared(session: &Session, script: &
     log_info!("脚本声明 Java.setStealth({})，预配置到 artinit/jsinit 之前", mode);
     session.eval_state.clear();
     send_command(sender, format!("javastealth {}", mode)).map_err(|e| format!("发送 javastealth 失败: {}", e))?;
-    match session.eval_state.recv_timeout(std::time::Duration::from_secs(10)) {
-        None => Err("等待 javastealth 超时".to_string()),
+    match session
+        .eval_state
+        .recv_timeout(std::time::Duration::from_secs(JAVA_STEALTH_TIMEOUT_SECS))
+    {
+        None => Err(format!("等待 javastealth 超时({}s)", JAVA_STEALTH_TIMEOUT_SECS)),
         Some(Err(e)) => Err(format!("javastealth 失败: {}", e)),
         Some(Ok(_)) => Ok(()),
     }
@@ -500,8 +679,11 @@ fn load_script_file_with_mode(
         // drain 超时时 agent 返回 Err，中止 reload 避免 UAF 旧 callback。
         session.eval_state.clear();
         if send_command(sender, "jsclean_soft").is_ok() {
-            match session.eval_state.recv_timeout(std::time::Duration::from_secs(35)) {
-                None => return Err("等待 jsclean_soft 超时".to_string()),
+            match session
+                .eval_state
+                .recv_timeout(std::time::Duration::from_secs(JSCLEAN_SOFT_TIMEOUT_SECS))
+            {
+                None => return Err(format!("等待 jsclean_soft 超时({}s)", JSCLEAN_SOFT_TIMEOUT_SECS)),
                 Some(Err(ref e)) if e.contains("未初始化") => {}
                 Some(Err(e)) if e.contains("drain timeout") => {
                     return Err(format!("软清理失败: {} — reload 中止，旧脚本继续运行", e));
@@ -516,18 +698,67 @@ fn load_script_file_with_mode(
 
     if script.is_empty() {
         log_info!("脚本为空，跳过加载: {}", script_path);
-        return Ok(PreResumeLoad::Loaded);
+        return Ok(PreResumeLoad::Loaded { uses_java_api: false });
     }
 
     preconfigure_java_stealth_if_declared(session, &script)?;
 
+    let uses_java_api = script_uses_java_api(&script);
+    if uses_java_api && stop_worker_after_load && !session.java_worker_ready.load(std::sync::atomic::Ordering::Acquire)
+    {
+        log_info!("检测到 pre-resume Java 脚本，先发送到 raw clone TLS JS worker 执行");
+    } else if uses_java_api {
+        log_info!("检测到 Java 脚本，发送到 Java worker 执行");
+    } else {
+        log_info!("脚本发送到 raw clone TLS JS worker 执行");
+    }
     let filename = script_filename(script_path);
     session.eval_state.clear();
-    log_info!("通过 agent socket 初始化并执行脚本");
+    if uses_java_api {
+        if stop_worker_after_load && !session.java_worker_ready.load(std::sync::atomic::Ordering::Acquire) {
+            send_command(sender, format!("loadjs_init [{}]\n{}", filename, script))
+                .map_err(|e| format!("发送 pre-resume Java 脚本到 raw clone TLS JS worker 失败: {}", e))?;
+            match session
+                .eval_state
+                .recv_timeout(std::time::Duration::from_secs(LOAD_PRE_RESUME_JAVA_TIMEOUT_SECS))
+            {
+                None => {
+                    return Err(format!(
+                        "pre-resume Java 脚本执行超时({}s)，未恢复子进程以避免错过早期 Java hook",
+                        LOAD_PRE_RESUME_JAVA_TIMEOUT_SECS
+                    ))
+                }
+                Some(Err(e)) => return Err(format!("pre-resume Java 脚本执行失败: {}", e)),
+                Some(Ok(out)) => {
+                    if !out.is_empty() {
+                        println!("{GREEN}=> {out}{RESET}");
+                    }
+                    cut_pre_resume_java_executor_hook(session)?;
+                    return Ok(PreResumeLoad::DeferredEvalCompleted);
+                }
+            }
+        }
+        ensure_java_worker_ready(session)?;
+        crate::process::thaw_cgroup_freezer(session.pid.load(std::sync::atomic::Ordering::Acquire));
+        session.eval_state.clear();
+        send_command(sender, format!("java_loadjs [{}]\n{}", filename, script))
+            .map_err(|e| format!("发送脚本到 Java worker 失败: {}", e))?;
+        print_eval_result(session, LOAD_JAVA_TIMEOUT_SECS);
+        return Ok(PreResumeLoad::Loaded { uses_java_api });
+    }
     send_command(sender, format!("loadjs_init [{}]\n{}", filename, script))
-        .map_err(|e| format!("发送 loadjs_init 失败: {}", e))?;
-    print_eval_result(session, if stop_worker_after_load { 10 } else { 30 });
-    Ok(PreResumeLoad::Loaded)
+        .map_err(|e| format!("发送脚本到 raw clone TLS JS worker 失败: {}", e))?;
+    print_eval_result(
+        session,
+        if stop_worker_after_load {
+            LOAD_STOP_WORKER_TIMEOUT_SECS
+        } else if uses_java_api {
+            LOAD_JAVA_TIMEOUT_SECS
+        } else {
+            LOAD_DEFAULT_TIMEOUT_SECS
+        },
+    );
+    Ok(PreResumeLoad::Loaded { uses_java_api })
 }
 
 /// 打印 eval 响应：等待 session.eval_state 结果并格式化输出。
@@ -537,8 +768,8 @@ pub(crate) fn print_eval_result(session: &Session, timeout_secs: u64) {
         .recv_timeout(std::time::Duration::from_secs(timeout_secs))
     {
         None => crate::logger::stdout_line(
-            &format!("{YELLOW}[timeout] 等待执行结果超时{RESET}"),
-            "[timeout] 等待执行结果超时",
+            &format!("{YELLOW}[timeout] 等待执行结果超时({}s){RESET}", timeout_secs),
+            &format!("[timeout] 等待执行结果超时({}s)", timeout_secs),
         ),
         Some(Ok(output)) => {
             if let Some(err) = output.strip_prefix(JSEVAL_ERROR_PREFIX) {
@@ -629,14 +860,15 @@ pub(crate) fn run_js_repl(session: &Arc<Session>) {
     // Auto-initialize JS engine: send jsinit and wait for EVAL confirmation.
     // Accept both Ok (just initialized) and Err containing "已初始化" (already was ready).
     {
-        let result = session
-            .eval_state
-            .clear_then_recv(std::time::Duration::from_secs(5), || {
-                let _ = send_command(sender, "jsinit");
-            });
+        let result =
+            session
+                .eval_state
+                .clear_then_recv(std::time::Duration::from_secs(EVAL_DEFAULT_TIMEOUT_SECS), || {
+                    let _ = send_command(sender, "jsinit");
+                });
         match result {
             None => {
-                log_error!("jsrepl: jsinit 超时，JS 引擎未就绪");
+                log_error!("jsrepl: jsinit 超时({}s)，JS 引擎未就绪", EVAL_DEFAULT_TIMEOUT_SECS);
                 return;
             }
             Some(Ok(_)) => {}
@@ -689,8 +921,7 @@ pub(crate) fn run_js_repl(session: &Arc<Session>) {
                         continue;
                     }
                 }
-                // 同步等待 agent 返回结果（最长 5 秒）
-                print_eval_result(session, 5);
+                print_eval_result(session, EVAL_DEFAULT_TIMEOUT_SECS);
             }
             Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
                 println!("{DIM}退出 JS REPL 模式{RESET}");

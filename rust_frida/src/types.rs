@@ -2,7 +2,7 @@
 
 /// 获取所有可用的字符串名称（用于 CLI --string 参数验证）
 pub(crate) fn get_string_table_names() -> Vec<&'static str> {
-    vec!["sym_name", "pthread_err", "dlsym_err", "cmdline", "output_path"]
+    vec!["sym_name", "dlsym_err", "cmdline", "output_path"]
 }
 
 /// 用户空间寄存器结构体
@@ -104,8 +104,6 @@ pub(crate) struct FridaLibcApi {
     pub(crate) send: u64,
     pub(crate) fcntl: u64,
     pub(crate) close: u64,
-    pub(crate) pthread_create: u64,
-    pub(crate) pthread_detach: u64,
     pub(crate) dlopen: u64,
     pub(crate) dlopen_flags: i32,
     _pad: i32,
@@ -132,13 +130,17 @@ pub(crate) struct RustFridaLoaderContext {
     pub(crate) fallback_address: u64, // const char *
     pub(crate) libc: u64,             // FridaLibcApi *
     pub(crate) string_table_addr: u64,
-    pub(crate) agent_current_thread_eval: u64,      // const char *
-    pub(crate) resolver_module_bases: u64,          // const Elf64_Addr *
-    pub(crate) resolver_module_count: u64,          // size_t
-    pub(crate) worker: u64,                         // pthread_t (runtime, zeroed)
+    pub(crate) agent_current_thread_eval: u64, // const char *
+    pub(crate) resolver_module_bases: u64,     // const Elf64_Addr *
+    pub(crate) resolver_module_count: u64,     // size_t
+    pub(crate) libc_base: u64,
+    pub(crate) linker_base: u64,
+    pub(crate) worker: u64,                         // raw-clone tid (runtime, zeroed)
     pub(crate) agent_handle: u64,                   // void * (runtime, zeroed)
     pub(crate) agent_entrypoint_impl: u64,          // fn ptr (runtime, zeroed)
     pub(crate) agent_current_thread_eval_impl: u64, // fn ptr (runtime, zeroed)
+    pub(crate) loader_stack: u64,                   // raw-clone loader stack base (runtime, zeroed)
+    pub(crate) loader_stack_size: u64,              // raw-clone loader stack size (runtime, zeroed)
     pub(crate) spawn_resume_flag: u64,              // pure spawn: *mut u64, 0 for ptrace backend
     pub(crate) spawn_stage0_done_flag: u64,         // pure spawn: *mut u64, set by zymbiote after resume wait exits
     pub(crate) spawn_cleanup_payload_base: u64,

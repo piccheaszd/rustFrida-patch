@@ -169,16 +169,15 @@ static void* prepare_redirect_entry(uint64_t key, HookRedirectEntry** out_entry)
     HookRedirectEntry* cur = g_engine.redirects;
     while (cur) {
         if (cur->key == key) {
-            pthread_mutex_unlock(&g_engine.lock);
+            hook_unlock(&g_engine.lock);
             return NULL;
         }
         cur = cur->next;
     }
 
-    /* Allocate entry in pool */
     HookRedirectEntry* entry = (HookRedirectEntry*)hook_alloc(sizeof(HookRedirectEntry));
     if (!entry) {
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return NULL;
     }
     memset(entry, 0, sizeof(HookRedirectEntry));
@@ -186,7 +185,7 @@ static void* prepare_redirect_entry(uint64_t key, HookRedirectEntry** out_entry)
     /* redirect/native thunk 通过指针间接调用，不需要近距离分配 */
     void* thunk_mem = hook_alloc(THUNK_ALLOC_SIZE);
     if (!thunk_mem) {
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return NULL;
     }
 
@@ -207,7 +206,7 @@ static void* finalize_redirect_entry(HookRedirectEntry* entry, uint64_t key,
 
     hook_flush_cache(thunk, thunk_size);
 
-    pthread_mutex_unlock(&g_engine.lock);
+    hook_unlock(&g_engine.lock);
     return thunk;
 }
 
@@ -217,7 +216,7 @@ void* hook_create_redirect(uint64_t key, void* original_entry,
     if (!g_engine.initialized || !original_entry || !on_enter)
         return NULL;
 
-    pthread_mutex_lock(&g_engine.lock);
+    hook_lock(&g_engine.lock);
 
     HookRedirectEntry* entry;
     void* thunk_mem = prepare_redirect_entry(key, &entry);
@@ -227,7 +226,7 @@ void* hook_create_redirect(uint64_t key, void* original_entry,
     void* thunk = generate_redirect_thunk(original_entry, on_enter, user_data,
                                            thunk_mem, &thunk_size);
     if (!thunk) {
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return NULL;
     }
 
@@ -238,7 +237,7 @@ void* hook_create_redirect(uint64_t key, void* original_entry,
 void* hook_remove_redirect(uint64_t key) {
     if (!g_engine.initialized) return NULL;
 
-    pthread_mutex_lock(&g_engine.lock);
+    hook_lock(&g_engine.lock);
 
     HookRedirectEntry* prev = NULL;
     HookRedirectEntry* entry = g_engine.redirects;
@@ -253,14 +252,14 @@ void* hook_remove_redirect(uint64_t key) {
                 g_engine.redirects = entry->next;
             }
 
-            pthread_mutex_unlock(&g_engine.lock);
+            hook_unlock(&g_engine.lock);
             return original;
         }
         prev = entry;
         entry = entry->next;
     }
 
-    pthread_mutex_unlock(&g_engine.lock);
+    hook_unlock(&g_engine.lock);
     return NULL;
 }
 
@@ -326,7 +325,7 @@ void* hook_create_native_trampoline(uint64_t key, HookCallback on_enter, void* u
     if (!g_engine.initialized || !on_enter)
         return NULL;
 
-    pthread_mutex_lock(&g_engine.lock);
+    hook_lock(&g_engine.lock);
 
     HookRedirectEntry* entry;
     /* native trampoline 通过 ArtMethod.data_ 间接调用，不需要 ADRP 近距离 */
@@ -336,7 +335,7 @@ void* hook_create_native_trampoline(uint64_t key, HookCallback on_enter, void* u
     size_t thunk_size = 0;
     void* thunk = generate_native_hook_thunk(on_enter, user_data, current_pc_hint, key, thunk_mem, &thunk_size);
     if (!thunk) {
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return NULL;
     }
 

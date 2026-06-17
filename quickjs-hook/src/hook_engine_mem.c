@@ -35,6 +35,102 @@ int page_has_read_perm(uintptr_t addr) {
     return readable;
 }
 
+int page_prot_flags(uintptr_t addr) {
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) return PROT_READ | PROT_EXEC;
+
+    char line[512];
+    int prot = PROT_READ | PROT_EXEC;
+    while (fgets(line, sizeof(line), f)) {
+        uintptr_t start = 0, end = 0;
+        char perms[8] = "";
+        if (sscanf(line, "%lx-%lx %7s", &start, &end, perms) >= 3) {
+            if (addr >= start && addr < end) {
+                prot = 0;
+                if (perms[0] == 'r') prot |= PROT_READ;
+                if (perms[1] == 'w') prot |= PROT_WRITE;
+                if (perms[2] == 'x') prot |= PROT_EXEC;
+                break;
+            }
+        }
+    }
+    fclose(f);
+    return prot;
+}
+
+static size_t hook_page_size(void) {
+    long page_size = sysconf(_SC_PAGESIZE);
+    return page_size > 0 ? (size_t)page_size : 4096u;
+}
+
+static uintptr_t hook_page_start(uintptr_t addr) {
+    size_t page_size = hook_page_size();
+    return addr & ~(uintptr_t)(page_size - 1);
+}
+
+int mprotect_range_pages(void* target, size_t len, int prot) {
+    if (!target || len == 0) return -1;
+
+    size_t page_size = hook_page_size();
+    uintptr_t start = (uintptr_t)target;
+    uintptr_t end = start + len - 1;
+    if (end < start) return -1;
+
+    uintptr_t page = hook_page_start(start);
+    uintptr_t last_page = hook_page_start(end);
+    for (;;) {
+        if (mprotect((void*)page, page_size, prot) != 0) {
+            return -1;
+        }
+        if (page == last_page) break;
+        page += page_size;
+    }
+    return 0;
+}
+
+void restore_range_prot_pages(void* target, size_t len, const int* prot_flags, size_t prot_count) {
+    if (!target || len == 0 || !prot_flags || prot_count == 0) return;
+
+    size_t page_size = hook_page_size();
+    uintptr_t start = (uintptr_t)target;
+    uintptr_t end = start + len - 1;
+    if (end < start) return;
+
+    uintptr_t page = hook_page_start(start);
+    uintptr_t last_page = hook_page_start(end);
+    size_t i = 0;
+    for (;;) {
+        int prot = i < prot_count ? prot_flags[i] : (PROT_READ | PROT_EXEC);
+        if (prot == 0) prot = PROT_READ | PROT_EXEC;
+        mprotect((void*)page, page_size, prot);
+        if (page == last_page) break;
+        page += page_size;
+        i++;
+    }
+}
+
+size_t save_range_prot_pages(void* target, size_t len, int* prot_flags, size_t prot_cap) {
+    if (!target || len == 0 || !prot_flags || prot_cap == 0) return 0;
+
+    size_t page_size = hook_page_size();
+    uintptr_t start = (uintptr_t)target;
+    uintptr_t end = start + len - 1;
+    if (end < start) return 0;
+
+    uintptr_t page = hook_page_start(start);
+    uintptr_t last_page = hook_page_start(end);
+    size_t count = 0;
+    for (;;) {
+        if (count < prot_cap) {
+            prot_flags[count] = page_prot_flags(page);
+        }
+        count++;
+        if (page == last_page) break;
+        page += page_size;
+    }
+    return count;
+}
+
 /*
  * Safely read bytes from a target address.
  *
@@ -52,8 +148,7 @@ int read_target_safe(void* target, void* buf, size_t len) {
     }
 
     /* Page not readable (XOM / --x) — mprotect to add read, then memcpy */
-    uintptr_t page_start = (uintptr_t)target & ~(uintptr_t)0xFFF;
-    if (mprotect((void*)page_start, 0x2000, PROT_READ | PROT_EXEC) == 0) {
+    if (mprotect_range_pages(target, len, PROT_READ | PROT_EXEC) == 0) {
         memcpy(buf, target, len);
         /* mprotect already set r-x, no need to restore */
         return 0;
@@ -76,6 +171,18 @@ void restore_page_rx(uintptr_t page_start) {
         mprotect((void*)page_start, 0x1000, PROT_READ | PROT_EXEC);
         mprotect((void*)(page_start + 0x1000), 0x1000, PROT_READ | PROT_EXEC);
     }
+}
+
+void restore_page_prot_span(uintptr_t page_start, int first_prot, int second_prot) {
+    if (first_prot == 0) first_prot = PROT_READ | PROT_EXEC;
+    if (second_prot == 0) second_prot = PROT_READ | PROT_EXEC;
+    if (first_prot == second_prot) {
+        if (mprotect((void*)page_start, 0x2000, first_prot) == 0) {
+            return;
+        }
+    }
+    mprotect((void*)page_start, 0x1000, first_prot);
+    mprotect((void*)(page_start + 0x1000), 0x1000, second_prot);
 }
 
 /* --- Entry free list management --- */
@@ -623,6 +730,16 @@ void* hook_mmap_near_range(void* target, size_t alloc_size, int64_t max_range) {
                         gaps[num_gaps].end = ge;
                         gaps[num_gaps].dist = d;
                         num_gaps++;
+                    } else {
+                        int farthest = 0;
+                        for (int k = 1; k < MAX_GAPS; k++) {
+                            if (gaps[k].dist > gaps[farthest].dist) farthest = k;
+                        }
+                        if (d < gaps[farthest].dist) {
+                            gaps[farthest].start = gs;
+                            gaps[farthest].end = ge;
+                            gaps[farthest].dist = d;
+                        }
                     }
                 }
             }
@@ -646,9 +763,10 @@ void* hook_mmap_near_range(void* target, size_t alloc_size, int64_t max_range) {
     #define MAP_FIXED_NOREPLACE 0x100000
     #endif
 
-    /* 单 gap 探测上限：每次步进 alloc_size，64 步 × 64KB = 4MB 覆盖，足够跨过
-     * 隐藏的老 pool。更大的 gap 也会被系统 VMA 切断，不用担心单 gap 过大。 */
-    const int MAX_STEPS_PER_GAP = 64;
+    /* 单 gap 探测上限：按页粒度围绕最近点扫描。不能按 alloc_size 步进；
+     * /proc/self/maps 里可见的空洞可能被隐藏 VMA 或内核保留占掉前几页，
+     * 只试 gap 起点会误判“近址内存不足”。 */
+    const int MAX_STEPS_PER_GAP = 1024;
 
     for (int i = 0; i < num_gaps; i++) {
         uintptr_t gs = gaps[i].start;
@@ -667,7 +785,7 @@ void* hook_mmap_near_range(void* target, size_t alloc_size, int64_t max_range) {
 
         int had_unsupported = 0;
         int steps = 0;
-        /* 以 origin 为中心，按 alloc_size 步长交替向 +/- 方向扫 */
+        /* 以 origin 为中心，按 page_size 步长交替向 +/- 方向扫 */
         for (int step = 0; step < MAX_STEPS_PER_GAP * 2; step++) {
             int64_t off_steps;
             if (step == 0) off_steps = 0;
@@ -676,11 +794,11 @@ void* hook_mmap_near_range(void* target, size_t alloc_size, int64_t max_range) {
 
             uintptr_t cand;
             if (off_steps >= 0) {
-                uintptr_t absoff = (uintptr_t)off_steps * (uintptr_t)alloc_size;
+                uintptr_t absoff = (uintptr_t)off_steps * (uintptr_t)page_size;
                 if (origin > gap_last || absoff > gap_last - origin) continue;
                 cand = origin + absoff;
             } else {
-                uintptr_t absoff = (uintptr_t)(-off_steps) * (uintptr_t)alloc_size;
+                uintptr_t absoff = (uintptr_t)(-off_steps) * (uintptr_t)page_size;
                 if (origin < gs || absoff > origin - gs) continue;
                 cand = origin - absoff;
             }
@@ -704,7 +822,12 @@ void* hook_mmap_near_range(void* target, size_t alloc_size, int64_t max_range) {
                          ptr, target, (long long)max_range, i, steps);
                 return ptr;
             }
-            if (errno == EEXIST) continue;  /* 隐藏 VMA 或已占用，步进跳过 */
+            if (errno == EEXIST || errno == EACCES || errno == EPERM) {
+                /* 隐藏/残留 VMA 在部分内核上不会稳定返回 EEXIST，
+                 * 可能表现为 EACCES/EPERM。继续按页探测同一 gap，
+                 * 不退回远地址或 mprotect fallback。 */
+                continue;
+            }
             if (errno == ENOSYS || errno == EINVAL) {
                 had_unsupported = 1;
                 break;
@@ -787,9 +910,8 @@ static int pool_in_adrp_range(ExecPool* pool, void* target) {
     return dist > -range && dist < range;
 }
 
-/* 判断 pool 是否在 target 的指定范围内 */
-static int pool_in_range(ExecPool* pool, void* target, int64_t range) {
-    int64_t dist = (int64_t)((uint8_t*)pool->base - (uint8_t*)target);
+static int ptr_in_range(void* ptr, void* target, int64_t range) {
+    int64_t dist = (int64_t)((uint8_t*)ptr - (uint8_t*)target);
     return dist > -range && dist < range;
 }
 
@@ -861,17 +983,19 @@ void* hook_alloc_near(size_t size, void* target) {
 
     /* 1a: 现有 pool 中找 ±128MB 内有空间的 */
     if (g_engine.exec_mem_used + size <= g_engine.exec_mem_size) {
-        int64_t dist = (int64_t)((uint8_t*)g_engine.exec_mem - (uint8_t*)target);
-        if (dist > -b_range && dist < b_range) {
-            void* ptr = (uint8_t*)g_engine.exec_mem + g_engine.exec_mem_used;
+        void* ptr = (uint8_t*)g_engine.exec_mem + g_engine.exec_mem_used;
+        if (ptr_in_range(ptr, target, b_range)) {
             g_engine.exec_mem_used += size;
             return ptr;
         }
     }
     for (int i = 0; i < g_engine.pool_count; i++) {
-        if (pool_in_range(&g_engine.pools[i], target, b_range)) {
-            void* ptr = alloc_from_pool(&g_engine.pools[i], size);
-            if (ptr) return ptr;
+        ExecPool* pool = &g_engine.pools[i];
+        if (pool->used + size <= pool->size) {
+            void* ptr = (uint8_t*)pool->base + pool->used;
+            if (ptr_in_range(ptr, target, b_range)) {
+                return alloc_from_pool(pool, size);
+            }
         }
     }
 
@@ -888,17 +1012,19 @@ void* hook_alloc_near(size_t size, void* target) {
 
     /* 2a: 现有 pool 中找 ±4GB 内有空间的 */
     if (g_engine.exec_mem_used + size <= g_engine.exec_mem_size) {
-        int64_t dist = (int64_t)((uint8_t*)g_engine.exec_mem - (uint8_t*)target);
-        if (dist > -adrp_range && dist < adrp_range) {
-            void* ptr = (uint8_t*)g_engine.exec_mem + g_engine.exec_mem_used;
+        void* ptr = (uint8_t*)g_engine.exec_mem + g_engine.exec_mem_used;
+        if (ptr_in_range(ptr, target, adrp_range)) {
             g_engine.exec_mem_used += size;
             return ptr;
         }
     }
     for (int i = 0; i < g_engine.pool_count; i++) {
-        if (pool_in_range(&g_engine.pools[i], target, adrp_range)) {
-            void* ptr = alloc_from_pool(&g_engine.pools[i], size);
-            if (ptr) return ptr;
+        ExecPool* pool = &g_engine.pools[i];
+        if (pool->used + size <= pool->size) {
+            void* ptr = (uint8_t*)pool->base + pool->used;
+            if (ptr_in_range(ptr, target, adrp_range)) {
+                return alloc_from_pool(pool, size);
+            }
         }
     }
 
@@ -934,9 +1060,8 @@ void* hook_alloc_near_range(size_t size, void* target, int64_t max_range) {
 
     /* Phase 1: 初始 pool */
     if (g_engine.exec_mem_used + size <= g_engine.exec_mem_size) {
-        int64_t dist = (int64_t)((uint8_t*)g_engine.exec_mem - (uint8_t*)target);
-        if (dist > -max_range && dist < max_range) {
-            void* ptr = (uint8_t*)g_engine.exec_mem + g_engine.exec_mem_used;
+        void* ptr = (uint8_t*)g_engine.exec_mem + g_engine.exec_mem_used;
+        if (ptr_in_range(ptr, target, max_range)) {
             g_engine.exec_mem_used += size;
             return ptr;
         }
@@ -945,8 +1070,11 @@ void* hook_alloc_near_range(size_t size, void* target, int64_t max_range) {
     /* Phase 1b: 额外 pool */
     for (int i = 0; i < g_engine.pool_count; i++) {
         ExecPool* pool = &g_engine.pools[i];
-        if (pool_in_range(pool, target, max_range) && pool->used + size <= pool->size) {
-            return alloc_from_pool(pool, size);
+        if (pool->used + size <= pool->size) {
+            void* ptr = (uint8_t*)pool->base + pool->used;
+            if (ptr_in_range(ptr, target, max_range)) {
+                return alloc_from_pool(pool, size);
+            }
         }
     }
 
@@ -1267,37 +1395,43 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
     if (jump_result < 0) {
         return jump_result;
     }
+    int jump_len = jump_result;
 
     {
-        void* writable = find_rw_sibling(target, (size_t)jump_result);
+        void* writable = find_rw_sibling(target, (size_t)jump_len);
         if (writable) {
-            memcpy(writable, jump_buf, (size_t)jump_result);
+            memcpy(writable, jump_buf, (size_t)jump_len);
             /* flush icache 在 target 侧 (CPU 执行地址) — 虚拟地址不同但物理页同 */
-            __builtin___clear_cache((char*)target, (char*)target + jump_result);
-            __builtin___clear_cache((char*)writable, (char*)writable + jump_result);
+            __builtin___clear_cache((char*)target, (char*)target + jump_len);
+            __builtin___clear_cache((char*)writable, (char*)writable + jump_len);
             entry->stealth = 0;
-            entry->original_size = jump_result;
+            entry->original_size = jump_len;
             hook_log("[patch_target] rw-sibling OK target=%p via writable=%p len=%d",
-                     target, writable, jump_result);
+                     target, writable, jump_len);
             return 0;
         }
     }
 
-    /* Fallback: mprotect + direct write */
-    uintptr_t page_start = (uintptr_t)target & ~0xFFF;
-    if (mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-        hook_log("[patch_target] mprotect(RWX) %p failed errno=%d(%s)",
-                 (void*)page_start, errno, strerror(errno));
+    /* Fallback: mprotect + direct write. Protect only the pages covered by
+     * this jump; a fixed 2-page span fails when a recomp slot sits on the last
+     * mapped page of a tiny trampoline region. */
+    int saved_prot[8] = {0};
+    size_t saved_count = save_range_prot_pages(target, (size_t)jump_len, saved_prot,
+                                               sizeof(saved_prot) / sizeof(saved_prot[0]));
+    if (saved_count == 0 || saved_count > sizeof(saved_prot) / sizeof(saved_prot[0]) ||
+            mprotect_range_pages(target, (size_t)jump_len, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        hook_log("[patch_target] mprotect(RWX) %p len=%d failed errno=%d(%s)",
+                 target, jump_len, errno, strerror(errno));
         return HOOK_ERROR_MPROTECT_FAILED;
     }
     jump_result = hook_write_jump(target, jump_dest);
     if (jump_result < 0) {
-        restore_page_rx(page_start);
+        restore_range_prot_pages(target, (size_t)jump_len, saved_prot, saved_count);
         return jump_result;
     }
     entry->stealth = 0;
     entry->original_size = jump_result;
-    restore_page_rx(page_start);
+    restore_range_prot_pages(target, (size_t)jump_len, saved_prot, saved_count);
 
     return 0;
 }

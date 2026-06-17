@@ -31,7 +31,7 @@ void* hook_install(void* target, void* replacement, int stealth) {
         return NULL;
     }
 
-    pthread_mutex_lock(&g_engine.lock);
+    hook_lock(&g_engine.lock);
 
     if (stealth == 1 && wxshadow_page_has_active_hook(target)) {
         log_wxshadow_page_busy(target);
@@ -41,7 +41,7 @@ void* hook_install(void* target, void* replacement, int stealth) {
 
     HookEntry* entry = setup_hook_entry(target);
     if (!entry) {
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return NULL;
     }
 
@@ -49,20 +49,20 @@ void* hook_install(void* target, void* replacement, int stealth) {
 
     if (build_trampoline(entry, 0) < 0) {
         free_entry(entry);
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return NULL;
     }
 
     if (patch_target(target, replacement, stealth, entry) != 0) {
         free_entry(entry);
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return NULL;
     }
 
     finalize_hook(entry, NULL, 0);
 
     void* trampoline = entry->trampoline;
-    pthread_mutex_unlock(&g_engine.lock);
+    hook_unlock(&g_engine.lock);
     return trampoline;
 }
 
@@ -306,7 +306,7 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
     if (!target) return HOOK_ERROR_INVALID_PARAM;
     if (!on_enter && !on_leave) return HOOK_ERROR_INVALID_PARAM;
 
-    pthread_mutex_lock(&g_engine.lock);
+    hook_lock(&g_engine.lock);
 
     if (stealth == 1 && wxshadow_page_has_active_hook(target)) {
         log_wxshadow_page_busy(target);
@@ -316,7 +316,7 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
 
     HookEntry* entry = setup_hook_entry(target);
     if (!entry) {
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return HOOK_ERROR_ALLOC_FAILED;
     }
 
@@ -326,7 +326,7 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
 
     if (build_trampoline(entry, 0) < 0) {
         free_entry(entry);
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return HOOK_ERROR_ALLOC_FAILED;
     }
 
@@ -335,20 +335,20 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
     void* thunk_mem = generate_attach_thunk(entry, on_enter, on_leave, user_data, &thunk_size);
     if (!thunk_mem) {
         free_entry(entry);
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return HOOK_ERROR_ALLOC_FAILED;
     }
 
     int patch_result = patch_target(target, thunk_mem, stealth, entry);
     if (patch_result != 0) {
         free_entry(entry);
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return patch_result;
     }
 
     finalize_hook(entry, thunk_mem, thunk_size);
 
-    pthread_mutex_unlock(&g_engine.lock);
+    hook_unlock(&g_engine.lock);
     return HOOK_OK;
 }
 
@@ -407,7 +407,7 @@ void* hook_replace(void* target, HookCallback on_enter, void* user_data, int ste
         return NULL;
     }
 
-    pthread_mutex_lock(&g_engine.lock);
+    hook_lock(&g_engine.lock);
 
     if (stealth == 1 && wxshadow_page_has_active_hook(target)) {
         log_wxshadow_page_busy(target);
@@ -417,7 +417,7 @@ void* hook_replace(void* target, HookCallback on_enter, void* user_data, int ste
 
     HookEntry* entry = setup_hook_entry(target);
     if (!entry) {
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return NULL;
     }
 
@@ -426,7 +426,7 @@ void* hook_replace(void* target, HookCallback on_enter, void* user_data, int ste
 
     if (build_trampoline(entry, 0) < 0) {
         free_entry(entry);
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return NULL;
     }
 
@@ -435,20 +435,20 @@ void* hook_replace(void* target, HookCallback on_enter, void* user_data, int ste
     void* thunk_mem = generate_replace_thunk(entry, on_enter, user_data, &thunk_size);
     if (!thunk_mem) {
         free_entry(entry);
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return NULL;
     }
 
     if (patch_target(target, thunk_mem, stealth, entry) != 0) {
         free_entry(entry);
-        pthread_mutex_unlock(&g_engine.lock);
+        hook_unlock(&g_engine.lock);
         return NULL;
     }
 
     finalize_hook(entry, thunk_mem, thunk_size);
 
     void* trampoline = entry->trampoline;
-    pthread_mutex_unlock(&g_engine.lock);
+    hook_unlock(&g_engine.lock);
     return trampoline;
 }
 
@@ -529,7 +529,7 @@ int hook_remove(void* target) {
         return HOOK_ERROR_INVALID_PARAM;
     }
 
-    pthread_mutex_lock(&g_engine.lock);
+    hook_lock(&g_engine.lock);
 
     HookEntry* prev = NULL;
     HookEntry* entry = g_engine.hooks;
@@ -545,7 +545,7 @@ int hook_remove(void* target) {
                 int rc = wxshadow_release(target);
                 if (rc != 0) {
                     hook_log("hook_remove: wxshadow_release FAILED for %p (stealth hook stays active)", target);
-                    pthread_mutex_unlock(&g_engine.lock);
+                    hook_unlock(&g_engine.lock);
                     return HOOK_ERROR_WXSHADOW_FAILED;
                 }
                 uintptr_t t = (uintptr_t)target;
@@ -575,15 +575,21 @@ int hook_remove(void* target) {
                     hook_log("hook_remove: rw-sibling restore OK target=%p via writable=%p len=%zu",
                              target, writable, (size_t)entry->original_size);
                 } else {
-                    uintptr_t page_start = (uintptr_t)target & ~0xFFF;
-                    if (mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+                    int saved_prot[8] = {0};
+                    size_t saved_count = save_range_prot_pages(target, (size_t)entry->original_size,
+                                                               saved_prot,
+                                                               sizeof(saved_prot) / sizeof(saved_prot[0]));
+                    if (saved_count == 0 ||
+                            saved_count > sizeof(saved_prot) / sizeof(saved_prot[0]) ||
+                            mprotect_range_pages(target, (size_t)entry->original_size,
+                                                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
                         hook_log("hook_remove: mprotect failed target=%p errno=%d, hook remains installed",
                                  target, errno);
-                        pthread_mutex_unlock(&g_engine.lock);
+                        hook_unlock(&g_engine.lock);
                         return HOOK_ERROR_MPROTECT_FAILED;
                     }
                     memcpy(target, entry->original_bytes, entry->original_size);
-                    restore_page_rx(page_start);
+                    restore_range_prot_pages(target, (size_t)entry->original_size, saved_prot, saved_count);
                     hook_flush_cache(target, entry->original_size);
                 }
             }
@@ -598,23 +604,59 @@ int hook_remove(void* target) {
             /* Move to free list for reuse instead of discarding */
             free_entry(entry);
 
-            pthread_mutex_unlock(&g_engine.lock);
+            hook_unlock(&g_engine.lock);
             return HOOK_OK;
         }
         prev = entry;
         entry = entry->next;
     }
 
-    pthread_mutex_unlock(&g_engine.lock);
+    hook_unlock(&g_engine.lock);
     return HOOK_ERROR_NOT_FOUND;
 }
 
 /* --- Get trampoline --- */
 
 void* hook_get_trampoline(void* target) {
-    pthread_mutex_lock(&g_engine.lock);
+    hook_lock(&g_engine.lock);
     HookEntry* entry = find_hook(target);
     void* result = entry ? entry->trampoline : NULL;
-    pthread_mutex_unlock(&g_engine.lock);
+    hook_unlock(&g_engine.lock);
     return result;
+}
+
+int hook_mark_recomp_hook(void* target) {
+    if (!g_engine.initialized || !target) {
+        return HOOK_ERROR_INVALID_PARAM;
+    }
+
+    hook_lock(&g_engine.lock);
+    HookEntry* entry = find_hook(target);
+    if (!entry) {
+        hook_unlock(&g_engine.lock);
+        return HOOK_ERROR_NOT_FOUND;
+    }
+
+    entry->stealth = 2;
+    hook_unlock(&g_engine.lock);
+    return HOOK_OK;
+}
+
+int hook_mark_recomp_hook_by_trampoline(void* trampoline) {
+    if (!g_engine.initialized || !trampoline) {
+        return HOOK_ERROR_INVALID_PARAM;
+    }
+
+    hook_lock(&g_engine.lock);
+    HookEntry* entry = g_engine.hooks;
+    while (entry) {
+        if (entry->trampoline == trampoline) {
+            entry->stealth = 2;
+            hook_unlock(&g_engine.lock);
+            return HOOK_OK;
+        }
+        entry = entry->next;
+    }
+    hook_unlock(&g_engine.lock);
+    return HOOK_ERROR_NOT_FOUND;
 }

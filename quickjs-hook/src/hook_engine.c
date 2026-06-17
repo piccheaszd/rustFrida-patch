@@ -201,10 +201,8 @@ int hook_engine_init(void* exec_mem, size_t size) {
     g_engine.hooks = NULL;
     g_engine.free_list = NULL;
     g_engine.redirects = NULL;
-    g_engine.exec_mem_page_size = 4096u;
-    /* g_engine is static zero-initialized; bionic's default mutex initializer is
-     * also all-zero. Avoid calling pthread_mutex_init() from injected startup
-     * because hardened apps may crash inside target libc initialization paths. */
+    g_engine.exec_mem_page_size = (size_t)sysconf(_SC_PAGESIZE);
+    hook_lock_init(&g_engine.lock);
     g_engine.initialized = 1;
 
     return 0;
@@ -224,7 +222,7 @@ HookEntry* find_hook(void* target) {
 void hook_engine_cleanup(void) {
     if (!g_engine.initialized) return;
 
-    pthread_mutex_lock(&g_engine.lock);
+    hook_lock(&g_engine.lock);
 
     /* Count hooks on both lists for diagnostics */
     int hooks_count = 0, free_count = 0, stealth_hooks = 0, stealth_free = 0;
@@ -255,11 +253,21 @@ void hook_engine_cleanup(void) {
         } else if (entry->stealth == 2) {
             /* Recomp entries are discarded below with the pool. */
         } else {
-            uintptr_t page_start = (uintptr_t)entry->target & ~0xFFF;
-            mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC);
-            memcpy(entry->target, entry->original_bytes, entry->original_size);
-            restore_page_rx(page_start);
-            hook_flush_cache(entry->target, entry->original_size);
+            int saved_prot[8] = {0};
+            size_t saved_count = save_range_prot_pages(entry->target, entry->original_size,
+                                                       saved_prot,
+                                                       sizeof(saved_prot) / sizeof(saved_prot[0]));
+            if (saved_count != 0 &&
+                    saved_count <= sizeof(saved_prot) / sizeof(saved_prot[0]) &&
+                    mprotect_range_pages(entry->target, entry->original_size,
+                                         PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+                memcpy(entry->target, entry->original_bytes, entry->original_size);
+                restore_range_prot_pages(entry->target, entry->original_size, saved_prot, saved_count);
+                hook_flush_cache(entry->target, entry->original_size);
+            } else {
+                hook_log("hook_engine_cleanup: mprotect restore failed for %p errno=%d",
+                         entry->target, errno);
+            }
         }
         entry = entry->next;
     }
@@ -301,5 +309,6 @@ void hook_engine_cleanup(void) {
     g_engine.exec_mem_used = 0;
     g_engine.initialized = 0;
 
-    pthread_mutex_unlock(&g_engine.lock);
+    hook_unlock(&g_engine.lock);
+    hook_lock_destroy(&g_engine.lock);
 }

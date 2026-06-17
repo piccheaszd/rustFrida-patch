@@ -22,13 +22,39 @@ use crate::communication::{send_command, start_socketpair_handler};
 use crate::injection::inject_via_bootstrapper;
 use crate::process::find_pid_by_name;
 use crate::repl::{
-    load_script_file, load_script_file_pre_resume, print_eval_result, print_help, rewrite_jseval_for_agent,
-    run_js_repl, try_jseval_on_main_thread_if_java, try_loadjs_on_main_thread_if_java,
-    try_managedcounter_on_main_thread,
+    cut_pre_resume_java_executor_hook, ensure_java_worker_ready, ensure_java_worker_ready_after_resume,
+    preconfigure_java_stealth_if_declared, print_eval_result, print_help, rewrite_jseval_for_agent, run_js_repl,
+    script_uses_java_api, try_jseval_on_main_thread_if_java_or_dsl, try_loadjs_on_main_thread_if_java,
+    try_managedcounter_on_main_thread, EVAL_DEFAULT_TIMEOUT_SECS, EVAL_JAVA_TIMEOUT_SECS, EVAL_RECOMP_TIMEOUT_SECS,
+    LOAD_DEFAULT_TIMEOUT_SECS, LOAD_JAVA_TIMEOUT_SECS, LOAD_PRE_RESUME_JAVA_TIMEOUT_SECS,
+    LOAD_STOP_WORKER_TIMEOUT_SECS,
 };
 use crate::session::{Session, SessionManager};
 use crate::spawn;
 use crate::{log_error, log_info, log_success, log_warn};
+
+const SESSION_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScriptLoadState {
+    Loaded { needs_post_resume_java_worker: bool },
+    Failed,
+}
+
+impl ScriptLoadState {
+    fn failed(&self) -> bool {
+        matches!(self, Self::Failed)
+    }
+
+    fn needs_post_resume_java_worker(&self) -> bool {
+        match self {
+            Self::Loaded {
+                needs_post_resume_java_worker,
+            } => *needs_post_resume_java_worker,
+            Self::Failed => false,
+        }
+    }
+}
 
 // ────────────────────────── Server 命令补全 ──────────────────────────
 
@@ -130,16 +156,145 @@ fn parse_script_flag(parts: &[&str]) -> (Vec<String>, Option<String>) {
 }
 
 /// 在目标进程暂停期间加载脚本（用于 spawn 模式）
-fn load_script_on_session(session: &Session, script_path: &str, stop_worker_after_load: bool) -> bool {
-    let result = if stop_worker_after_load {
-        load_script_file_pre_resume(session, script_path).map(|_| ())
-    } else {
-        load_script_file(session, script_path, false)
-    };
-    if let Err(e) = result {
-        log_error!("[#{}] {}", session.id, e);
+fn load_script_on_session(session: &Session, script_path: &str, stop_worker_after_load: bool) -> ScriptLoadState {
+    if session.get_sender().is_none() {
+        log_error!("[#{}] agent 未连接，无法加载脚本", session.id);
+        return ScriptLoadState::Failed;
     }
-    false
+    let script = match std::fs::read_to_string(script_path) {
+        Ok(s) => s,
+        Err(e) => {
+            log_error!("[#{}] 读取脚本 '{}' 失败: {}", session.id, script_path, e);
+            return ScriptLoadState::Failed;
+        }
+    };
+
+    if script.is_empty() {
+        log_info!("[#{}] 脚本为空，跳过加载: {}", session.id, script_path);
+        return ScriptLoadState::Loaded {
+            needs_post_resume_java_worker: false,
+        };
+    }
+
+    if let Err(e) = preconfigure_java_stealth_if_declared(session, &script) {
+        log_error!("[#{}] {}", session.id, e);
+        return ScriptLoadState::Failed;
+    }
+
+    let uses_java_api = script_uses_java_api(&script);
+    let deferred_pre_resume_java =
+        uses_java_api && stop_worker_after_load && !session.java_worker_ready.load(Ordering::Acquire);
+    if deferred_pre_resume_java {
+        log_info!(
+            "[#{}] 检测到 pre-resume Java 脚本，先发送到 raw clone TLS JS worker 执行",
+            session.id
+        );
+    } else if uses_java_api {
+        log_info!("[#{}] 检测到 Java 脚本，发送到 Java worker 执行", session.id);
+    } else {
+        log_info!("[#{}] 脚本发送到 raw clone TLS JS worker 执行", session.id);
+    }
+    session.eval_state.clear();
+    let filename = std::path::Path::new(script_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("script.js")
+        .to_string();
+    let load_result = if uses_java_api {
+        if deferred_pre_resume_java {
+            match session.get_sender() {
+                Some(sender) => {
+                    send_command(sender, format!("loadjs_init [{}]\n{}", filename, script)).map_err(|e| e.to_string())
+                }
+                None => Err("agent 未连接".to_string()),
+            }
+        } else {
+            match ensure_java_worker_ready(session) {
+                Ok(()) => {
+                    crate::process::thaw_cgroup_freezer(session.pid.load(Ordering::Acquire));
+                    session.eval_state.clear();
+                    match session.get_sender() {
+                        Some(sender) => send_command(sender, format!("java_loadjs [{}]\n{}", filename, script))
+                            .map_err(|e| e.to_string()),
+                        None => Err("agent 未连接".to_string()),
+                    }
+                }
+                Err(e) => Err(e),
+            }
+        }
+    } else {
+        match session.get_sender() {
+            Some(sender) => {
+                send_command(sender, format!("loadjs_init [{}]\n{}", filename, script)).map_err(|e| e.to_string())
+            }
+            None => Err("agent 未连接".to_string()),
+        }
+    };
+    match load_result {
+        Ok(()) => {
+            if deferred_pre_resume_java {
+                match session
+                    .eval_state
+                    .recv_timeout(std::time::Duration::from_secs(LOAD_PRE_RESUME_JAVA_TIMEOUT_SECS))
+                {
+                    None => {
+                        log_error!(
+                            "[#{}] pre-resume Java 脚本执行超时({}s)，未恢复子进程以避免错过早期 Java hook",
+                            session.id,
+                            LOAD_PRE_RESUME_JAVA_TIMEOUT_SECS
+                        );
+                        return ScriptLoadState::Failed;
+                    }
+                    Some(Err(e)) => {
+                        log_error!("[#{}] pre-resume Java 脚本执行失败: {}", session.id, e);
+                        return ScriptLoadState::Failed;
+                    }
+                    Some(Ok(out)) => {
+                        if !out.is_empty() {
+                            log_success!("[#{}] => {}", session.id, out);
+                        }
+                    }
+                }
+                if let Err(e) = cut_pre_resume_java_executor_hook(session) {
+                    log_error!("[#{}] pre-resume Java executor hook 切断失败: {}", session.id, e);
+                    return ScriptLoadState::Failed;
+                }
+                return ScriptLoadState::Loaded {
+                    needs_post_resume_java_worker: true,
+                };
+            }
+            match session
+                .eval_state
+                .recv_timeout(std::time::Duration::from_secs(if stop_worker_after_load {
+                    LOAD_STOP_WORKER_TIMEOUT_SECS
+                } else if uses_java_api {
+                    LOAD_JAVA_TIMEOUT_SECS
+                } else {
+                    LOAD_DEFAULT_TIMEOUT_SECS
+                })) {
+                None => {
+                    log_warn!("[#{}] 脚本加载超时", session.id);
+                    return ScriptLoadState::Failed;
+                }
+                Some(Err(e)) => {
+                    log_error!("[#{}] 脚本执行失败: {}", session.id, e);
+                    return ScriptLoadState::Failed;
+                }
+                Some(Ok(out)) => {
+                    if !out.is_empty() {
+                        log_success!("[#{}] => {}", session.id, out);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            log_error!("[#{}] 加载脚本失败: {}", session.id, e);
+            return ScriptLoadState::Failed;
+        }
+    }
+    ScriptLoadState::Loaded {
+        needs_post_resume_java_worker: uses_java_api,
+    }
 }
 
 /// 发送 shutdown 并等待 agent 断连
@@ -153,7 +308,7 @@ fn shutdown_session(session: &Session) {
     }
     session.shutdown_requested.store(true, Ordering::Release);
     let _ = send_command(sender, "shutdown");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
     while !session.disconnected.load(Ordering::Acquire) {
         if std::time::Instant::now() >= deadline {
             break;
@@ -182,7 +337,7 @@ fn do_spawn(
                     session.set_remote_agent_info(injection.loader_ctx_addr, injection.agent_current_thread_eval_impl);
                     let _handle = start_socketpair_handler(injection.host_fd, session.clone());
 
-                    if !session.wait_connected(30) {
+                    if !session.wait_connected(SESSION_CONNECT_TIMEOUT_SECS) {
                         log_error!("[#{}] 等待 agent 连接超时", sid);
                         session.failed.store(true, Ordering::Release);
                         // 尝试恢复子进程
@@ -198,21 +353,27 @@ fn do_spawn(
                     }
 
                     // 在子进程暂停期间加载脚本
-                    let deferred_java_script = script.as_ref().and_then(|script_path| {
-                        if load_script_on_session(&session, script_path, true) {
-                            Some(script_path.clone())
-                        } else {
-                            None
+                    let mut post_resume_java_worker_needed = false;
+                    if let Some(ref script_path) = script {
+                        let load_state = load_script_on_session(&session, script_path, true);
+                        if load_state.failed() {
+                            session.failed.store(true, Ordering::Release);
+                            spawn::abort_pending_children_and_cleanup_zygote_patches();
+                            return;
                         }
-                    });
+                        post_resume_java_worker_needed |= load_state.needs_post_resume_java_worker();
+                    }
 
                     // resume 子进程
                     if let Err(e) = spawn::resume_child(pid as u32) {
                         log_error!("[#{}] 恢复子进程失败: {}", sid, e);
                     }
-                    if let Some(script_path) = deferred_java_script {
-                        log_info!("[#{}] 子进程已恢复，执行延后 Java 脚本", sid);
-                        load_script_on_session(&session, &script_path, false);
+                    if let Err(e) = ensure_java_worker_ready_after_resume(&session, post_resume_java_worker_needed) {
+                        log_warn!(
+                            "[#{}] Java worker 启动失败，后续 Java 操作需要重新初始化 worker: {}",
+                            sid,
+                            e
+                        );
                     }
 
                     log_success!("[#{}] {} 已就绪 (PID: {})", sid, package, pid);
@@ -244,7 +405,7 @@ fn do_attach(
                     session.set_remote_agent_info(injection.loader_ctx_addr, injection.agent_current_thread_eval_impl);
                     let _handle = start_socketpair_handler(injection.host_fd, session.clone());
 
-                    if !session.wait_connected(30) {
+                    if !session.wait_connected(SESSION_CONNECT_TIMEOUT_SECS) {
                         log_error!("[#{}] 等待 agent 连接超时", sid);
                         session.failed.store(true, Ordering::Release);
                         return;
@@ -258,7 +419,10 @@ fn do_attach(
 
                     // 非 spawn 模式：先连接再加载脚本
                     if let Some(ref script_path) = script {
-                        load_script_on_session(&session, script_path, false);
+                        if load_script_on_session(&session, script_path, false).failed() {
+                            session.failed.store(true, Ordering::Release);
+                            return;
+                        }
                     }
 
                     log_success!("[#{}] {} 已就绪 (PID: {})", sid, label, pid);
@@ -383,7 +547,7 @@ fn run_session_repl(session: &Arc<Session>) -> bool {
                         if handled {
                             Ok(true)
                         } else {
-                            try_jseval_on_main_thread_if_java(session, &line)
+                            try_jseval_on_main_thread_if_java_or_dsl(session, &line)
                         }
                     }) {
                     Ok(v) => v,
@@ -405,7 +569,13 @@ fn run_session_repl(session: &Arc<Session>) -> bool {
                 }
 
                 if is_eval_cmd {
-                    let timeout = if is_recomp { 15 } else { 5 };
+                    let timeout = if is_recomp {
+                        EVAL_RECOMP_TIMEOUT_SECS
+                    } else if script_uses_java_api(&line) {
+                        EVAL_JAVA_TIMEOUT_SECS
+                    } else {
+                        EVAL_DEFAULT_TIMEOUT_SECS
+                    };
                     print_eval_result(session, timeout);
                 }
             }

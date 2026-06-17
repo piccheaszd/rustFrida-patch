@@ -542,7 +542,11 @@ pub(crate) unsafe extern "C" fn art_interrupt_handler(_rt: *mut ffi::JSRuntime, 
         let exc_check: ExcCheckFn = std::mem::transmute(*(vtable.add(228)));
         exc_check(env_ptr);
     }
-    0
+    if crate::js_execution_deadline_expired() {
+        1
+    } else {
+        0
+    }
 }
 
 pub(crate) unsafe fn invoke_hook_callback_common(

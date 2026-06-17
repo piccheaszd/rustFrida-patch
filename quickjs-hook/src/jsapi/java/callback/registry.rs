@@ -4,8 +4,13 @@
 
 /// Hook 类型：统一 Clone+Replace 策略
 /// 所有回调统一 JNI 调用约定: x0=JNIEnv*, x1=this/jclass, x2+=args
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) enum HookType {
+    /// Registered native fnPtr hook only.
+    ///
+    /// The original ArtMethod is not modified. The hook is installed by
+    /// patching the native function body pointed to by ArtMethod::data_.
+    NativeEntry,
     /// Unified replacement hook (art_router swaps ArtMethod*)
     /// - replacement_addr: heap-allocated replacement ArtMethod (native, jniCode=thunk)
     /// - per_method_hook_target: Some(quickCode) for compiled methods (Layer 3 router hook),
@@ -14,6 +19,7 @@ pub(super) enum HookType {
     Replaced {
         replacement_addr: usize,
         per_method_hook_target: Option<u64>,
+        original_flags_mutated: bool,
     },
     /// Experimental quick callback hook.
     /// Router calls Rust directly and only uses replacement_addr as a native
@@ -33,6 +39,20 @@ pub(super) enum HookType {
     },
 }
 
+impl HookType {
+    pub(super) fn original_flags_mutated(&self) -> bool {
+        match self {
+            HookType::NativeEntry | HookType::Quick { .. } => false,
+            HookType::Replaced {
+                original_flags_mutated,
+                ..
+            } => *original_flags_mutated,
+            HookType::Managed { .. } => true,
+        }
+    }
+}
+
+#[derive(Clone)]
 pub(super) struct JavaHookData {
     pub(super) art_method: u64,
     // Frida-style original method state（unhook 时恢复全部字段）
@@ -43,7 +63,9 @@ pub(super) struct JavaHookData {
     pub(super) hook_type: HookType,
     // Backup clone for callOriginal (heap, 原始状态副本)
     pub(super) clone_addr: u64,
-    // JNI global ref to jclass (for JNI CallNonvirtual/Static calls)
+    // JNI global ref to jclass (for JNI CallNonvirtual/Static calls).
+    // Raw clone installs may store 0 and derive a temporary local class ref
+    // from ArtMethod.declaring_class_ when needed.
     pub(super) class_global_ref: usize,
     // Return type char from JNI signature: b'V', b'I', b'J', b'Z', b'L', etc.
     pub(super) return_type: u8,
@@ -67,12 +89,13 @@ pub(super) struct JavaHookData {
     /// true = thunk 用 BLR (post-callback dispatch), $orig 可设 fast_orig 标志。
     /// false = thunk 用 BR, $orig 必须走 JNI 路径。
     pub(super) use_blr: bool,
-    /// Registered native method entry hook.
+    /// Registered native method entry hook target passed to hook_engine.
     ///
     /// ART's generic JNI trampoline calls ArtMethod::data_ (the registered
     /// native fnPtr) directly, so shared-stub routing may never see the Java
-    /// invocation. Non-zero means data_ was inline-replaced and $orig must call
-    /// this trampoline instead of re-entering the ArtMethod via JNI.
+    /// invocation. In recomp mode this is the anonymous slot, not the original
+    /// native fnPtr. Non-zero means $orig must call this trampoline instead of
+    /// re-entering the ArtMethod via JNI.
     pub(super) native_entry_hook_target: u64,
     pub(super) native_entry_trampoline: u64,
     /// true when the native entry uses @CriticalNative ABI:
@@ -210,6 +233,18 @@ pub(crate) fn registered_methods_for_class(class_name: &str) -> Vec<MethodInfo> 
         .collect()
 }
 
+pub(crate) unsafe fn registered_class_mirror_for_class(class_name: &str) -> Option<u64> {
+    let prefix = format!("{}.", class_name);
+    let guard = JAVA_HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    let registry = guard.as_ref()?;
+
+    registry
+        .values()
+        .find(|data| data.method_key.starts_with(&prefix) || data.class_name == class_name)
+        .map(|data| art_method_declaring_class_mirror(data.art_method))
+        .filter(|mirror| *mirror != 0)
+}
+
 pub(super) fn registered_invoke_target_for_key(
     class_name: &str,
     method_name: &str,
@@ -223,6 +258,86 @@ pub(super) fn registered_invoke_target_for_key(
         .values()
         .find(|data| data.method_key == key && data.is_static == is_static)?;
     Some((data.art_method, data.class_global_ref))
+}
+
+static ART_MIRROR_NEW_LOCAL_REF: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static ART_JNIENV_DELETE_LOCAL_REF: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+pub(super) unsafe fn art_method_declaring_class_mirror(art_method_addr: u64) -> u64 {
+    if art_method_addr < 0x1000 {
+        return 0;
+    }
+
+    let compressed = std::ptr::read_volatile(art_method_addr as *const u32) as u64;
+    if compressed > 0x10000 && crate::jsapi::util::is_addr_accessible(compressed, 4) {
+        return compressed;
+    }
+
+    let raw = std::ptr::read_volatile(art_method_addr as *const u64) & super::PAC_STRIP_MASK;
+    if raw > 0x10000 && crate::jsapi::util::is_addr_accessible(raw, 4) {
+        return raw;
+    }
+
+    0
+}
+
+pub(super) unsafe fn raw_mirror_to_local_ref(env: JniEnv, raw: u64) -> *mut std::ffi::c_void {
+    if env.is_null() || raw == 0 {
+        return std::ptr::null_mut();
+    }
+
+    let sym = *ART_MIRROR_NEW_LOCAL_REF.get_or_init(|| {
+        crate::jsapi::module::libart_dlsym("_ZN3art9JNIEnvExt11NewLocalRefEPNS_6mirror6ObjectE") as usize
+    });
+    if sym != 0 {
+        type NewLocalFromMirrorFn = unsafe extern "C" fn(
+            *mut std::ffi::c_void,
+            *mut std::ffi::c_void,
+        ) -> *mut std::ffi::c_void;
+        let f: NewLocalFromMirrorFn = std::mem::transmute(sym);
+        return f(env as *mut std::ffi::c_void, raw as *mut std::ffi::c_void);
+    }
+
+    if crate::is_raw_clone_js_thread() {
+        crate::jsapi::console::output_verbose(
+            "[raw mirror] JNIEnvExt::NewLocalRef unavailable on raw clone; refusing JNI fallback",
+        );
+        return std::ptr::null_mut();
+    }
+
+    let new_local_ref: NewLocalRefFn = jni_fn!(env, NewLocalRefFn, JNI_NEW_LOCAL_REF);
+    new_local_ref(env, raw as *mut std::ffi::c_void)
+}
+
+pub(super) unsafe fn raw_delete_local_ref(env: JniEnv, obj: *mut std::ffi::c_void) {
+    if env.is_null() || obj.is_null() {
+        return;
+    }
+
+    let sym = *ART_JNIENV_DELETE_LOCAL_REF.get_or_init(|| {
+        crate::jsapi::module::libart_dlsym("_ZN3art9JNIEnvExt14DeleteLocalRefEP8_jobject") as usize
+    });
+    if sym != 0 {
+        type DeleteLocalRefFn =
+            unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void);
+        let f: DeleteLocalRefFn = std::mem::transmute(sym);
+        f(env as *mut std::ffi::c_void, obj);
+        return;
+    }
+
+    if crate::is_raw_clone_js_thread() {
+        crate::jsapi::console::output_verbose(
+            "[raw mirror] JNIEnvExt::DeleteLocalRef unavailable on raw clone; leaking local ref",
+        );
+        return;
+    }
+
+    let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+    delete_local_ref(env, obj);
+}
+
+pub(super) unsafe fn local_class_ref_for_art_method(env: JniEnv, art_method_addr: u64) -> *mut std::ffi::c_void {
+    raw_mirror_to_local_ref(env, art_method_declaring_class_mirror(art_method_addr))
 }
 
 /// Build a unique key string for method lookup

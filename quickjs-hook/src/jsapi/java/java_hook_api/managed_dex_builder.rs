@@ -123,6 +123,51 @@ pub(super) const MANAGED_MESSAGE_CODES_FIELD: &str = "__rf_msg_codes";
 pub(super) const MANAGED_MESSAGE_VALUES_FIELD: &str = "__rf_msg_values";
 pub(super) const MANAGED_MESSAGE_TEXTS_FIELD: &str = "__rf_msg_texts";
 
+pub(super) struct GeneratedJavaWorkerDex {
+    pub dex: Vec<u8>,
+    pub class_name: String,
+}
+
+pub(super) fn build_java_worker_dex(class_id: u64) -> Result<GeneratedJavaWorkerDex, String> {
+    let descriptor = format!("Lrustfrida/JavaWorker{};", class_id);
+    let class_name = descriptor
+        .trim_start_matches('L')
+        .trim_end_matches(';')
+        .replace('/', ".");
+    let mut class = DexClass::new(descriptor.clone())
+        .super_type("Ljava/lang/Thread;")
+        .source_file("RustFridaJavaWorker.java");
+
+    let thread_ctor = MethodRef::new(
+        "Ljava/lang/Thread;",
+        "<init>",
+        "V",
+        vec!["Ljava/lang/String;".to_string()],
+    );
+    let mut ctor = DexIrBuilder::new(2, 1, 2);
+    ctor.const_string(0, "wwb-javawoker");
+    ctor.invoke_direct(vec![1, 0], thread_ctor.clone());
+    ctor.return_void();
+    class.direct_method("<init>", "V", Vec::new(), ACC_PUBLIC | ACC_CONSTRUCTOR, ctor.finish()?);
+
+    let native_loop = MethodRef::new(descriptor.clone(), "nativeLoop", "V", Vec::new());
+    class.native_direct_method("nativeLoop", "V", Vec::new(), ACC_PRIVATE | ACC_STATIC | ACC_NATIVE);
+
+    let mut run = DexIrBuilder::new(1, 1, 0);
+    run.invoke_static(Vec::new(), native_loop.clone());
+    run.return_void();
+    class.virtual_method("run", "V", Vec::new(), ACC_PUBLIC, run.finish()?);
+
+    let mut dex = DexBuilder::new();
+    dex.add_method_ref(thread_ctor);
+    dex.add_method_ref(native_loop);
+    dex.add_class(class);
+    Ok(GeneratedJavaWorkerDex {
+        dex: dex.build()?,
+        class_name,
+    })
+}
+
 mod descriptor;
 use descriptor::{
     array_component_descriptor, build_method_sig, build_params_sig, common_value_descriptor_with_env,

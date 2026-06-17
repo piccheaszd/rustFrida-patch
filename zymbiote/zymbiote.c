@@ -64,6 +64,7 @@ struct _ZymbioteContext
     uint64_t capset_got_slot;       /* child 自恢复: capset GOT 槽 */
     uint64_t capset_original;       /* child 自恢复: capset GOT 原值 */
     uint64_t capset_got_protection; /* child 自恢复: capset GOT 页原始保护 */
+    uint64_t passive_setargv0;      /* 非零 = 诊断模式：setArgV0 只转发原函数，不阻塞 */
 };
 
 /* 全局上下文实例（运行时由 Rust 侧通过 /proc/pid/mem 填充） */
@@ -667,6 +668,10 @@ rustfrida_zymbiote_replacement_setargv0(JNIEnv *env, jobject clazz, jstring name
     bool revert_now;
 
     zymbiote.original_set_argv0(env, clazz, name);
+
+    /* 诊断模式：只保留 setArgV0 指针改写，不做 socket/ACK/SIGSTOP/revert。 */
+    if (zymbiote.passive_setargv0)
+        return 0;
 
     if (zymbiote.pure_spawn_done)
         return 0;

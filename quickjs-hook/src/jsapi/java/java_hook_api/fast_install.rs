@@ -12,13 +12,23 @@ use super::install_support::{
 };
 
 unsafe fn install_fast_hook_inner(class_name: &str, method_name: &str, sig: &str, dsl: &str) -> Result<(), String> {
+    let env = ensure_jni_initialized()?;
+    install_fast_hook_with_env(env, class_name, method_name, sig, dsl)
+}
+
+pub(in crate::jsapi::java) unsafe fn install_fast_hook_with_env(
+    env: JniEnv,
+    class_name: &str,
+    method_name: &str,
+    sig: &str,
+    dsl: &str,
+) -> Result<(), String> {
     let (actual_sig, force_static) = if let Some(stripped) = sig.strip_prefix("static:") {
         (stripped.to_string(), true)
     } else {
         (sig.to_string(), false)
     };
 
-    let env = ensure_jni_initialized()?;
     let (art_method, is_static) = resolve_art_method(env, class_name, method_name, &actual_sig, force_static)?;
 
     init_java_registry();
@@ -35,6 +45,12 @@ unsafe fn install_fast_hook_inner(class_name: &str, method_name: &str, sig: &str
     let original_data = std::ptr::read_volatile((art_method as usize + data_off) as *const u64);
     let original_entry_point = read_entry_point(art_method, ep_offset);
     let bridge = find_art_bridge_functions(env, ep_offset);
+    if !is_code_pointer(original_entry_point) {
+        return Err(format!(
+            "resolved ArtMethod entry_point is not executable for Java.fastHook {}.{}{} (ArtMethod={:#x}, ep={:#x}, spec={:?})",
+            class_name, method_name, actual_sig, art_method, original_entry_point, spec
+        ));
+    }
     let has_independent_code = !is_art_quick_entrypoint(original_entry_point, bridge);
     if !has_independent_code {
         return Err("Java.fastHook currently requires compiled quick code; use Java.compileMethod() first".to_string());
@@ -62,12 +78,13 @@ unsafe fn install_fast_hook_inner(class_name: &str, method_name: &str, sig: &str
         ep_offset,
         env,
         art_method,
+        false,
         method_name == "<init>",
         false,
     )?;
     let stack_entry_point = router_thunk_body.ok_or("fastHook requires router thunk body")?;
     let (replacement_addr, sentinel_source) =
-        create_quick_stack_sentinel_art_method(env, spec.size, spec, data_off, ep_offset, stack_entry_point)?;
+        create_quick_stack_sentinel_art_method(art_method, spec.size, spec, data_off, ep_offset, stack_entry_point)?;
     install_guard.set_replacement_addr(replacement_addr);
 
     ensure_art_controller_initialized(&bridge, ep_offset, env as *mut std::ffi::c_void);
@@ -295,13 +312,19 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_fast_hook(
     argc: i32,
     argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
-    super::super::lazy_init_reflect_cache();
     let (class_name, method_name, sig, dsl) = match extract_fast_hook_args(ctx, argc, argv) {
         Ok(v) => v,
         Err(e) => return e,
     };
 
-    match install_fast_hook_inner(&class_name, &method_name, &sig, &dsl) {
+    let result = if crate::is_raw_clone_js_thread() {
+        super::super::callback::fast_hook_via_executor(class_name, method_name, sig, dsl)
+    } else {
+        super::super::lazy_init_reflect_cache();
+        install_fast_hook_inner(&class_name, &method_name, &sig, &dsl)
+    };
+
+    match result {
         Ok(()) => JSValue::bool(true).raw(),
         Err(e) => throw_internal_error(ctx, e),
     }

@@ -70,6 +70,9 @@ const CLASS_OBJECT_SIZE_OFFSET_CANDIDATES: &[usize] = &[0x5c, 0x64, 0x60, 0x68];
 /// ART `kObjectAlignment` = 8 字节（mirror::Object 的最小对齐）。
 const OBJECT_ALIGNMENT: u64 = 8;
 
+/// Java.choose 的内部扫描预算。超时返回已找到的部分结果，避免交互卡到外层超时。
+const HEAP_SCAN_BUDGET: std::time::Duration = std::time::Duration::from_millis(1500);
+
 /// 合理对象大小上限 —— 超此值认为 class 字段损坏或指错，保守推进。
 /// 实际框架对象极少超过 1MB（字符串/数组走 large object space 不在 main space walk 里）。
 const MAX_REASONABLE_OBJECT_SIZE: u32 = 1 << 20;
@@ -601,6 +604,7 @@ pub(super) unsafe fn heap_scan_enumerate_instances(
     class_global_ref: *mut c_void,
     include_subtypes: bool,
     max_count: usize,
+    allow_suspend_all: bool,
 ) -> Result<Vec<*mut c_void>, String> {
     let api = resolve_art_heap_api()
         .ok_or_else(|| "[heap_scan] libart symbols unavailable (ART internal layout changed?)".to_string())?;
@@ -649,10 +653,11 @@ pub(super) unsafe fn heap_scan_enumerate_instances(
     }
     let java_lang_class_low32 = java_lang_class_obj as u32;
 
-    let (scan_regions, class_range_regions) = enumerate_heap_regions();
+    let (scan_regions, mut class_range_regions) = enumerate_heap_regions();
     if scan_regions.is_empty() {
         return Err("[heap_scan] no [anon:dalvik-*] heap VMAs in /proc/self/maps".to_string());
     }
+    normalize_regions(&mut class_range_regions);
     output_verbose(&format!(
         "[heap_scan] regions: scan={} class_range={} needle={:#x} java.lang.Class={:#x}",
         scan_regions.len(),
@@ -662,13 +667,7 @@ pub(super) unsafe fn heap_scan_enumerate_instances(
     ));
 
     // JavaVMExt* = JavaVM*（ART 子类）
-    let vm_ptr = {
-        let guard = JNI_STATE.lock().unwrap_or_else(|e| e.into_inner());
-        match guard.as_ref() {
-            Some(state) => state.vm,
-            None => return Err("[heap_scan] JNI state has no JavaVM*".to_string()),
-        }
-    };
+    let vm_ptr = get_or_init_vm().map_err(|e| format!("[heap_scan] JavaVM resolve failed: {}", e))?;
     if vm_ptr.is_null() {
         return Err("[heap_scan] JavaVM* is null".to_string());
     }
@@ -696,23 +695,49 @@ pub(super) unsafe fn heap_scan_enumerate_instances(
     // object_size_alloc_fast_path_ 字段偏移（版本敏感，首次调用做缓存）
     let class_obj_size_off = resolve_class_object_size_offset();
 
-    // RAII：ScopedSuspendAll + ScopedGCCriticalSection
-    let cause_cstr = CString::new("rustFrida Java.choose").unwrap();
+    if allow_suspend_all && !include_subtypes && max_count > 0 {
+        let mut accept_set = HashSet::new();
+        accept_set.insert(needle_low32);
+        let scan_started = std::time::Instant::now();
+        let (hits, scan_timed_out) = scan_regions_for_class_set(
+            &scan_regions,
+            &class_range_regions,
+            &accept_set,
+            java_lang_class_low32,
+            max_count,
+            class_obj_size_off,
+            scan_started,
+        );
+        output_verbose(&format!(
+            "[heap_scan] bounded exact scan without suspend-all: hits={} timed_out={} max_count={}",
+            hits.len(),
+            scan_timed_out,
+            max_count,
+        ));
+        return Ok(global_refs_from_hits(api, vm_ptr, self_thread, env, hits));
+    }
+
     let mut sgcs_storage = [0u64; SGCS_STORAGE_BYTES / 8];
 
-    // 进入 stop-the-world
-    (api.ssa_ctor)(std::ptr::null_mut(), cause_cstr.as_ptr() as *const c_char, 0);
+    if allow_suspend_all {
+        let cause_cstr = CString::new("rustFrida Java.choose").unwrap();
 
-    // 扫描本身不会再触发 GC，但 ScopedGCCriticalSection 作双保险：
-    // 避免任何可能 trigger GC 的路径在我们扫描期间插队（例如 AddGlobalRef 的惰性扩表）。
-    // ctor 会读 Thread 内部状态，必须在 SuspendAll 之后调用（self_thread 此时仍然合法，
-    // 因为我们就是发起 SuspendAll 的那个线程，不会被自己挂起）。
-    (api.sgcs_ctor)(
-        sgcs_storage.as_mut_ptr() as *mut c_void,
-        self_thread,
-        K_GC_CAUSE_DEBUGGER,
-        K_COLLECTOR_TYPE_HEAP_TRIM,
-    );
+        // 进入 stop-the-world
+        (api.ssa_ctor)(std::ptr::null_mut(), cause_cstr.as_ptr() as *const c_char, 0);
+
+        // 扫描本身不会再触发 GC，但 ScopedGCCriticalSection 作双保险：
+        // 避免任何可能 trigger GC 的路径在我们扫描期间插队（例如 AddGlobalRef 的惰性扩表）。
+        // ctor 会读 Thread 内部状态，必须在 SuspendAll 之后调用（self_thread 此时仍然合法，
+        // 因为我们就是发起 SuspendAll 的那个线程，不会被自己挂起）。
+        (api.sgcs_ctor)(
+            sgcs_storage.as_mut_ptr() as *mut c_void,
+            self_thread,
+            K_GC_CAUSE_DEBUGGER,
+            K_COLLECTOR_TYPE_HEAP_TRIM,
+        );
+    } else {
+        output_verbose("[heap_scan] suspend-all disabled for raw executor; using bounded opportunistic scan");
+    }
 
     // 扫描（用 catch_unwind 兜底，防止任何 panic 导致 SuspendAll 没 resume 吊死进程）
     let scan_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -730,30 +755,35 @@ pub(super) unsafe fn heap_scan_enumerate_instances(
             s.insert(needle_low32);
             s
         };
-        let hits = scan_regions_for_class_set(
+        let scan_started = std::time::Instant::now();
+        let (hits, scan_timed_out) = scan_regions_for_class_set(
             &scan_regions,
             &class_range_regions,
             &accept_set,
             java_lang_class_low32,
             max_count,
             class_obj_size_off,
+            scan_started,
         );
-        (hits, accept_set.len(), walk_stats)
+        (hits, accept_set.len(), walk_stats, scan_timed_out)
     }));
 
-    // RAII 对偶析构（倒序）
-    (api.sgcs_dtor)(sgcs_storage.as_mut_ptr() as *mut c_void);
-    (api.ssa_dtor)(std::ptr::null_mut());
+    if allow_suspend_all {
+        // RAII 对偶析构（倒序）
+        (api.sgcs_dtor)(sgcs_storage.as_mut_ptr() as *mut c_void);
+        (api.ssa_dtor)(std::ptr::null_mut());
+    }
 
-    let (hits, accept_count, walk_stats) = match scan_result {
+    let (hits, accept_count, walk_stats, scan_timed_out) = match scan_result {
         Ok(v) => v,
         Err(_) => return Err("[heap_scan] scan panicked".to_string()),
     };
 
     output_verbose(&format!(
-        "[heap_scan] raw hits = {} (accept_set size = {})",
+        "[heap_scan] raw hits = {} (accept_set size = {}, timed_out = {})",
         hits.len(),
-        accept_count
+        accept_count,
+        scan_timed_out
     ));
     if include_subtypes {
         output_verbose(&format!(
@@ -768,7 +798,17 @@ pub(super) unsafe fn heap_scan_enumerate_instances(
         ));
     }
 
-    // 把 mirror::Object* 包成 JNI global ref
+    Ok(global_refs_from_hits(api, vm_ptr, self_thread, env, hits))
+}
+
+unsafe fn global_refs_from_hits(
+    api: &ArtHeapApi,
+    vm_ptr: *mut c_void,
+    self_thread: *mut c_void,
+    env: JniEnv,
+    hits: Vec<u64>,
+) -> Vec<*mut c_void> {
+    // 把 mirror::Object* 包成 JNI global ref。
     let mut global_refs = Vec::with_capacity(hits.len());
     // 用 HashSet 去重 —— 扫描中理论上不会重复，但 large object space 某些对象 8B 对齐
     // 后可能命中多个位置；双重校验已经过滤大部分，这里再去一次。
@@ -784,8 +824,7 @@ pub(super) unsafe fn heap_scan_enumerate_instances(
         }
         global_refs.push(jobj);
     }
-
-    Ok(global_refs)
+    global_refs
 }
 
 /// 扫描主函数 —— 在 SuspendAll + GC critical 保护下执行。
@@ -807,15 +846,27 @@ unsafe fn scan_regions_for_class_set(
     java_lang_class_low32: u32,
     max_count: usize,
     class_obj_size_off: usize,
-) -> Vec<u64> {
+    scan_started: std::time::Instant,
+) -> (Vec<u64>, bool) {
     let mut hits = Vec::new();
     let cap = if max_count == 0 { usize::MAX } else { max_count };
+    let mut checked_budget_at = 0usize;
+    let mut timed_out = false;
 
     'outer: for region in app_regions {
         let mut addr = region.start;
         let limit = region.end;
 
         while addr + 8 <= limit {
+            checked_budget_at += 1;
+            if checked_budget_at >= 4096 {
+                checked_budget_at = 0;
+                if scan_started.elapsed() >= HEAP_SCAN_BUDGET {
+                    timed_out = true;
+                    break 'outer;
+                }
+            }
+
             let class_ptr_low32 = std::ptr::read_volatile(addr as *const u32);
 
             if class_ptr_low32 == 0 {
@@ -854,7 +905,7 @@ unsafe fn scan_regions_for_class_set(
         }
     }
 
-    hits
+    (hits, timed_out)
 }
 
 /// 给定一个 mirror::Class*，返回该类实例占用字节数（已向 8B 对齐）。
@@ -874,5 +925,41 @@ unsafe fn object_step_bytes(class_ptr: u64, class_obj_size_off: usize) -> u64 {
 
 #[inline]
 fn address_in_any_region(addr: u64, regions: &[HeapRegion]) -> bool {
-    regions.iter().any(|r| addr >= r.start && addr + 4 <= r.end)
+    let Some(end) = addr.checked_add(4) else {
+        return false;
+    };
+    let mut lo = 0usize;
+    let mut hi = regions.len();
+    while lo < hi {
+        let mid = lo + ((hi - lo) / 2);
+        let region = regions[mid];
+        if end <= region.start {
+            hi = mid;
+        } else if addr >= region.end {
+            lo = mid + 1;
+        } else {
+            return addr >= region.start && end <= region.end;
+        }
+    }
+    false
+}
+
+fn normalize_regions(regions: &mut Vec<HeapRegion>) {
+    regions.sort_by_key(|r| (r.start, r.end));
+    let mut out: Vec<HeapRegion> = Vec::with_capacity(regions.len());
+    for region in regions.iter().copied() {
+        if region.end <= region.start {
+            continue;
+        }
+        if let Some(last) = out.last_mut() {
+            if region.start <= last.end {
+                if region.end > last.end {
+                    last.end = region.end;
+                }
+                continue;
+            }
+        }
+        out.push(region);
+    }
+    *regions = out;
 }

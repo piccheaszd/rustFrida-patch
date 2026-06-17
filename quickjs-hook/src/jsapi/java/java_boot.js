@@ -18,6 +18,8 @@
     var _releaseInstanceRefs = Java._releaseInstanceRefs;
     var _methodListCache = Object.create(null);
     var _classLoaderListCache = null;
+    var _directHookImpls = Object.create(null);
+    var _directHookBypass = Object.create(null);
     delete Java.hook;
     delete Java.unhook;
     delete Java._methods;
@@ -49,7 +51,12 @@
     function _wrapJavaReturn(value) {
         if (value === null || value === undefined) return value;
         if (_isWrappedJavaObject(value)) {
-            return _wrapJavaObj(value.__jptr, value.__jclass);
+            return _wrapJavaObj(
+                value.__jptr,
+                value.__jclass,
+                value.__jraw === true,
+                value.__jglobal === true
+            );
         }
         // Rust marshal 把 Java 对象数组自动转 JS Array, 元素为裸 {__jptr, __jclass}。
         // 这里递归把每个元素包成 Proxy, 让 `arr[i].method()` 和嵌套数组访问都生效。
@@ -61,9 +68,9 @@
         return value;
     }
 
-    function _invokeJavaMethod(jptr, jcls, name, sig, args) {
+    function _invokeJavaMethod(jtarget, jcls, name, sig, args) {
         return _wrapJavaReturn(
-            Java._invokeMethod.apply(Java, [jptr, jcls, name, sig].concat(args))
+            Java._invokeMethod.apply(Java, [jtarget, jcls, name, sig].concat(args))
         );
     }
 
@@ -71,6 +78,63 @@
         return _wrapJavaReturn(
             _invokeStaticMethod.apply(Java, [jcls, name, sig].concat(args))
         );
+    }
+
+    function _methodKey(cls, name, sig) {
+        return cls + "." + name + sig;
+    }
+
+    function _withDirectHookBypass(key, fn) {
+        _directHookBypass[key] = (_directHookBypass[key] || 0) + 1;
+        try {
+            return fn();
+        } finally {
+            var n = (_directHookBypass[key] || 1) - 1;
+            if (n > 0) _directHookBypass[key] = n;
+            else delete _directHookBypass[key];
+        }
+    }
+
+    function _maybeInvokeDirectInstanceHook(target, cls, name, sig, args, fallback) {
+        var key = _methodKey(cls, name, sig);
+        var fn = _directHookImpls[key];
+        if (!fn || _directHookBypass[key]) return fallback();
+
+        var orig = function() {
+            var origArgs = arguments.length ? _argsFrom(arguments) : args;
+            return _withDirectHookBypass(key, function() {
+                return _invokeJavaMethod(target, cls, name, sig, origArgs);
+            });
+        };
+        var thisObj = _wrapJavaObjOnTarget({
+            __jptr: target.__jptr,
+            __jclass: target.__jclass,
+            __jraw: target.__jraw === true,
+            __jglobal: target.__jglobal === true,
+            __$orig: orig
+        });
+        var ret = fn.apply(thisObj, args);
+        return _wrapJavaReturn(ret);
+    }
+
+    function _maybeInvokeDirectStaticHook(cls, name, sig, args, fallback) {
+        var key = _methodKey(cls, name, sig);
+        var fn = _directHookImpls[key];
+        if (!fn || _directHookBypass[key]) return fallback();
+
+        var orig = function() {
+            var origArgs = arguments.length ? _argsFrom(arguments) : args;
+            return _withDirectHookBypass(key, function() {
+                return _invokeJavaStaticMethod(cls, name, sig, origArgs);
+            });
+        };
+        var fnThis = {
+            $orig: orig,
+            $className: cls,
+            $static: true
+        };
+        var ret = fn.apply(fnThis, args);
+        return _wrapJavaReturn(ret);
     }
 
     function _getMethodList(jcls) {
@@ -496,12 +560,21 @@
             } else {
                 sig = _resolveInstanceMethodSig(target.__jclass, name, args);
             }
-            return _invokeJavaMethod(
-                target.__jptr,
+            return _maybeInvokeDirectInstanceHook(
+                target,
                 target.__jclass,
                 name,
                 sig,
-                args
+                args,
+                function() {
+                    return _invokeJavaMethod(
+                        target,
+                        target.__jclass,
+                        name,
+                        sig,
+                        args
+                    );
+                }
             );
         };
 
@@ -553,12 +626,12 @@
         get: function() {
             var m = this._m;
             return _wrapJavaReturn(
-                _readField(this._t.__jptr, m.id, m.sig, m.st, m.cls)
+                _readField(this._t.__jptr, m.id, m.sig, m.st, m.cls, this._t.__jglobal === true)
             );
         },
         set: function(v) {
             var m = this._m;
-            _writeField(this._t.__jptr, m.id, m.sig, m.st, m.cls, v);
+            _writeField(this._t.__jptr, m.id, m.sig, m.st, m.cls, v, this._t.__jglobal === true);
         },
         enumerable: true,
         configurable: true
@@ -596,11 +669,11 @@
         Object.defineProperty(fn, "value", {
             get: function() {
                 return _wrapJavaReturn(
-                    _readField(target.__jptr, meta.id, meta.sig, meta.st, meta.cls)
+                    _readField(target.__jptr, meta.id, meta.sig, meta.st, meta.cls, target.__jglobal === true)
                 );
             },
             set: function(v) {
-                _writeField(target.__jptr, meta.id, meta.sig, meta.st, meta.cls, v);
+                _writeField(target.__jptr, meta.id, meta.sig, meta.st, meta.cls, v, target.__jglobal === true);
             },
             enumerable: true,
             configurable: true
@@ -627,6 +700,8 @@
             get: function(target, prop) {
                 if (prop === "__jptr") return target.__jptr;
                 if (prop === "__jclass") return target.__jclass;
+                if (prop === "__jraw") return target.__jraw === true;
+                if (prop === "__jglobal") return target.__jglobal === true;
                 // Rust 内部属性穿透（__origJobject 用于 hook 返回值 round-trip）
                 if (prop === "__origJobject") return target.__origJobject;
                 // Frida-compat hook invocation accessor（仅当 target 由 wrapCallback 注入时存在）
@@ -635,12 +710,12 @@
                     if (hint === "string" || hint === "default") {
                         if (isArray) {
                             try {
-                                var n = Java._arrayLength(target.__jptr);
+                                var n = Java._arrayLength(target.__jptr, target.__jglobal === true);
                                 return "[" + target.__jclass + " length=" + n + "]";
                             } catch(e) {}
                         }
                         try {
-                            return String(_invokeJavaMethod(target.__jptr, target.__jclass, "toString", "()Ljava/lang/String;", []));
+                            return String(_invokeJavaMethod(target, target.__jclass, "toString", "()Ljava/lang/String;", []));
                         } catch(e) {}
                     }
                     return "[JavaObject:" + target.__jclass + "@" + target.__jptr + "]";
@@ -650,15 +725,15 @@
                 // Java 数组特殊路径：`.length` + 数字索引 → JNI array op
                 if (isArray) {
                     if (prop === "length") {
-                        return Java._arrayLength(target.__jptr);
+                        return Java._arrayLength(target.__jptr, target.__jglobal === true);
                     }
                     // 数字索引 (prop 可能是字符串 "0" 或实际数字转来的 string)
                     if (typeof prop === "string" && /^\d+$/.test(prop)) {
-                        return Java._arrayGet(target.__jptr, +prop, target.__jclass);
+                        return Java._arrayGet(target.__jptr, +prop, target.__jclass, target.__jglobal === true);
                     }
                     // toString 特殊: 让 JS side 显示一个简略摘要
                     if (prop === "toString") return function() {
-                        var n = Java._arrayLength(target.__jptr);
+                        var n = Java._arrayLength(target.__jptr, target.__jglobal === true);
                         return "[" + target.__jclass + " length=" + n + "]";
                     };
                     // 其他 prop 走通用路径（可能是 Object 方法比如 hashCode）
@@ -666,7 +741,22 @@
                 if (typeof prop !== "string") return undefined;
                 if (prop === "toString") return function() {
                     try {
-                        return _invokeJavaMethod(target.__jptr, target.__jclass, "toString", "()Ljava/lang/String;", []);
+                        return _maybeInvokeDirectInstanceHook(
+                            target,
+                            target.__jclass,
+                            "toString",
+                            "()Ljava/lang/String;",
+                            [],
+                            function() {
+                                return _invokeJavaMethod(
+                                    target,
+                                    target.__jclass,
+                                    "toString",
+                                    "()Ljava/lang/String;",
+                                    []
+                                );
+                            }
+                        );
                     } catch(e) {
                         return "[JavaObject:" + target.__jclass + "]";
                     }
@@ -681,7 +771,7 @@
                             throw new Error("obj.$call(name, sig, ...args) requires (string, string, ...)");
                         }
                         return _invokeJavaMethod(
-                            target.__jptr,
+                            target,
                             target.__jclass,
                             name,
                             sig,
@@ -694,7 +784,10 @@
                 if (fieldWrappers[prop]) return fieldWrappers[prop];
 
                 var cachedMeta = _cachedFieldMeta(target.__jclass, prop);
-                if (cachedMeta) {
+                if (cachedMeta !== undefined) {
+                    if (cachedMeta === null) {
+                        return _makeInstanceMethodInvoker(target, prop);
+                    }
                     var cachedFw;
                     if (_hasMethod(target.__jclass, prop)) {
                         cachedFw = _decorateWithFieldValue(
@@ -707,14 +800,19 @@
                     return cachedFw;
                 }
 
-                if (_hasMethod(target.__jclass, prop)) {
-                    return _makeInstanceMethodInvoker(target, prop);
-                }
-
-                // 解析字段元数据（per-class 缓存，首次走 C，后续纯 JS 查找）
+                // 解析字段元数据（per-class 缓存，首次走 C，后续纯 JS 查找）。
+                // raw clone worker 上字段访问不能先枚举方法；方法枚举可能需要按类名
+                // 扫 Class mirror，字段路径可用当前对象直接定位 klass_。
                 var meta = _resolveFieldMeta(target.__jclass, prop, target.__jptr);
                 if (meta) {
-                    var fw = new FieldWrapper(target, meta);
+                    var fw;
+                    if (_hasMethod(target.__jclass, prop)) {
+                        fw = _decorateWithFieldValue(
+                            _makeInstanceMethodInvoker(target, prop), target, meta
+                        );
+                    } else {
+                        fw = new FieldWrapper(target, meta);
+                    }
                     fieldWrappers[prop] = fw;
                     return fw;
                 }
@@ -727,8 +825,13 @@
     }
 
     // 公共：从 ptr+cls 直接创建 wrapper（多数路径用这个）
-    function _wrapJavaObj(ptr, cls) {
-        return _wrapJavaObjOnTarget({__jptr: ptr, __jclass: cls});
+    function _wrapJavaObj(ptr, cls, raw, globalRef) {
+        return _wrapJavaObjOnTarget({
+            __jptr: ptr,
+            __jclass: cls,
+            __jraw: raw === true,
+            __jglobal: globalRef === true
+        });
     }
 
     function MethodWrapper(cls, method, sig, cache) {
@@ -883,6 +986,7 @@
             if (fn === null || fn === undefined) {
                 for (var i = 0; i < sigs.length; i++) {
                     _unhook(cls, name, sigs[i]);
+                    delete _directHookImpls[_methodKey(cls, name, sigs[i])];
                 }
                 this._fn = null;
             } else {
@@ -898,7 +1002,7 @@
                         var a = rawArgs[i];
                         wrappedArgs[i] = (a !== null && typeof a === "object"
                             && a.__jptr !== undefined)
-                            ? _wrapJavaObj(a.__jptr, a.__jclass)
+                            ? _wrapJavaObj(a.__jptr, a.__jclass, a.__jraw === true, a.__jglobal === true)
                             : a;
                     }
                     // Wrap orig 使返回的 Java 对象自动转 Proxy
@@ -907,7 +1011,7 @@
                         var ret = origCallOriginal.apply(ctx, arguments);
                         if (ret !== null && typeof ret === "object"
                             && ret.__jptr !== undefined) {
-                            return _wrapJavaObj(ret.__jptr, ret.__jclass);
+                            return _wrapJavaObj(ret.__jptr, ret.__jclass, ret.__jraw === true, ret.__jglobal === true);
                         }
                         return ret;
                     };
@@ -935,6 +1039,7 @@
                 };
                 for (var i = 0; i < sigs.length; i++) {
                     _hook(cls, name, sigs[i], wrapCallback);
+                    _directHookImpls[_methodKey(cls, name, sigs[i])] = userFn;
                 }
                 this._fn = fn;
             }
@@ -1122,11 +1227,20 @@
             sig = wrapper._s;
         }
 
-        return _invokeJavaStaticMethod(
+        var name = wrapper._m === "$init" ? "<init>" : wrapper._m;
+        return _maybeInvokeDirectStaticHook(
             wrapper._c,
-            wrapper._m === "$init" ? "<init>" : wrapper._m,
+            name,
             sig,
-            args
+            args,
+            function() {
+                return _invokeJavaStaticMethod(
+                    wrapper._c,
+                    name,
+                    sig,
+                    args
+                );
+            }
         );
     }
 
@@ -1300,22 +1414,25 @@
                     }
                     return cache._new;
                 }
-                // 静态字段检查（per-class 缓存，仅首次走 C 调用）
-                if (staticFieldWrappers[prop]) return staticFieldWrappers[prop];
-                var meta = _resolveFieldMeta(cls, prop, 0);
-                if (meta && meta.st) {
-                    var fw;
-                    if (_hasMethod(cls, prop)) {
-                        // 同名冲突：方法可调用 + .value 读写静态字段
-                        if (!wrappers[prop]) {
-                            wrappers[prop] = _bindMethodWrapper(new MethodWrapper(cls, prop, null, cache));
+                // 静态字段检查（per-class 缓存，仅首次走 C 调用）。raw clone
+                // pre-resume 阶段不能为了字段消歧等待 Java executor，否则
+                // Java.ready 的 framework gate 可能在装好前就被 resume 越过。
+                if (!_isRawCloneJsThread()) {
+                    if (staticFieldWrappers[prop]) return staticFieldWrappers[prop];
+                    var meta = _resolveFieldMeta(cls, prop, 0);
+                    if (meta && meta.st) {
+                        var fw;
+                        if (_hasMethod(cls, prop)) {
+                            if (!wrappers[prop]) {
+                                wrappers[prop] = _bindMethodWrapper(new MethodWrapper(cls, prop, null, cache));
+                            }
+                            fw = _decorateWithFieldValue(wrappers[prop], staticTarget, meta);
+                        } else {
+                            fw = new FieldWrapper(staticTarget, meta);
                         }
-                        fw = _decorateWithFieldValue(wrappers[prop], staticTarget, meta);
-                    } else {
-                        fw = new FieldWrapper(staticTarget, meta);
+                        staticFieldWrappers[prop] = fw;
+                        return fw;
                     }
-                    staticFieldWrappers[prop] = fw;
-                    return fw;
                 }
                 // 方法
                 if (!wrappers[prop]) {
@@ -1356,7 +1473,16 @@
     var _readyCallbacks = [];
     var _readyFired = false;
     var _readyGateSig = "(Ljava/lang/ClassLoader;Ljava/lang/String;Landroid/content/Context;)Landroid/app/Application;";
+    var _readyCallAppSig = "(Landroid/app/Application;)V";
     var _gateInstalled = false;
+
+    function _isRawCloneJsThread() {
+        try {
+            return Java._isRawCloneJsThread && Java._isRawCloneJsThread();
+        } catch (_) {
+            return false;
+        }
+    }
 
     function _callReadyCallback(fn, index) {
         try {
@@ -1366,36 +1492,76 @@
         }
     }
 
+    function _fireReadyCallbacks() {
+        if (_readyFired) return;
+        _readyFired = true;
+        var cbs = _readyCallbacks;
+        _readyCallbacks = [];
+        for (var i = 0; i < cbs.length; i++) {
+            _callReadyCallback(cbs[i], i);
+        }
+    }
+
     Java._installGateHook = function() {
         if (_gateInstalled) return;
         try {
-            _hook("android/app/Instrumentation", "newApplication", _readyGateSig, function(ctx) {
-                var app = ctx.orig();
+            var Inst = Java.use("android.app.Instrumentation");
+            Inst.newApplication.overload(_readyGateSig).impl = function(classLoader, className, context) {
+                var app = this.$orig(classLoader, className, context);
 
-                if (ctx.args && ctx.args[0] !== null && ctx.args[0] !== undefined) {
-                    var clPtr = ctx.args[0];
+                if (classLoader !== null && classLoader !== undefined) {
+                    var clPtr = classLoader;
                     if (typeof clPtr === "object" && clPtr.__jptr !== undefined) {
                         clPtr = clPtr.__jptr;
                     }
                     Java._updateClassLoader(clPtr);
                 }
 
-                _readyFired = true;
-                var cbs = _readyCallbacks;
-                _readyCallbacks = [];
-                for (var i = 0; i < cbs.length; i++) {
-                    _callReadyCallback(cbs[i], i);
-                }
+                _fireReadyCallbacks();
 
                 return app;
-            });
+            };
+            Inst.callApplicationOnCreate.overload(_readyCallAppSig).impl = function(app) {
+                if (app !== null && app !== undefined) {
+                    try {
+                        var cl = app.getClass().getClassLoader();
+                        var clPtr = cl;
+                        if (typeof clPtr === "object" && clPtr.__jptr !== undefined) {
+                            clPtr = clPtr.__jptr;
+                        }
+                        Java._updateClassLoader(clPtr);
+                    } catch (_) {}
+                }
+                _fireReadyCallbacks();
+                return this.$orig(app);
+            };
             _gateInstalled = true;
-        } catch(e) {}
+        } catch(e) {
+            console.log("[Java.ready] gate hook install failed: " + e);
+            if (_isRawCloneJsThread()) {
+                try {
+                    if (Java._cutRawCloneExecutorHook) {
+                        Java._cutRawCloneExecutorHook();
+                    }
+                } catch (_) {}
+                throw e;
+            }
+        }
     };
 
     Java._flushReadyCallbacks = function() {
-        if (!_readyFired && !Java._isClassLoaderReady()) {
+        if (_isRawCloneJsThread()) {
             return;
+        }
+        if (!_readyFired && !Java._isClassLoaderReady()) {
+            try {
+                if (Java._reprobeClassLoaderOnce && Java._reprobeClassLoaderOnce()) {
+                    _readyFired = true;
+                }
+            } catch (_) {}
+            if (!_readyFired && !Java._isClassLoaderReady()) {
+                return;
+            }
         }
 
         _readyFired = true;
@@ -1417,11 +1583,28 @@
             return;
         }
 
-        if (_readyCallbacks.length === 0) {
-            Java._installGateHook();
+        if (_isRawCloneJsThread()) {
+            var installRawGate = _readyCallbacks.length === 0;
+            _readyCallbacks.push(fn);
+            if (installRawGate) {
+                Java._installGateHook();
+            }
+            return;
         }
 
+        try {
+            if (Java._reprobeClassLoaderOnce && Java._reprobeClassLoaderOnce()) {
+                _readyFired = true;
+                _readyCallbacks.push(fn);
+                return;
+            }
+        } catch (_) {}
+
+        var installGate = _readyCallbacks.length === 0;
         _readyCallbacks.push(fn);
+        if (installGate) {
+            Java._installGateHook();
+        }
     };
 
     function _getClassLoaders() {
@@ -1483,6 +1666,28 @@
     Java.setClassLoader = function(loader) {
         return _setClassLoader(_normalizeLoaderArg(loader));
     };
+
+    var _executorHookInstalled = false;
+    Java.installExecutorHook = function() {
+        if (_executorHookInstalled) return true;
+        try {
+            if (Java._installExecutorHook && Java._installExecutorHook()) {
+                _executorHookInstalled = true;
+                return true;
+            }
+        } catch (_) {}
+        try {
+            if (Java._initArtController && Java._initArtController()) {
+                _executorHookInstalled = true;
+                return true;
+            }
+        } catch (e) {
+            return false;
+        }
+        return false;
+    };
+
+    try { Java.installExecutorHook(); } catch (_) {}
 
     // ========================================================================
     // Java.choose(className, {onMatch, onComplete}) — Frida 兼容
@@ -1547,7 +1752,12 @@
                 var entry = raw[i];
                 if (!entry || entry.__jptr === undefined || entry.__jptr === 0n
                         || entry.__jptr === 0) continue;
-                var target = {__jptr: entry.__jptr, __jclass: entry.__jclass || className};
+                var target = {
+                    __jptr: entry.__jptr,
+                    __jclass: entry.__jclass || className,
+                    __jraw: entry.__jraw === true,
+                    __jglobal: entry.__jglobal === true
+                };
                 liveTargets.push(target);
                 var wrapped = _wrapJavaObjOnTarget(target);
                 var ret;

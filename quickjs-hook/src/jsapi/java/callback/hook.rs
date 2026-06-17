@@ -213,6 +213,10 @@ pub(super) unsafe extern "C" fn java_hook_callback(
     }; // lock released
 
     let hook_ctx_env: JniEnv = (*ctx_ptr).x[0] as JniEnv;
+    let drained = drain_raw_clone_executor(hook_ctx_env);
+    if drained != 0 {
+        crate::jsapi::console::output_verbose(&format!("[java executor] drained {} raw-clone task(s)", drained));
+    }
 
     // Track whether handle_result was called (false if JS exception occurred)
     let result_was_set = std::cell::Cell::new(false);
@@ -578,39 +582,6 @@ unsafe fn js_result_to_raw(
 ///   - 对象参数是裸 mirror::Object*，需要标记为 JniTransition 后 NewLocalRef 包装
 ///   - float/double 返回值写入 d[0]
 
-/// 将裸 mirror::Object* 转为 JNI local ref (jobject)。
-///
-/// Quick 调用约定中的对象参数是堆上的裸 mirror::Object* 指针。
-/// JNI 标准 NewLocalRef 期望 jobject (IndirectRef)，不能直接传裸指针。
-/// 使用 ART 内部导出的 JNIEnvExt::NewLocalRef(mirror::Object*) 直接接受裸指针。
-///
-/// 缓存 dlsym 结果，避免每次调用都查找。
-#[allow(dead_code)]
-static mut ART_NEW_LOCAL_REF: Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void> = None;
-
-#[allow(dead_code)]
-unsafe fn raw_mirror_to_local_ref(env: JniEnv, raw: u64) -> *mut std::ffi::c_void {
-    if raw == 0 || env.is_null() {
-        return std::ptr::null_mut();
-    }
-
-    // 尝试用 ART 内部 JNIEnvExt::NewLocalRef(mirror::Object*) — 直接接受裸指针
-    let add_ref = ART_NEW_LOCAL_REF.get_or_insert_with(|| {
-        let sym = crate::jsapi::module::libart_dlsym(
-            "_ZN3art9JNIEnvExt11NewLocalRefEPNS_6mirror6ObjectE",
-        );
-        if sym.is_null() {
-            // fallback: 标准 JNI NewLocalRef (可能不兼容裸指针)
-            let vtable = *(env as *const *const usize);
-            let new_local: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void =
-                std::mem::transmute(*(vtable.add(25))); // JNI_NEW_LOCAL_REF = 25
-            new_local
-        } else {
-            std::mem::transmute(sym)
-        }
-    });
-    add_ref(env as *mut std::ffi::c_void, raw as *mut std::ffi::c_void)
-}
 #[no_mangle]
 #[allow(dead_code)]
 pub unsafe extern "C" fn java_hook_dispatch_from_quick(

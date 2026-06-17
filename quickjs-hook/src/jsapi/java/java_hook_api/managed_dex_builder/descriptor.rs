@@ -1,9 +1,10 @@
 use crate::jsapi::java::jni_core::{
-    jni_check_exc, CallBooleanMethodAFn, CallIntMethodAFn, CallObjectMethodAFn, DeleteLocalRefFn, GetArrayLengthFn,
-    GetMethodIdFn, GetObjectArrayElementFn, GetStringUtfCharsFn, JniEnv, PopLocalFrameFn, PushLocalFrameFn,
-    ReleaseStringUtfCharsFn, JNI_CALL_BOOLEAN_METHOD_A, JNI_CALL_INT_METHOD_A, JNI_CALL_OBJECT_METHOD_A,
-    JNI_DELETE_LOCAL_REF, JNI_GET_ARRAY_LENGTH, JNI_GET_METHOD_ID, JNI_GET_OBJECT_ARRAY_ELEMENT,
-    JNI_GET_STRING_UTF_CHARS, JNI_POP_LOCAL_FRAME, JNI_PUSH_LOCAL_FRAME, JNI_RELEASE_STRING_UTF_CHARS,
+    jni_check_exc, jni_null_or_exc, CallBooleanMethodAFn, CallIntMethodAFn, CallObjectMethodAFn, DeleteLocalRefFn,
+    GetArrayLengthFn, GetMethodIdFn, GetObjectArrayElementFn, GetStringUtfCharsFn, JniEnv, PopLocalFrameFn,
+    PushLocalFrameFn, ReleaseStringUtfCharsFn, JNI_CALL_BOOLEAN_METHOD_A, JNI_CALL_INT_METHOD_A,
+    JNI_CALL_OBJECT_METHOD_A, JNI_DELETE_LOCAL_REF, JNI_GET_ARRAY_LENGTH, JNI_GET_METHOD_ID,
+    JNI_GET_OBJECT_ARRAY_ELEMENT, JNI_GET_STRING_UTF_CHARS, JNI_POP_LOCAL_FRAME, JNI_PUSH_LOCAL_FRAME,
+    JNI_RELEASE_STRING_UTF_CHARS,
 };
 use std::collections::{BTreeSet, VecDeque};
 use std::ffi::{c_void, CStr, CString};
@@ -403,7 +404,7 @@ unsafe fn resolve_field_with_reflection(
             return Ok(spec);
         }
         let super_cls = call_obj(env, current, get_superclass_mid, std::ptr::null());
-        if jni_check_exc(env) || super_cls.is_null() {
+        if jni_null_or_exc(env, super_cls) {
             break;
         }
         current = super_cls;
@@ -436,18 +437,22 @@ unsafe fn find_matching_field_in_array(
     expected_static: Option<bool>,
     field_get_name_mid: *mut c_void,
 ) -> Result<Option<ResolvedFieldSpec>, String> {
-    if array.is_null() || jni_check_exc(env) {
+    if jni_null_or_exc(env, array) {
         return Ok(None);
     }
     let get_arr_len: GetArrayLengthFn = jni_fn!(env, GetArrayLengthFn, JNI_GET_ARRAY_LENGTH);
     let get_arr_elem: GetObjectArrayElementFn = jni_fn!(env, GetObjectArrayElementFn, JNI_GET_OBJECT_ARRAY_ELEMENT);
     let len = get_arr_len(env, array);
-    if jni_check_exc(env) || len <= 0 {
+    let len_failed = {
+        let had_exc = jni_check_exc(env);
+        len <= 0 || had_exc
+    };
+    if len_failed {
         return Ok(None);
     }
     for i in 0..len {
         let field = get_arr_elem(env, array, i);
-        if field.is_null() || jni_check_exc(env) {
+        if jni_null_or_exc(env, field) {
             continue;
         }
         let Some(name) = reflected_field_name(env, field, field_get_name_mid) else {
@@ -473,11 +478,15 @@ unsafe fn reflected_field_name(env: JniEnv, field: *mut c_void, field_get_name_m
     let get_str: GetStringUtfCharsFn = jni_fn!(env, GetStringUtfCharsFn, JNI_GET_STRING_UTF_CHARS);
     let rel_str: ReleaseStringUtfCharsFn = jni_fn!(env, ReleaseStringUtfCharsFn, JNI_RELEASE_STRING_UTF_CHARS);
     let name_jstr = call_obj(env, field, field_get_name_mid, std::ptr::null());
-    if name_jstr.is_null() || jni_check_exc(env) {
+    if jni_null_or_exc(env, name_jstr) {
         return None;
     }
     let chars = get_str(env, name_jstr, std::ptr::null_mut());
-    if chars.is_null() || jni_check_exc(env) {
+    let chars_failed = {
+        let had_exc = jni_check_exc(env);
+        chars.is_null() || had_exc
+    };
+    if chars_failed {
         return None;
     }
     let value = CStr::from_ptr(chars).to_string_lossy().to_string();
@@ -501,7 +510,11 @@ unsafe fn reflected_field_spec(env: JniEnv, field: *mut c_void) -> Result<Resolv
     let type_cls = call_obj(env, field, get_type_mid, std::ptr::null());
     let declaring_cls = call_obj(env, field, get_declaring_class_mid, std::ptr::null());
     let modifiers = call_int(env, field, get_modifiers_mid, std::ptr::null());
-    if jni_check_exc(env) || type_cls.is_null() || declaring_cls.is_null() {
+    let metadata_failed = {
+        let had_exc = jni_check_exc(env);
+        type_cls.is_null() || declaring_cls.is_null() || had_exc
+    };
+    if metadata_failed {
         return Err("failed to read reflected field metadata".to_string());
     }
     let type_name = crate::jsapi::java::try_get_class_name(env as u64, type_cls as u64)
@@ -525,7 +538,7 @@ unsafe fn class_method_id_from_class_ref(
     let name = CString::new(name).map_err(|_| format!("invalid method name {}", name))?;
     let sig = CString::new(sig).map_err(|_| format!("invalid method signature {}", sig))?;
     let mid = get_mid(env, cls, name.as_ptr(), sig.as_ptr());
-    if mid.is_null() || jni_check_exc(env) {
+    if jni_null_or_exc(env, mid) {
         Err(format!(
             "reflection method {}{} not found",
             name.to_string_lossy(),
@@ -647,7 +660,11 @@ unsafe fn collect_interface_types(
     let get_arr_len: GetArrayLengthFn = jni_fn!(env, GetArrayLengthFn, JNI_GET_ARRAY_LENGTH);
     let get_arr_elem: GetObjectArrayElementFn = jni_fn!(env, GetObjectArrayElementFn, JNI_GET_OBJECT_ARRAY_ELEMENT);
     let len = get_arr_len(env, array);
-    if jni_check_exc(env) || len <= 0 {
+    let len_failed = {
+        let had_exc = jni_check_exc(env);
+        len <= 0 || had_exc
+    };
+    if len_failed {
         delete_local_ref(env, array);
         return;
     }
@@ -655,7 +672,7 @@ unsafe fn collect_interface_types(
     let mut queue = VecDeque::new();
     for i in 0..len {
         let iface = get_arr_elem(env, array, i);
-        if jni_check_exc(env) || iface.is_null() {
+        if jni_null_or_exc(env, iface) {
             continue;
         }
         refs.push(iface);
@@ -671,13 +688,17 @@ unsafe fn collect_interface_types(
             continue;
         };
         let parent_len = get_arr_len(env, parent_array);
-        if jni_check_exc(env) || parent_len <= 0 {
+        let parent_len_failed = {
+            let had_exc = jni_check_exc(env);
+            parent_len <= 0 || had_exc
+        };
+        if parent_len_failed {
             delete_local_ref(env, parent_array);
             continue;
         }
         for i in 0..parent_len {
             let parent_iface = get_arr_elem(env, parent_array, i);
-            if jni_check_exc(env) || parent_iface.is_null() {
+            if jni_null_or_exc(env, parent_iface) {
                 continue;
             }
             refs.push(parent_iface);
@@ -742,7 +763,8 @@ unsafe fn class_is_interface(env: JniEnv, cls: *mut c_void) -> bool {
     };
     let call_bool: CallBooleanMethodAFn = jni_fn!(env, CallBooleanMethodAFn, JNI_CALL_BOOLEAN_METHOD_A);
     let result = call_bool(env, cls, is_interface_mid, std::ptr::null());
-    !jni_check_exc(env) && result != 0
+    let had_exc = jni_check_exc(env);
+    !had_exc && result != 0
 }
 
 unsafe fn class_get_interfaces_method_id(env: JniEnv) -> Option<*mut c_void> {
@@ -763,7 +785,7 @@ unsafe fn class_method_id(env: JniEnv, name: &str, sig: &str) -> Option<*mut c_v
     let name = CString::new(name).ok()?;
     let sig = CString::new(sig).ok()?;
     let mid = get_mid(env, class_cls, name.as_ptr(), sig.as_ptr());
-    let failed = mid.is_null() || jni_check_exc(env);
+    let failed = jni_null_or_exc(env, mid);
     delete_local_ref(env, class_cls);
     if failed {
         None
@@ -775,7 +797,7 @@ unsafe fn class_method_id(env: JniEnv, name: &str, sig: &str) -> Option<*mut c_v
 unsafe fn get_interfaces_array(env: JniEnv, cls: *mut c_void, interfaces_mid: *mut c_void) -> Option<*mut c_void> {
     let call_obj: CallObjectMethodAFn = jni_fn!(env, CallObjectMethodAFn, JNI_CALL_OBJECT_METHOD_A);
     let array = call_obj(env, cls, interfaces_mid, std::ptr::null());
-    if array.is_null() || jni_check_exc(env) {
+    if jni_null_or_exc(env, array) {
         None
     } else {
         Some(array)

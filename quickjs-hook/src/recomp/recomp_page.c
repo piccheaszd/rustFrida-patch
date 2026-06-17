@@ -13,6 +13,12 @@
 #include <stdio.h>
 #include <limits.h>
 
+extern void hook_log(const char* fmt, ...);
+
+#ifndef RECOMP_DEBUG_LOG
+#define RECOMP_DEBUG_LOG 0
+#endif
+
 /* ============================================================================
  * 内部辅助：判断指令是否为分支类
  * ============================================================================ */
@@ -32,9 +38,47 @@ static int is_branch_type(Arm64InsnType type) {
     }
 }
 
-/* 判断指令是否不可能 fall-through（无条件跳转/返回） */
+/* 判断指令是否不可能 fall-through（无条件跳转/返回）。
+ * BLR 是 call，callee RET 后必须继续执行下一条，不能当作 terminator。 */
 static int is_unconditional_transfer(Arm64InsnType type) {
-    return type == ARM64_INSN_B || type == ARM64_INSN_BR || type == ARM64_INSN_BLR || type == ARM64_INSN_RET;
+    return type == ARM64_INSN_B || type == ARM64_INSN_BR || type == ARM64_INSN_RET;
+}
+
+static int is_art_implicit_suspend_poll(uint32_t insn) {
+    return insn == 0xf94002b5u; /* ldr x21, [x21] */
+}
+
+static int put_b_required(Arm64Writer* w, uint64_t target);
+static int put_b_prefer_translated_or_orig(Arm64Writer* w, uint64_t translated_target, uint64_t orig_target);
+static int emit_trampoline(
+    Arm64Writer* w,
+    const Arm64InsnInfo* info,
+    uint32_t insn,
+    uint64_t return_addr,
+    uint64_t orig_ret_addr
+);
+
+static int emit_suspend_poll_skip_null_trampoline(
+    Arm64Writer* w,
+    uint32_t insn,
+    uint64_t orig_fallthrough,
+    uint64_t suspend_entrypoint,
+    uint64_t translated_fallthrough
+) {
+    uint64_t do_poll = arm64_writer_new_label_id(w);
+    arm64_writer_put_cbnz_reg_label(w, ARM64_REG_X21, do_poll);
+    if (suspend_entrypoint != 0) {
+        arm64_writer_put_ldr_reg_address(w, ARM64_REG_X30, orig_fallthrough);
+        if (arm64_writer_put_b_imm(w, suspend_entrypoint) != 0) {
+            arm64_writer_put_branch_address_reg(w, suspend_entrypoint, ARM64_REG_X16);
+        }
+    } else {
+        if (put_b_prefer_translated_or_orig(w, translated_fallthrough, orig_fallthrough) != 0)
+            return -1;
+    }
+    arm64_writer_put_label(w, do_poll);
+    arm64_writer_put_insn(w, insn);
+    return put_b_prefer_translated_or_orig(w, translated_fallthrough, orig_fallthrough);
 }
 
 /* ============================================================================
@@ -114,24 +158,38 @@ static const char* branch_type_name(Arm64InsnType type) {
     }
 }
 
-static int emit_translated_branch_trampoline(
+static int put_b_required(Arm64Writer* w, uint64_t target) {
+    if (target == 0)
+        return -1;
+    return arm64_writer_put_b_imm(w, target);
+}
+
+static int put_b_prefer_translated_or_orig(Arm64Writer* w, uint64_t translated_target, uint64_t orig_target) {
+    uint64_t target = translated_target != 0 ? translated_target : orig_target;
+    if (target == 0)
+        return -1;
+    return arm64_writer_put_b_imm(w, target);
+}
+
+static int emit_branch_trampoline(
     Arm64Writer* w,
     const Arm64InsnInfo* info,
     uint64_t translated_target,
+    uint64_t orig_target,
     uint64_t translated_fallthrough
 ) {
     switch (info->type) {
     case ARM64_INSN_B:
-        return arm64_writer_put_b_imm(w, translated_target);
+        return put_b_prefer_translated_or_orig(w, translated_target, orig_target);
 
     case ARM64_INSN_B_COND: {
         uint64_t skip = arm64_writer_new_label_id(w);
         Arm64Cond inv = (Arm64Cond)(info->cond ^ 1);
         arm64_writer_put_b_cond_label(w, inv, skip);
-        if (arm64_writer_put_b_imm(w, translated_target) != 0)
+        if (put_b_prefer_translated_or_orig(w, translated_target, orig_target) != 0)
             return -1;
         arm64_writer_put_label(w, skip);
-        return arm64_writer_put_b_imm(w, translated_fallthrough);
+        return put_b_required(w, translated_fallthrough);
     }
 
     case ARM64_INSN_CBZ:
@@ -141,10 +199,10 @@ static int emit_translated_branch_trampoline(
             arm64_writer_put_cbnz_reg_label(w, info->reg, skip);
         else
             arm64_writer_put_cbz_reg_label(w, info->reg, skip);
-        if (arm64_writer_put_b_imm(w, translated_target) != 0)
+        if (put_b_prefer_translated_or_orig(w, translated_target, orig_target) != 0)
             return -1;
         arm64_writer_put_label(w, skip);
-        return arm64_writer_put_b_imm(w, translated_fallthrough);
+        return put_b_required(w, translated_fallthrough);
     }
 
     case ARM64_INSN_TBZ:
@@ -154,10 +212,63 @@ static int emit_translated_branch_trampoline(
             arm64_writer_put_tbnz_reg_imm_label(w, info->reg, info->bit, skip);
         else
             arm64_writer_put_tbz_reg_imm_label(w, info->reg, info->bit, skip);
-        if (arm64_writer_put_b_imm(w, translated_target) != 0)
+        if (put_b_prefer_translated_or_orig(w, translated_target, orig_target) != 0)
             return -1;
         arm64_writer_put_label(w, skip);
-        return arm64_writer_put_b_imm(w, translated_fallthrough);
+        return put_b_required(w, translated_fallthrough);
+    }
+
+    default:
+        return -1;
+    }
+}
+
+static int emit_branch_fallthrough_trampoline(
+    Arm64Writer* w,
+    const Arm64InsnInfo* info,
+    uint64_t translated_target,
+    uint64_t orig_target,
+    uint64_t translated_fallthrough,
+    uint64_t orig_fallthrough
+) {
+    switch (info->type) {
+    case ARM64_INSN_B:
+        return put_b_prefer_translated_or_orig(w, translated_target, orig_target);
+
+    case ARM64_INSN_B_COND: {
+        uint64_t skip = arm64_writer_new_label_id(w);
+        Arm64Cond inv = (Arm64Cond)(info->cond ^ 1);
+        arm64_writer_put_b_cond_label(w, inv, skip);
+        if (put_b_prefer_translated_or_orig(w, translated_target, orig_target) != 0)
+            return -1;
+        arm64_writer_put_label(w, skip);
+        return put_b_prefer_translated_or_orig(w, translated_fallthrough, orig_fallthrough);
+    }
+
+    case ARM64_INSN_CBZ:
+    case ARM64_INSN_CBNZ: {
+        uint64_t skip = arm64_writer_new_label_id(w);
+        if (info->type == ARM64_INSN_CBZ)
+            arm64_writer_put_cbnz_reg_label(w, info->reg, skip);
+        else
+            arm64_writer_put_cbz_reg_label(w, info->reg, skip);
+        if (put_b_prefer_translated_or_orig(w, translated_target, orig_target) != 0)
+            return -1;
+        arm64_writer_put_label(w, skip);
+        return put_b_prefer_translated_or_orig(w, translated_fallthrough, orig_fallthrough);
+    }
+
+    case ARM64_INSN_TBZ:
+    case ARM64_INSN_TBNZ: {
+        uint64_t skip = arm64_writer_new_label_id(w);
+        if (info->type == ARM64_INSN_TBZ)
+            arm64_writer_put_tbnz_reg_imm_label(w, info->reg, info->bit, skip);
+        else
+            arm64_writer_put_tbz_reg_imm_label(w, info->reg, info->bit, skip);
+        if (put_b_prefer_translated_or_orig(w, translated_target, orig_target) != 0)
+            return -1;
+        arm64_writer_put_label(w, skip);
+        return put_b_prefer_translated_or_orig(w, translated_fallthrough, orig_fallthrough);
     }
 
     default:
@@ -171,31 +282,35 @@ static int emit_fallthrough_noscratch_trampoline(
     uint32_t insn,
     uint64_t orig_pc,
     uint64_t tramp_pc,
+    uint64_t orig_next_page,
     uint64_t translated_next_page,
     uint64_t translated_branch_target
 ) {
     if (is_branch_type(info->type) &&
         info->type != ARM64_INSN_BL &&
         info->type != ARM64_INSN_BLR) {
-        if (translated_branch_target == 0)
-            return -1;
-        return emit_translated_branch_trampoline(
-            w, info, translated_branch_target, translated_next_page);
+        return emit_branch_fallthrough_trampoline(
+            w, info, translated_branch_target, info->target,
+            translated_next_page, orig_next_page);
+    }
+
+    if (info->type == ARM64_INSN_BL || info->type == ARM64_INSN_BLR) {
+        return emit_trampoline(w, info, insn, orig_pc + 4, orig_pc + 4);
     }
 
     if (!info->is_pc_relative && info->type != ARM64_INSN_BLR) {
         arm64_writer_put_insn(w, insn);
-        return arm64_writer_put_b_imm(w, translated_next_page);
+        return put_b_prefer_translated_or_orig(w, translated_next_page, orig_next_page);
     }
 
     if (info->type == ARM64_INSN_PRFM_LITERAL) {
         arm64_writer_put_insn(w, 0xD503201F);
-        return arm64_writer_put_b_imm(w, translated_next_page);
+        return put_b_prefer_translated_or_orig(w, translated_next_page, orig_next_page);
     }
 
     if (info->type == ARM64_INSN_ADR || info->type == ARM64_INSN_ADRP) {
         arm64_writer_put_mov_reg_imm(w, info->dst_reg, info->target);
-        return arm64_writer_put_b_imm(w, translated_next_page);
+        return put_b_prefer_translated_or_orig(w, translated_next_page, orig_next_page);
     }
 
     if (info->type == ARM64_INSN_LDR_LITERAL) {
@@ -208,14 +323,14 @@ static int emit_fallthrough_noscratch_trampoline(
         } else {
             arm64_writer_put_ldr_reg_reg_offset(w, xd, xd, 0);
         }
-        return arm64_writer_put_b_imm(w, translated_next_page);
+        return put_b_prefer_translated_or_orig(w, translated_next_page, orig_next_page);
     }
 
     if (info->type == ARM64_INSN_LDRSW_LITERAL) {
         Arm64Reg xd = info->dst_reg;
         arm64_writer_put_ldr_reg_address(w, xd, info->target);
         arm64_writer_put_ldrsw_reg_reg_offset(w, xd, xd, 0);
-        return arm64_writer_put_b_imm(w, translated_next_page);
+        return put_b_prefer_translated_or_orig(w, translated_next_page, orig_next_page);
     }
 
     if (info->type == ARM64_INSN_LDR_LITERAL_FP) {
@@ -224,13 +339,13 @@ static int emit_fallthrough_noscratch_trampoline(
         arm64_writer_put_ldr_fp_reg_reg(w, (uint32_t)info->dst_reg,
                                          ARM64_REG_X16, info->fp_size);
         arm64_writer_put_pop_reg_reg(w, ARM64_REG_X16, ARM64_REG_X17);
-        return arm64_writer_put_b_imm(w, translated_next_page);
+        return put_b_prefer_translated_or_orig(w, translated_next_page, orig_next_page);
     }
 
     uint32_t relocated = 0;
     if (arm64_relocator_relocate_insn(orig_pc, tramp_pc, insn, &relocated) == ARM64_RELOC_OK) {
         arm64_writer_put_insn(w, relocated);
-        return arm64_writer_put_b_imm(w, translated_next_page);
+        return put_b_prefer_translated_or_orig(w, translated_next_page, orig_next_page);
     }
 
     return -1;
@@ -494,6 +609,7 @@ int recompile_page(
     uint64_t tramp_base,
     size_t tramp_cap,
     size_t* tramp_used,
+    uint64_t suspend_entrypoint,
     RecompTranslateExistingFn translate_existing,
     void* translate_user_data,
     RecompileStats* stats
@@ -518,22 +634,20 @@ int recompile_page(
         /* 分析指令 */
         Arm64InsnInfo info = arm64_relocator_analyze_insn(orig_pc, insn);
 
-        if (is_branch_type(info.type) && info.type != ARM64_INSN_BL && info.type != ARM64_INSN_BLR) {
-            uint64_t direct_target = 0;
-            if (info.target >= orig_base && info.target < orig_base + RECOMP_PAGE_SIZE) {
-                direct_target = recomp_base + (info.target - orig_base);
-            } else {
-                direct_target = info.target;
-            }
-            if (direct_target != 0) {
+        if (is_branch_type(info.type) &&
+            info.type != ARM64_INSN_BL &&
+            info.type != ARM64_INSN_BLR &&
+            !(is_last && !is_unconditional_transfer(info.type))) {
+            if (info.target != 0) {
                 uint32_t branch_insn = 0;
-                if (encode_branch_like(insn, info.type, recomp_pc, direct_target, &branch_insn) == 0) {
-                    recomp_insns[i] = branch_insn;
-                    if (info.target >= orig_base && info.target < orig_base + RECOMP_PAGE_SIZE)
+                uint64_t intra_target = 0;
+                if (info.target >= orig_base && info.target < orig_base + RECOMP_PAGE_SIZE) {
+                    intra_target = recomp_base + (info.target - orig_base);
+                    if (encode_branch_like(insn, info.type, recomp_pc, intra_target, &branch_insn) == 0) {
+                        recomp_insns[i] = branch_insn;
                         local_stats.num_intra_page++;
-                    else
-                        local_stats.num_direct_reloc++;
-                    continue;
+                        continue;
+                    }
                 }
 
                 uint64_t translated_target = translate_existing
@@ -546,7 +660,6 @@ int recompile_page(
                     continue;
                 }
 
-                uint64_t trampoline_target = translated_target != 0 ? translated_target : direct_target;
                 if (!arm64_writer_can_write(&tw, 32)) {
                     local_stats.error = -1;
                     snprintf(local_stats.error_msg, sizeof(local_stats.error_msg),
@@ -556,14 +669,14 @@ int recompile_page(
 
                 uint64_t tramp_pc = arm64_writer_pc(&tw);
                 uint64_t translated_fallthrough = recomp_pc + 4;
-                if (emit_translated_branch_trampoline(
-                        &tw, &info, trampoline_target, translated_fallthrough) != 0) {
+                if (emit_branch_trampoline(
+                        &tw, &info, translated_target, info.target, translated_fallthrough) != 0) {
                     local_stats.error = -1;
                     snprintf(local_stats.error_msg, sizeof(local_stats.error_msg),
                              "无 scratch 分支跳板超出 B 范围 (offset=0x%x type=%s target=0x%llx branch_target=0x%llx)",
                              i * 4, branch_type_name(info.type),
                              (unsigned long long)info.target,
-                             (unsigned long long)trampoline_target);
+                             (unsigned long long)(translated_target != 0 ? translated_target : info.target));
                     goto done;
                 }
 
@@ -578,12 +691,14 @@ int recompile_page(
 
                 recomp_insns[i] = tramp_branch_insn;
                 local_stats.num_trampolines++;
+#if RECOMP_DEBUG_LOG
                 hook_log("[recomp-BR-NOSCRATCH] page=%llx +0x%03x: %08x type=%s target=%llx translated=%llx tramp=%llx",
                          (unsigned long long)orig_base, i * 4, insn,
                          branch_type_name(info.type),
                          (unsigned long long)info.target,
-                         (unsigned long long)trampoline_target,
+                         (unsigned long long)(translated_target != 0 ? translated_target : info.target),
                          (unsigned long long)tramp_pc);
+#endif
                 continue;
             }
 
@@ -595,6 +710,60 @@ int recompile_page(
                          (unsigned long long)info.target);
                 goto done;
             }
+        }
+
+        /* ART arm64 quick implicit suspend checks are encoded as
+         *   ldr x21, [x21]
+         * on the original OAT/boot page. Executing the same instruction on an
+         * anonymous recomp page with x21 == 0 raises SIGSEGV outside ART's
+         * generated-code fault-manager range. When a quick suspend entrypoint
+         * is known, dispatch to ART with LR set to the original next OAT PC;
+         * otherwise skip the null fault as a temporary fallback. This must run
+         * before the page-end fall-through fixup, so a poll at the last page
+         * instruction is never copied into a generic fall-through trampoline. */
+        if (is_art_implicit_suspend_poll(insn)) {
+            if (!arm64_writer_can_write(&tw, suspend_entrypoint != 0 ? 56 : 24)) {
+                local_stats.error = -1;
+                snprintf(local_stats.error_msg, sizeof(local_stats.error_msg),
+                         "跳板区空间不足 (suspend-poll guard offset=0x%x)", i * 4);
+                goto done;
+            }
+
+            uint64_t tramp_pc = arm64_writer_pc(&tw);
+            uint64_t translated_fallthrough = recomp_pc + 4;
+            if (is_last) {
+                uint64_t next_page = orig_base + RECOMP_PAGE_SIZE;
+                translated_fallthrough = translate_existing
+                    ? translate_existing(next_page, translate_user_data)
+                    : 0;
+            }
+            uint64_t orig_fallthrough = orig_pc + 4;
+            if (emit_suspend_poll_skip_null_trampoline(&tw, insn, orig_fallthrough,
+                                                       suspend_entrypoint, translated_fallthrough) != 0) {
+                local_stats.error = -1;
+                snprintf(local_stats.error_msg, sizeof(local_stats.error_msg),
+                         "suspend-poll guard 跳板超出 B 范围 (offset=0x%x)", i * 4);
+                goto done;
+            }
+
+            uint32_t branch_insn;
+            if (encode_b(recomp_pc, tramp_pc, &branch_insn) != 0) {
+                local_stats.error = -1;
+                snprintf(local_stats.error_msg, sizeof(local_stats.error_msg),
+                         "无法编码到 suspend-poll guard 跳板 (offset=0x%x)", i * 4);
+                goto done;
+            }
+
+            recomp_insns[i] = branch_insn;
+            local_stats.num_trampolines++;
+#if RECOMP_DEBUG_LOG
+            hook_log("[recomp-SUSPEND] page=%llx +0x%03x: %08x -> guard tramp=%llx ret=%llx entry=%llx",
+                     (unsigned long long)orig_base, i * 4, insn,
+                     (unsigned long long)tramp_pc,
+                     (unsigned long long)translated_fallthrough,
+                     (unsigned long long)suspend_entrypoint);
+#endif
+            continue;
         }
 
         /* ================================================================
@@ -612,7 +781,9 @@ int recompile_page(
 
             uint64_t tramp_pc = arm64_writer_pc(&tw);
             uint64_t next_page = orig_base + RECOMP_PAGE_SIZE;
-            uint64_t next_target = next_page;
+            uint64_t next_target = translate_existing
+                ? translate_existing(next_page, translate_user_data)
+                : 0;
             uint64_t translated_branch_target = 0;
             if (is_branch_type(info.type) &&
                 info.type != ARM64_INSN_BL &&
@@ -625,7 +796,7 @@ int recompile_page(
             }
 
             if (emit_fallthrough_noscratch_trampoline(
-                    &tw, &info, insn, orig_pc, tramp_pc, next_target,
+                    &tw, &info, insn, orig_pc, tramp_pc, next_page, next_target,
                     translated_branch_target) != 0) {
                 local_stats.error = -1;
                 snprintf(local_stats.error_msg, sizeof(local_stats.error_msg),
@@ -664,6 +835,7 @@ int recompile_page(
         if (is_branch_type(info.type) &&
             info.type != ARM64_INSN_BL &&
             info.type != ARM64_INSN_BLR &&
+            !(is_last && !is_unconditional_transfer(info.type)) &&
             info.target >= orig_base &&
             info.target < orig_base + RECOMP_PAGE_SIZE) {
             recomp_insns[i] = insn;
@@ -680,13 +852,14 @@ int recompile_page(
         if (rr == ARM64_RELOC_OK) {
             recomp_insns[i] = relocated;
             local_stats.num_direct_reloc++;
-            /* DEBUG: ADRP 直接重定位详细日志 */
+#if RECOMP_DEBUG_LOG
             if (info.type == ARM64_INSN_ADRP || info.type == ARM64_INSN_ADR) {
                 hook_log("[recomp-RELOC] page=%llx +0x%03x: %08x → %08x  type=%s target=%llx dst_reg=%d",
                          (unsigned long long)orig_base, i * 4, insn, relocated,
                          info.type == ARM64_INSN_ADRP ? "ADRP" : "ADR",
                          (unsigned long long)info.target, (int)info.dst_reg);
             }
+#endif
             continue;
         }
 
@@ -737,6 +910,7 @@ int recompile_page(
         recomp_insns[i] = branch_insn;
         local_stats.num_trampolines++;
 
+#if RECOMP_DEBUG_LOG
         /* DEBUG: 打印每条跳板化指令的详细信息 */
         {
             static const char* type_names[] = {
@@ -756,6 +930,7 @@ int recompile_page(
                      (unsigned long long)info.target, (int)info.dst_reg,
                      (unsigned long long)tramp_pc, (unsigned long long)return_addr);
         }
+#endif
     }
 
     /* flush writer 的 label 引用 */
@@ -765,6 +940,7 @@ int recompile_page(
                  "跳板区 label 解析失败");
     }
 
+#if RECOMP_DEBUG_LOG
     /* DEBUG: dump 所有被修改的指令 + 未被修改但为 PC-relative 的（疑似遗漏） */
     if (local_stats.error == 0) {
         int miss_count = 0;
@@ -797,6 +973,7 @@ int recompile_page(
                      (unsigned long long)orig_base, miss_count);
         }
     }
+#endif
 
     /* 在跳板区末尾填 BRK guard，防止 fall-through 到空白执行垃圾指令 */
     while (arm64_writer_can_write(&tw, 4)) {

@@ -59,6 +59,7 @@ int recompile_page(
     uint64_t tramp_base,
     size_t tramp_cap,
     size_t* tramp_used,
+    uint64_t suspend_entrypoint,
     RecompTranslateExistingFn translate_existing,
     void* translate_user_data,
     RecompileStats* stats

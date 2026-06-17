@@ -2,6 +2,7 @@
 
 use crate::ffi;
 use crate::value::JSValue;
+use std::collections::HashSet;
 use std::ffi::CString;
 
 use super::jni_core::*;
@@ -27,16 +28,29 @@ pub(super) unsafe extern "C" fn js_java_methods(
         None => return ffi::JS_ThrowTypeError(ctx, b"argument must be a class name string\0".as_ptr() as *const _),
     };
 
-    let env = match ensure_jni_initialized() {
-        Ok(e) => e,
-        Err(msg) => {
-            let err = CString::new(msg).unwrap();
-            return ffi::JS_ThrowInternalError(ctx, err.as_ptr());
+    let mut methods = if crate::is_raw_clone_js_thread() {
+        match super::art_method::enumerate_methods_by_dex(std::ptr::null_mut(), &class_name) {
+            Some(m) => m,
+            None => match super::callback::enumerate_methods_via_executor(&class_name) {
+                Ok(m) => m,
+                Err(msg) => {
+                    let err = CString::new(format!(
+                        "raw clone _methods('{}') dex self-parse and Java executor reflection failed: {}",
+                        class_name, msg
+                    ))
+                    .unwrap();
+                    return ffi::JS_ThrowInternalError(ctx, err.as_ptr());
+                }
+            },
         }
-    };
-
-    let registered_methods = super::callback::registered_methods_for_class(&class_name);
-    let methods = if registered_methods.is_empty() {
+    } else {
+        let env = match ensure_jni_initialized() {
+            Ok(e) => e,
+            Err(msg) => {
+                let err = CString::new(msg).unwrap();
+                return ffi::JS_ThrowInternalError(ctx, err.as_ptr());
+            }
+        };
         match enumerate_methods(env, &class_name) {
             Ok(m) => m,
             Err(msg) => {
@@ -44,9 +58,22 @@ pub(super) unsafe extern "C" fn js_java_methods(
                 return ffi::JS_ThrowInternalError(ctx, err.as_ptr());
             }
         }
-    } else {
-        registered_methods
     };
+
+    // Registry entries may include methods installed with a raw JNI signature
+    // before reflection has cached the class. They should supplement, not
+    // replace, reflection results; replacing drops inherited methods such as
+    // java.lang.Object.getClass().
+    let mut seen: HashSet<(String, String, bool)> = methods
+        .iter()
+        .map(|m| (m.name.clone(), m.sig.clone(), m.is_static))
+        .collect();
+    for method in super::callback::registered_methods_for_class(&class_name) {
+        let key = (method.name.clone(), method.sig.clone(), method.is_static);
+        if seen.insert(key) {
+            methods.push(method);
+        }
+    }
 
     // Build JS array: [{name: "...", sig: "...", static: bool}, ...]
     let arr = ffi::JS_NewArray(ctx);

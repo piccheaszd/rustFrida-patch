@@ -57,6 +57,7 @@ struct _ZymbioteContext
     uint64_t capset_got_slot;
     uint64_t capset_original;
     uint64_t capset_got_protection;
+    uint64_t passive_setargv0;
 };
 
 ZymbioteContext zymbiote =
@@ -231,6 +232,9 @@ rustfrida_zymbiote_replacement_setargv0(JNIEnv *env, jobject clazz, jstring name
     bool release_name;
 
     zymbiote.original_set_argv0(env, clazz, name);
+
+    if (zymbiote.passive_setargv0)
+        return 0;
 
     if (zymbiote.pure_spawn_done || zymbiote.block_in_setcontext)
         return 0;

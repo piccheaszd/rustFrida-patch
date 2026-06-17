@@ -71,6 +71,11 @@ impl DexClass {
         self
     }
 
+    pub(super) fn super_type(mut self, super_type: impl Into<String>) -> Self {
+        self.super_type = super_type.into();
+        self
+    }
+
     pub(super) fn static_field(&mut self, name: &str, type_name: &str, access_flags: u32) -> FieldRef {
         let field = FieldRef::new(self.class_type.clone(), type_name.to_string(), name.to_string());
         self.static_fields.push(ClassField {
@@ -119,6 +124,28 @@ impl DexClass {
             method: method.clone(),
             access_flags,
             code: None,
+        });
+        method
+    }
+
+    pub(super) fn virtual_method(
+        &mut self,
+        name: &str,
+        return_type: &str,
+        params: Vec<String>,
+        access_flags: u32,
+        code: DexCode,
+    ) -> MethodRef {
+        let method = MethodRef::new(
+            self.class_type.clone(),
+            name.to_string(),
+            return_type.to_string(),
+            params,
+        );
+        self.virtual_methods.push(ClassMethod {
+            method: method.clone(),
+            access_flags,
+            code: Some(code),
         });
         method
     }
@@ -326,11 +353,31 @@ impl DexBuilder {
             &mut data,
             &[
                 (TYPE_HEADER_ITEM, 1, 0),
-                (TYPE_STRING_ID_ITEM, strings.len() as u32, string_ids_off as u32),
-                (TYPE_TYPE_ID_ITEM, types.len() as u32, type_ids_off as u32),
-                (TYPE_PROTO_ID_ITEM, protos.len() as u32, proto_ids_off as u32),
-                (TYPE_FIELD_ID_ITEM, fields.len() as u32, field_ids_off as u32),
-                (TYPE_METHOD_ID_ITEM, methods.len() as u32, method_ids_off as u32),
+                (
+                    TYPE_STRING_ID_ITEM,
+                    strings.len() as u32,
+                    section_off(strings.len(), string_ids_off),
+                ),
+                (
+                    TYPE_TYPE_ID_ITEM,
+                    types.len() as u32,
+                    section_off(types.len(), type_ids_off),
+                ),
+                (
+                    TYPE_PROTO_ID_ITEM,
+                    protos.len() as u32,
+                    section_off(protos.len(), proto_ids_off),
+                ),
+                (
+                    TYPE_FIELD_ID_ITEM,
+                    fields.len() as u32,
+                    section_off(fields.len(), field_ids_off),
+                ),
+                (
+                    TYPE_METHOD_ID_ITEM,
+                    methods.len() as u32,
+                    section_off(methods.len(), method_ids_off),
+                ),
                 (TYPE_CLASS_DEF_ITEM, self.classes.len() as u32, class_defs_off as u32),
                 (TYPE_MAP_LIST, 1, map_off),
                 (TYPE_TYPE_LIST, type_lists.len() as u32, first_type_list_off),
@@ -354,15 +401,15 @@ impl DexBuilder {
         write_u32_at(&mut out, 40, 0x1234_5678);
         write_u32_at(&mut out, 52, map_off);
         write_u32_at(&mut out, 56, strings.len() as u32);
-        write_u32_at(&mut out, 60, string_ids_off as u32);
+        write_u32_at(&mut out, 60, section_off(strings.len(), string_ids_off));
         write_u32_at(&mut out, 64, types.len() as u32);
-        write_u32_at(&mut out, 68, type_ids_off as u32);
+        write_u32_at(&mut out, 68, section_off(types.len(), type_ids_off));
         write_u32_at(&mut out, 72, protos.len() as u32);
-        write_u32_at(&mut out, 76, proto_ids_off as u32);
+        write_u32_at(&mut out, 76, section_off(protos.len(), proto_ids_off));
         write_u32_at(&mut out, 80, fields.len() as u32);
-        write_u32_at(&mut out, 84, field_ids_off as u32);
+        write_u32_at(&mut out, 84, section_off(fields.len(), field_ids_off));
         write_u32_at(&mut out, 88, methods.len() as u32);
-        write_u32_at(&mut out, 92, method_ids_off as u32);
+        write_u32_at(&mut out, 92, section_off(methods.len(), method_ids_off));
         write_u32_at(&mut out, 96, self.classes.len() as u32);
         write_u32_at(&mut out, 100, class_defs_off as u32);
         write_u32_at(&mut out, 104, (file_size - data_off) as u32);
@@ -611,6 +658,14 @@ fn lookup_u16<K: Ord + std::fmt::Debug>(map: &BTreeMap<K, u32>, key: &K, kind: &
         return Err(format!("{} index too large: {}", kind, value));
     }
     Ok(value as u16)
+}
+
+fn section_off(count: usize, offset: usize) -> u32 {
+    if count == 0 {
+        0
+    } else {
+        offset as u32
+    }
 }
 
 fn shorty_char(descriptor: &str) -> char {
