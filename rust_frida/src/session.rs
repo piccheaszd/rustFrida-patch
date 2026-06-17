@@ -212,6 +212,7 @@ impl SessionManager {
         }
     }
 
+    #[cfg(not(feature = "noptrace"))]
     pub(crate) fn create_session(&self, label: String) -> Arc<Session> {
         let mut sessions = self.sessions.lock().unwrap();
         // 复用已释放的 id：从 1 开始挑最小的空缺
@@ -234,10 +235,12 @@ impl SessionManager {
         self.sessions.lock().unwrap().get(&id).cloned()
     }
 
+    #[cfg(not(feature = "noptrace"))]
     pub(crate) fn set_active(&self, id: Option<u32>) {
         *self.active_id.lock().unwrap() = id;
     }
 
+    #[cfg(not(feature = "noptrace"))]
     pub(crate) fn remove_session(&self, id: u32) -> Option<Arc<Session>> {
         let removed = self.sessions.lock().unwrap().remove(&id);
         let mut active = self.active_id.lock().unwrap();
@@ -267,6 +270,7 @@ impl SessionManager {
         result
     }
 
+    #[cfg(not(feature = "noptrace"))]
     pub(crate) fn all_sessions(&self) -> Vec<Arc<Session>> {
         self.sessions.lock().unwrap().values().cloned().collect()
     }

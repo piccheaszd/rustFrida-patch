@@ -12,6 +12,7 @@ use nix::unistd::Pid;
 #[cfg(not(feature = "noptrace"))]
 use std::mem::size_of;
 use std::os::unix::io::RawFd;
+#[cfg(not(feature = "noptrace"))]
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -147,13 +148,19 @@ fn remote_mprotect_syscall(
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct InjectionResult {
     pub(crate) host_fd: RawFd,
+    #[cfg(not(feature = "noptrace"))]
     pub(crate) target_pid: i32,
     pub(crate) loader_ctx_addr: u64,
     pub(crate) agent_current_thread_eval_impl: u64,
+    #[cfg(not(feature = "noptrace"))]
     pub(crate) loader_alloc_base: u64,
+    #[cfg(not(feature = "noptrace"))]
     pub(crate) loader_alloc_size: u64,
+    #[cfg(not(feature = "noptrace"))]
     pub(crate) loader_stack: u64,
+    #[cfg(not(feature = "noptrace"))]
     pub(crate) loader_stack_size: u64,
+    #[cfg(not(feature = "noptrace"))]
     pub(crate) libc_munmap: u64,
 }
 
@@ -264,6 +271,7 @@ fn env_flag_enabled(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn env_value_enabled(value: &str) -> bool {
     value != "0" && !value.eq_ignore_ascii_case("false")
 }
@@ -834,6 +842,7 @@ pub(crate) fn choose_injection_thread(pid: i32) -> Result<i32, String> {
     Ok(tid)
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn choose_injection_thread_once(pid: i32) -> (i32, i32) {
     let task_dir = format!("/proc/{}/task", pid);
     let mut best_tid = pid;
@@ -895,6 +904,7 @@ fn choose_injection_thread_once(pid: i32) -> (i32, i32) {
     (best_tid, best_score)
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn log_injection_thread_candidate(pid: i32, tid: i32) {
     let comm = std::fs::read_to_string(format!("/proc/{}/task/{}/comm", pid, tid))
         .unwrap_or_default()
@@ -907,6 +917,7 @@ fn log_injection_thread_candidate(pid: i32, tid: i32) {
     log_verbose!("注入线程候选: tid={} comm={} wchan={}", tid, comm, wchan);
 }
 
+#[cfg(not(feature = "noptrace"))]
 pub(crate) fn choose_java_eval_thread(pid: i32) -> i32 {
     let task_dir = format!("/proc/{}/task", pid);
     let mut best_tid = pid;
@@ -1004,6 +1015,7 @@ pub(crate) fn choose_java_eval_thread(pid: i32) -> i32 {
     best_tid
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn is_risky_injection_thread(comm: &str) -> bool {
     const RISKY_NAMES: &[&str] = &[
         "Runtime worker",
@@ -1240,10 +1252,12 @@ fn is_system_resolver_module(path: &str) -> bool {
         || path.starts_with("/vendor/")
 }
 
+#[cfg(not(feature = "noptrace"))]
 struct OwnedFd {
     fd: RawFd,
 }
 
+#[cfg(not(feature = "noptrace"))]
 impl OwnedFd {
     fn new(fd: RawFd) -> Self {
         Self { fd }
@@ -1260,6 +1274,7 @@ impl OwnedFd {
     }
 }
 
+#[cfg(not(feature = "noptrace"))]
 impl Drop for OwnedFd {
     fn drop(&mut self) {
         if self.fd >= 0 {
@@ -1269,11 +1284,13 @@ impl Drop for OwnedFd {
     }
 }
 
+#[cfg(not(feature = "noptrace"))]
 struct CgroupThawGuard {
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
+#[cfg(not(feature = "noptrace"))]
 impl CgroupThawGuard {
     fn start(pid: i32) -> Self {
         crate::process::thaw_cgroup_freezer(pid);
@@ -1292,6 +1309,7 @@ impl CgroupThawGuard {
     }
 }
 
+#[cfg(not(feature = "noptrace"))]
 impl Drop for CgroupThawGuard {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
@@ -1301,10 +1319,12 @@ impl Drop for CgroupThawGuard {
     }
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn read_trimmed(path: String) -> String {
     std::fs::read_to_string(path).unwrap_or_default().trim().to_string()
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn cgroup_freezer_state(pid: i32) -> String {
     let cgroup_path = format!("/proc/{}/cgroup", pid);
     let content = match std::fs::read_to_string(&cgroup_path) {
@@ -1327,6 +1347,7 @@ fn cgroup_freezer_state(pid: i32) -> String {
     "none".to_string()
 }
 
+#[cfg(not(feature = "noptrace"))]
 fn loader_thread_diagnostics(pid: i32, tid: i32) -> String {
     let status = std::fs::read_to_string(format!("/proc/{}/task/{}/status", pid, tid)).unwrap_or_default();
     let state = status
@@ -1393,6 +1414,7 @@ fn poll_loader_fd(sockfd: RawFd, events: libc::c_short, deadline: Instant, conte
 }
 
 /// Unix socket fd-passing: 通过 SCM_RIGHTS 发送 fd
+#[cfg(not(feature = "noptrace"))]
 fn send_fd_timeout(sockfd: RawFd, fd_to_send: RawFd, deadline: Instant, context: &str) -> Result<(), String> {
     use std::io::IoSlice;
 
@@ -1749,7 +1771,7 @@ fn run_loader_handshake(
 /// The zymbiote child passes its existing hello socket to the in-process loader.
 /// Host does not extract or pass target fds here: agent.so is streamed on this
 /// socket and the loader reuses the same socket as the agent command channel.
-pub(crate) fn run_loader_handshake_pure(ctrl_fd: RawFd, target_pid: i32) -> Result<InjectionResult, String> {
+pub(crate) fn run_loader_handshake_pure(ctrl_fd: RawFd, _target_pid: i32) -> Result<InjectionResult, String> {
     let mut msg_type = [0u8; 1];
     recv_exact(ctrl_fd, &mut msg_type)?;
     if msg_type[0] != message_type::HELLO {
@@ -1816,13 +1838,19 @@ pub(crate) fn run_loader_handshake_pure(ctrl_fd: RawFd, target_pid: i32) -> Resu
 
     Ok(InjectionResult {
         host_fd: ctrl_fd,
-        target_pid,
+        #[cfg(not(feature = "noptrace"))]
+        target_pid: _target_pid,
         loader_ctx_addr: 0,
         agent_current_thread_eval_impl: 0,
+        #[cfg(not(feature = "noptrace"))]
         loader_alloc_base: 0,
+        #[cfg(not(feature = "noptrace"))]
         loader_alloc_size: 0,
+        #[cfg(not(feature = "noptrace"))]
         loader_stack: 0,
+        #[cfg(not(feature = "noptrace"))]
         loader_stack_size: 0,
+        #[cfg(not(feature = "noptrace"))]
         libc_munmap: 0,
     })
 }

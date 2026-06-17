@@ -6,6 +6,7 @@ pub(crate) fn get_string_table_names() -> Vec<&'static str> {
 }
 
 /// 用户空间寄存器结构体
+#[cfg(not(feature = "noptrace"))]
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct UserRegs {
@@ -17,6 +18,7 @@ pub(crate) struct UserRegs {
 
 /// ARM64 FP/SIMD 寄存器结构体 (NT_FPREGSET / NT_PRFPREG)
 /// 对应 Linux struct user_fpsimd_state (asm/ptrace.h)
+#[cfg(not(feature = "noptrace"))]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct UserFpRegs {
@@ -25,6 +27,7 @@ pub(crate) struct UserFpRegs {
     pub(crate) fpcr: u32,         // 浮点控制寄存器
 }
 
+#[cfg(not(feature = "noptrace"))]
 impl Default for UserFpRegs {
     fn default() -> Self {
         // 不能用 derive(Default) 因为 [u128; 32] 没有 Default
@@ -64,6 +67,7 @@ pub(crate) mod message_type {
 
 /// FridaBootstrapContext — bootstrapper 的输入/输出参数
 /// 对应 inject-context.h 中的 struct _FridaBootstrapContext
+#[cfg(not(feature = "noptrace"))]
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FridaBootstrapContext {
@@ -82,6 +86,7 @@ pub(crate) struct FridaBootstrapContext {
     pub(crate) libc: u64, // FridaLibcApi *
 }
 
+#[cfg(not(feature = "noptrace"))]
 impl Default for FridaBootstrapContext {
     fn default() -> Self {
         unsafe { std::mem::zeroed() }

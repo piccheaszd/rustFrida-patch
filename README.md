@@ -24,7 +24,7 @@ git submodule update --init --recursive
 - 默认构建：带 ptrace backend，支持 PID/name attach、`--watch-so`、server、trace、普通 spawn 和 pure spawn。
 - `noptrace` 构建：编译期移除 ptrace 注入/远程调用/trace 后端，只保留属性命令和 `--spawn --spawn-pure` 自加载路径；pure spawn 使用单独的精简 zymbiote stage-0。
 
-最终产物 `rustfrida` 通过 `include_bytes!` 内嵌 loader blob 和 agent SO。agent 与 host 的 feature 必须匹配，`rust_frida/build.rs` 会检查 `libagent.features` 以及按构建类型保存的 `libagent.ptrace.features` / `libagent.noptrace.features`，发现 stale 或 `noptrace` 不一致时直接报错并给出需要重跑的 `cargo build -p agent ...` 命令。
+最终产物 `rustfrida` 通过 `include_bytes!` 内嵌 loader blob 和 agent SO。`rust_frida/build.rs` 会在 Android arm64 构建时自动重建缺失或过期的 loader blob；agent 与 host 的 feature 必须匹配，build script 会检查 `libagent.features` 以及按构建类型保存的 `libagent.ptrace.features` / `libagent.noptrace.features`，发现 stale 或 `noptrace` 不一致时直接报错并给出需要重跑的 `cargo build -p agent ...` 命令。
 
 ```
 loader shellcode  ──┐
@@ -32,7 +32,7 @@ loader shellcode  ──┐
 agent (libagent.so) ┘
 ```
 
-### 1. 构建 loader blob（bootstrapper + rustfrida-loader）
+### 1. 构建/更新 loader blob（bootstrapper + rustfrida-loader）
 
 ```bash
 python3 loader/build_helpers.py
@@ -41,7 +41,7 @@ python3 loader/build_helpers.py
 #   loader/build/rustfrida-loader.bin
 ```
 
-loader 是 ARM64 shellcode，被 `rustfrida` 通过 `include_bytes!` 嵌入。修改 `loader/` 下 C 代码后需要重新生成；当前 `rust_frida/build.rs` 只校验 blob 是否存在且新于输入文件，缺失或过期时会报错提示手动运行 `python3 loader/build_helpers.py`，不会自动生成。
+loader 是 ARM64 shellcode，被 `rustfrida` 通过 `include_bytes!` 嵌入。修改 `loader/` 下 C 代码后需要重新生成；通常不需要手动执行上面的命令，`rust_frida/build.rs` 会在 `aarch64-linux-android` 构建中发现 blob 缺失或过期时自动运行 `python3 loader/build_helpers.py`。手动命令仍可用于单独验证 loader helper 构建是否正常。
 
 ### 2. 默认 ptrace 构建
 
@@ -78,15 +78,30 @@ cargo build -p rust_frida --release --no-default-features --features noptrace
 cp target/aarch64-linux-android/release/rustfrida target/aarch64-linux-android/release/rustfrida-noptrace
 ```
 
+### 4. 一键验证构建矩阵
+
+本仓库提供本地验证脚本，固定执行 ptrace/noptrace 两套 agent + host 检查，并在结束前恢复默认 ptrace agent 变体，避免后续默认构建误用 `noptrace` marker：
+
+```bash
+tools/verify-build-matrix.sh
+PROFILE=release tools/verify-build-matrix.sh
+```
+
+脚本会执行 `cargo fmt --all --check`、`./zymbiote/build.sh`、默认 agent build + `rust_frida` check、`noptrace` agent build + `rust_frida` check，最后再跑一轮默认 agent build + `rust_frida` check。
+
 ### 当前实现状态
 
-本分支已合入 upstream `v0.0.4` 的 PID attach 稳定性修复，并新增 `--spawn-pure` / `noptrace` pure spawn 路径。相关点需要一起理解：
+本分支已合入 upstream `v0.0.5` 更新，并保留本地 `--spawn-pure` / `noptrace` pure spawn 路径。相关点需要一起理解：
 
 - PID 注入会优先选择更适合远程调用的工作线程，并在 bootstrap/loader 执行期间短暂停止同进程其他线程，降低主线程或信号线程干扰。
 - host 侧通过 `/proc/<pid>/mem` 批量读写上下文，减少 ptrace word-write 的不稳定窗口。
 - agent memfd 会按 ELF LOAD 段的 `p_memsz` 进行 padding，loader 将完整段映射为文件支撑 VMA，避免单独匿名 BSS 尾段。
 - 自解析 linker 只索引必要平台模块，并继续使用本分支传入的 resolver host module bases，避免在加固 app 中扫描所有 app `.so`。
 - 当前 loader 同时兼容 `DEBUG`/`LOG` 诊断消息；协议值保持一致，避免破坏旧 host/loader 握手。
+- 上游 Java worker / callback executor 已合入，Java/Managed DSL 的 pre-resume 脚本会优先走 raw-clone Java worker，恢复后按需启动 post-resume worker，减少主线程 remote eval 依赖。
+- 上游 ART dex resolver、managed install 和 Java array/exception 处理更新已合入，用于增强新版 ART 上的 managed hook 稳定性。
+- 上游 loader resolver seeding、libc/linker base 传递、maps fallback 和远端 loader mapping cleanup 已合入；ptrace 构建退出时会尝试清理 loader stack/mapping 残留。
+- 上游 passive `setArgV0` 与 spawn-only 诊断路径已合入，便于区分 zygote patch、child resume、agent 注入三类问题。
 - `--spawn-pure` 是 no-ptrace 子进程路径：`noptrace` 构建嵌入独立的 pure-only zymbiote stage-0，只负责阻塞子进程、接收 stage-1 loader 并跳转；loader 在 App 子进程内自链接 agent。
 - pure-only zymbiote stage-0 不内置 ELF linker、QuickJS、hook engine、属性 remap 或 capset mount hook；当前 executable payload 约 2.3KB，小于一页但仍会覆盖真实 `libstagefright.so` 尾页代码。
 - `noptrace` 构建只扫描和 patch `zygote64`，不再处理 32-bit zygote / usap；因此只支持 arm64 目标 App。
@@ -245,6 +260,26 @@ adb shell su -c 'chmod 755 /data/local/tmp/rf-noptrace'
 ```
 
 `noptrace` 构建不包含 `--pid`、`--name`、`--watch-so`、`--server`、`--profile`、trace 命令和 process remote-call 后端。当前 pure-only stage-0 不包含属性 profile 注入 hook；`--dump-props` / `--set-prop` / `--del-prop` / `--repack-props` 只能编辑 profile，不能自动应用到 pure spawn。需要自动应用 profile 时使用默认 ptrace 版。
+
+### Spawn / Zymbiote 诊断开关
+
+这些开关用于拆分 zygote patch、生进程恢复和 agent 注入问题。诊断命令仍会修改 zygote 进程，设备侧执行前确认处于授权测试环境。
+
+```bash
+# 只 patch zygote、启动目标并恢复 child，不注入 agent；用于确认 zymbiote 拦截和 child resume 是否正常
+RF_DIAG_SPAWN_ONLY=1 RF_DIAG_HOLD_SECS=20 ./rf --spawn com.example.app
+
+# 只走 passive setArgV0 launch 路径，不安装 setcontext 拦截；用于定位 setcontext hook 是否引入不稳定
+RF_DIAG_ZYM_PASSIVE_SETARGV0=1 RF_DIAG_HOLD_SECS=20 ./rf --spawn com.example.app
+
+# 普通 spawn/pure spawn 中禁用 setcontext patch，只保留 setArgV0 侧路径
+RF_DIAG_ZYM_NO_SETCONTEXT=1 ./rf --spawn com.example.app -l early.js
+
+# 普通 spawn/pure spawn 中禁用 setArgV0 patch，只保留 setcontext 侧路径
+RF_DIAG_ZYM_NO_SETARGV0=1 ./rf --spawn com.example.app -l early.js
+```
+
+`RF_DIAG_ZYM_NO_SETCONTEXT` 和 `RF_DIAG_ZYM_NO_SETARGV0` 不能同时启用；`RF_DIAG_ZYM_PASSIVE_SETARGV0` 与 `RF_DIAG_ZYM_NO_SETARGV0` 也互斥。`RF_DIAG_HOLD_SECS` 只影响 spawn-only/passive 诊断命令保持目标进程存活检查的时间，默认 20 秒。
 
 ### no-ptrace 验证
 
