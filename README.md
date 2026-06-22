@@ -100,7 +100,7 @@ PROFILE=release tools/verify-build-matrix.sh
 - 当前 loader 同时兼容 `DEBUG`/`LOG` 诊断消息；协议值保持一致，避免破坏旧 host/loader 握手。
 - 上游 Java worker / callback executor 已合入，Java/Managed DSL 的 pre-resume 脚本会优先走 raw-clone Java worker，恢复后按需启动 post-resume worker，减少主线程 remote eval 依赖。
 - 上游 ART dex resolver、managed install 和 Java array/exception 处理更新已合入，用于增强新版 ART 上的 managed hook 稳定性。
-- 上游 loader resolver seeding、libc/linker base 传递、maps fallback 和远端 loader mapping cleanup 已合入；ptrace 构建退出时会尝试清理 loader stack/mapping 残留。
+- 上游 loader resolver seeding、libc/linker base 传递、maps fallback 和远端 loader mapping cleanup 已合入；远端 loader stack/mapping 残留清理默认跳过，避免在已恢复运行的目标线程里额外 remote-call `munmap`。确实需要清理时显式设置 `RF_CLEANUP_REMOTE_LOADER=1`。
 - 上游 passive `setArgV0` 与 spawn-only 诊断路径已合入，便于区分 zygote patch、child resume、agent 注入三类问题。
 - `--spawn-pure` 是 no-ptrace 子进程路径：`noptrace` 构建嵌入独立的 pure-only zymbiote stage-0，只负责阻塞子进程、接收 stage-1 loader 并跳转；loader 在 App 子进程内自链接 agent。
 - pure-only zymbiote stage-0 不内置 ELF linker、QuickJS、hook engine、属性 remap 或 capset mount hook；当前 executable payload 约 2.3KB，小于一页但仍会覆盖真实 `libstagefright.so` 尾页代码。
@@ -113,6 +113,8 @@ PROFILE=release tools/verify-build-matrix.sh
 - `--spawn-early` 可强制无脚本时也走 early spawn；这是诊断/特殊场景用法，稳定性弱于 late。
 - `--spawn-late` 可强制带 `-l` 时也走 late spawn，脚本会在冷启动后加载，适合优先保证 REPL/脚本运行稳定的场景。
 - `Memory.write*` / `writeBytes` 现在要求写入范围完整落在可写 VMA 中，跨页或只读页会返回 JS 错误，避免直接 SIGSEGV 打断 agent 连接。
+- `Hook.RECOMP` 已覆盖 `hook()` / `Interceptor.replace()` / `Interceptor.attach()` 路径；`attach` 的 `onLeave` 会保留 `d0/d1`，避免 double/float 返回值被 leave 回调破坏。
+- `Hook.RECOMP` 的 JS 回调会避开同线程 QuickJS 重入：脚本自身通过 `NativeFunction` 调用已 attach 的目标函数时，回调会被跳过以避免死锁；目标 App 线程后续命中同一函数仍会进入 `onEnter` / `onLeave`。
 
 合并后验证过的 smoke：
 
@@ -126,6 +128,81 @@ printf 'jseval 1+1\nexit\n' | adb shell su -c '/data/local/tmp/rf --spawn com.co
 ```
 
 预期结果是 agent 连接成功，`jsinit` 返回 `=> initialized`，`jseval 1+1` 返回 `=> 2`，退出时 zygote patch 和 QuickJS cleanup 正常完成。
+
+### Hook.RECOMP / recompile.kpm
+
+`Hook.RECOMP` 依赖内核侧 `recompile.kpm`。在 KPatch-Next 环境下，推荐把验证过的 KPM 放到持久目录：
+
+```bash
+adb push recompile.kpm /data/local/tmp/recompile.kpm
+adb shell su -c 'cp -a /data/adb/kp-next/kpm/recompile.kpm /data/adb/kp-next/kpm/recompile.kpm.bak 2>/dev/null || true'
+adb shell su -c 'cp -f /data/local/tmp/recompile.kpm /data/adb/kp-next/kpm/recompile.kpm && chmod 600 /data/adb/kp-next/kpm/recompile.kpm'
+adb shell su -c '/data/adb/modules/KPatch-Next/bin/kpatch kpm unload recompile; /data/adb/modules/KPatch-Next/bin/kpatch kpm load /data/adb/kp-next/kpm/recompile.kpm'
+```
+
+加载成功后，`dmesg | grep -i recompile` 应该看到：
+
+```text
+recompile: export hooks setup_sigframe=...
+recompile: module loaded
+```
+
+如果出现 `setup_sigframe and do_signal both not found, signal PC export unprotected`，说明当前内核没有被 KPM 识别到可用的 signal PC export hook；这类内核上需要使用适配后的 `recompile.kpm`，不能只依赖原始 release 版本。
+
+在 Android 14 / 6.1 内核上还要注意 instruction abort 路径：仅把 `setup_sigframe` 适配到 `setup_rt_frame` 只能修复 signal PC export；如果执行被 hook 函数时卡在原始代码页，KPM 还需要覆盖实际的 instruction abort 入口（该设备上验证为 `do_mem_abort`）。验证成功时，dmesg 会出现成对的映射记录：
+
+```text
+recompile: registered mapping: <orig> -> <recomp>
+recompile: released mapping: <orig>
+```
+
+最小 RECOMP smoke 脚本：
+
+```js
+console.log("[recomp-smoke-libm] start");
+
+var atan2Ptr = Module.findExportByName("libm.so", "atan2");
+console.log("[recomp-smoke-libm] atan2=" + atan2Ptr);
+
+var hits = 0;
+Interceptor.attach(atan2Ptr, {
+  onEnter: function () {
+    hits++;
+    if (hits <= 3) {
+      console.log("[recomp-smoke-libm] enter atan2 hit=" + hits + " pc=" + this.pc);
+    }
+  },
+  onLeave: function (retval) {
+    if (hits <= 3) {
+      console.log("[recomp-smoke-libm] leave atan2 ret=" + retval);
+    }
+  }
+}, Hook.RECOMP);
+
+var atan2 = new NativeFunction(atan2Ptr, "double", ["double", "double"]);
+for (var i = 0; i < 3; i++) {
+  console.log("[recomp-smoke-libm] call atan2 -> " + atan2(1.0 + i, 2.0));
+}
+
+console.log("[recomp-smoke-libm] done hits=" + hits);
+```
+
+已在 Android 14 arm64 设备上用 `com.paic.mo.client` 的 spawn early 路径验证：
+
+```bash
+adb shell su -c 'RF_STOP_WORLD=1 RF_REMOTE_CALL_TIMEOUT_MS=7000 /data/local/tmp/rf --spawn com.paic.mo.client --spawn-early --verbose --connect-timeout 25 --quickjs-profile full -l /data/local/tmp/recomp_smoke_libm.js'
+```
+
+预期成功标记：
+
+```text
+Loader: agent 加载成功
+Agent 已连接
+[recompiler] prctl 注册成功
+[recomp-smoke-libm] call atan2 -> 0.4636476090008061
+[recomp-smoke-libm] call atan2 -> 0.7853981633974483
+[recomp-smoke-libm] call atan2 -> 0.982793723247329
+```
 
 `noptrace` pure spawn smoke：
 
@@ -920,6 +997,12 @@ hook(target, callback, true)            // true = WXSHADOW
 ```
 
 `--spawn-pure` 本身不依赖 WXSHADOW；WXSHADOW 是 agent 侧安装 native hook 时的 stealth patch 模式。设备内核需要支持对应 shadow 页能力，严格 stealth 场景下失败会直接返回错误，避免静默退回普通 mprotect 直写。
+
+`Hook.WXSHADOW` 和 `Hook.RECOMP` 是按 hook 选择的两种 stealth backend，可以在同一进程里混用；不要在同一个目标地址上重复安装不同 backend。WXSHADOW 仍受同页多 hook 限制，遇到同 4KB 页多个目标时优先拆分测试或改用 RECOMP。
+
+`Hook.RECOMP` 需要内核侧 `recompile.kpm` 已加载并能处理当前内核的 signal PC export 与 instruction abort 路径。若 KPM 未加载、符号不匹配或 dmesg 出现 signal PC export 未保护警告，RECOMP 可能只能注册映射但无法可靠重定向执行，应先修正 KPM 再测试业务 hook。
+
+`Interceptor.attach(..., Hook.RECOMP)` 的同线程 `NativeFunction` 自测命中会跳过 JS 回调以避免 QuickJS 重入；这时 `hits=0` 但返回值正确是正常现象。恢复目标进程后，由目标 App 线程触发同一函数仍会进入 `onEnter` / `onLeave`。
 
 ### API 速查
 
