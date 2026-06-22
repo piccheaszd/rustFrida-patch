@@ -12,16 +12,7 @@ fn main() -> anyhow::Result<()> {
     println!("cargo:rustc-cdylib-link-arg=-Wl,-u,nanosleep,--export-dynamic-symbol=nanosleep");
     println!("cargo:rustc-cdylib-link-arg=-Wl,-u,rustfrida_probe_entry,--export-dynamic-symbol=rustfrida_probe_entry");
 
-    let target = std::env::var("TARGET")?;
-    let profile = std::env::var("PROFILE")?;
-    let manifest_dir = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
-    let workspace_root = manifest_dir.parent().expect("agent must be inside workspace root");
-    let profile_dir = if profile == "release" { "release" } else { "debug" };
-    let marker = workspace_root
-        .join("target")
-        .join(target)
-        .join(profile_dir)
-        .join("libagent.features");
+    let marker = current_target_profile_dir()?.join("libagent.features");
     if let Some(parent) = marker.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -29,4 +20,14 @@ fn main() -> anyhow::Result<()> {
     std::fs::write(marker, format!("noptrace={}\n", if noptrace { "1" } else { "0" }))?;
 
     Ok(())
+}
+
+fn current_target_profile_dir() -> anyhow::Result<std::path::PathBuf> {
+    let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
+    out_dir
+        .parent()
+        .and_then(std::path::Path::parent)
+        .and_then(std::path::Path::parent)
+        .map(std::path::Path::to_path_buf)
+        .ok_or_else(|| anyhow::anyhow!("无法从 OUT_DIR 推导 target profile 目录: {}", out_dir.display()))
 }

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
 """
 build_helpers.py — Compile Frida-style bootstrapper + loader into binary shellcode.
 

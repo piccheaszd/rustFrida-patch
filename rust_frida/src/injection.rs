@@ -11,7 +11,11 @@ use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::Pid;
 #[cfg(not(feature = "noptrace"))]
 use std::mem::size_of;
+#[cfg(not(feature = "noptrace"))]
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::os::unix::io::RawFd;
+#[cfg(not(feature = "noptrace"))]
+use std::os::unix::net::UnixListener;
 #[cfg(not(feature = "noptrace"))]
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -1285,6 +1289,90 @@ impl Drop for OwnedFd {
 }
 
 #[cfg(not(feature = "noptrace"))]
+struct LoaderFallbackListener {
+    listener: UnixListener,
+    name: String,
+}
+
+#[cfg(not(feature = "noptrace"))]
+impl LoaderFallbackListener {
+    fn bind_for_pid(pid: i32) -> Result<Self, String> {
+        let name = format!("rustfrida-{}", pid);
+        let (addr, addrlen) = socket_addr_abstract(&name)?;
+
+        let socket_fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        if socket_fd < 0 {
+            return Err(format!(
+                "创建 loader fallback socket 失败: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        let ret = unsafe {
+            libc::bind(
+                socket_fd,
+                &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+                addrlen,
+            )
+        };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            unsafe { libc::close(socket_fd) };
+            return Err(format!("bind loader fallback socket 失败: {}", err));
+        }
+
+        let ret = unsafe { libc::listen(socket_fd, 1) };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            unsafe { libc::close(socket_fd) };
+            return Err(format!("listen loader fallback socket 失败: {}", err));
+        }
+
+        let listener = unsafe { UnixListener::from_raw_fd(socket_fd) };
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| format!("设置 loader fallback socket 非阻塞失败: {}", e))?;
+
+        Ok(Self { listener, name })
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn accept_until(&self, deadline: Instant, context: &str) -> Result<OwnedFd, String> {
+        loop {
+            match self.listener.accept() {
+                Ok((stream, _)) => return Ok(OwnedFd::new(stream.into_raw_fd())),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    poll_loader_fd(self.listener.as_raw_fd(), libc::POLLIN, deadline, context)?;
+                }
+                Err(e) => return Err(format!("{}: accept 失败: {}", context, e)),
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "noptrace"))]
+fn socket_addr_abstract(name: &str) -> Result<(libc::sockaddr_un, u32), String> {
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as u16;
+
+    let name_bytes = name.as_bytes();
+    if name_bytes.len() + 1 > addr.sun_path.len() {
+        return Err("loader fallback socket 名称过长".to_string());
+    }
+
+    addr.sun_path[0] = 0;
+    for (i, &b) in name_bytes.iter().enumerate() {
+        addr.sun_path[i + 1] = b;
+    }
+
+    let addrlen = std::mem::offset_of!(libc::sockaddr_un, sun_path) + 1 + name_bytes.len();
+    Ok((addr, addrlen as u32))
+}
+
+#[cfg(not(feature = "noptrace"))]
 struct CgroupThawGuard {
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -1372,6 +1460,18 @@ fn loader_thread_diagnostics(pid: i32, tid: i32) -> String {
         tracer,
         cgroup_freezer_state(pid)
     )
+}
+
+#[cfg(not(feature = "noptrace"))]
+fn loader_hello_diagnostics(pid: i32, loader_ctx_addr: usize) -> String {
+    match read_loader_runtime_context(pid, loader_ctx_addr) {
+        Ok(ctx) if ctx.worker != 0 => loader_thread_diagnostics(pid, ctx.worker as i32),
+        Ok(ctx) => format!(
+            "loader_diag: worker=0 loader_stack=0x{:x} loader_stack_size={}",
+            ctx.loader_stack, ctx.loader_stack_size
+        ),
+        Err(e) => format!("loader_diag: runtime_ctx_unavailable ({})", e),
+    }
 }
 
 fn loader_timeout_left(deadline: Instant, context: &str) -> Result<Duration, String> {
@@ -1626,13 +1726,45 @@ fn run_loader_handshake(
     loader_alloc_base: usize,
     loader_alloc_size: usize,
     libc_munmap: u64,
+    fallback_listener: Option<&LoaderFallbackListener>,
 ) -> Result<InjectionResult, String> {
     let deadline = Instant::now() + LOADER_HANDSHAKE_TIMEOUT;
     let _thaw_guard = CgroupThawGuard::start(target_pid);
+    let mut ctrl_fd = ctrl_fd;
 
     // 1. 接收 HELLO 消息: [type:u8][thread_id:i32]
     let mut msg_type = [0u8; 1];
-    recv_exact_timeout(ctrl_fd, &mut msg_type, deadline, "等待 loader HELLO")?;
+    if let Err(primary_err) = recv_exact_timeout(ctrl_fd, &mut msg_type, deadline, "等待 loader HELLO") {
+        if let Some(listener) = fallback_listener {
+            log_warn!(
+                "{}; 尝试 loader fallback abstract socket {}",
+                primary_err,
+                listener.name()
+            );
+            match listener.accept_until(deadline, "等待 loader fallback 连接") {
+                Ok(fallback_fd) => {
+                    unsafe { close(ctrl_fd) };
+                    ctrl_fd = fallback_fd.into_raw();
+                    recv_exact_timeout(ctrl_fd, &mut msg_type, deadline, "等待 loader HELLO(fallback)")
+                        .map_err(|e| format!("{}; {}", e, loader_hello_diagnostics(target_pid, loader_ctx_addr)))?;
+                }
+                Err(fallback_err) => {
+                    return Err(format!(
+                        "{}; {}; {}",
+                        primary_err,
+                        fallback_err,
+                        loader_hello_diagnostics(target_pid, loader_ctx_addr)
+                    ));
+                }
+            }
+        } else {
+            return Err(format!(
+                "{}; {}",
+                primary_err,
+                loader_hello_diagnostics(target_pid, loader_ctx_addr)
+            ));
+        }
+    }
     if msg_type[0] != message_type::HELLO {
         return Err(format!("期望 HELLO({}), 收到 {}", message_type::HELLO, msg_type[0]));
     }
@@ -2058,6 +2190,8 @@ fn inject_via_bootstrapper_once(
         bootstrap_ctx.ctrlfds[0],
         host_ctrl_fd
     );
+    let fallback_listener = LoaderFallbackListener::bind_for_pid(pid)?;
+    log_verbose!("loader fallback socket: {}", fallback_listener.name());
 
     // === 写入 StringTable ===
     let string_table_offset = size_of::<FridaLibcApi>()
@@ -2098,7 +2232,7 @@ fn inject_via_bootstrapper_once(
     let entrypoint_str = build_agent_entrypoint()?;
     let current_thread_eval_str = b"rustfrida_loadjs_current_thread\0";
     let data_str = build_loader_agent_data()?;
-    let fallback_str = format!("\x00rustfrida-{}\0", pid); // abstract socket: \0 prefix
+    let fallback_str = format!("{}\0", fallback_listener.name());
     mem.pwrite_all(&entrypoint_str, str_base as u64)?;
     let current_thread_eval_str_addr = str_base + entrypoint_str.len();
     mem.pwrite_all(current_thread_eval_str, current_thread_eval_str_addr as u64)?;
@@ -2209,6 +2343,7 @@ fn inject_via_bootstrapper_once(
         alloc_base,
         total_alloc,
         libc_api.munmap_fn,
+        Some(&fallback_listener),
     ) {
         Ok(result) => result,
         Err(e) => {

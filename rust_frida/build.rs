@@ -28,7 +28,8 @@ fn main() {
     let loader_bootstrapper = workspace_root.join("loader").join("build").join("bootstrapper.bin");
     let loader_blob = workspace_root.join("loader").join("build").join("rustfrida-loader.bin");
     if target == "aarch64-linux-android" && helpers_are_stale(workspace_root) {
-        let status = std::process::Command::new("python3")
+        let status = std::process::Command::new("uv")
+            .args(["run", "--python", "3"])
             .arg(workspace_root.join("loader/build_helpers.py"))
             .current_dir(workspace_root)
             .status()
@@ -37,8 +38,8 @@ fn main() {
             panic!("loader/build_helpers.py failed with status {}", status);
         }
     }
-    ensure_generated_blob(&loader_bootstrapper, "python3 loader/build_helpers.py");
-    ensure_generated_blob(&loader_blob, "python3 loader/build_helpers.py");
+    ensure_generated_blob(&loader_bootstrapper, "uv run --python 3 loader/build_helpers.py");
+    ensure_generated_blob(&loader_blob, "uv run --python 3 loader/build_helpers.py");
 
     let zymbiote_sources = [
         "zymbiote/build.sh",
@@ -53,7 +54,7 @@ fn main() {
     println!("cargo:rerun-if-changed=../zymbiote/build/zymbiote-pure.elf");
     println!("cargo:rerun-if-changed=../zymbiote/build/zymbiote-restore.elf");
 
-    let target_profile_dir = workspace_root.join("target").join(&target).join(profile_dir);
+    let target_profile_dir = current_target_profile_dir();
     let built_agent_so = target_profile_dir.join("libagent.so");
     let built_agent_feature_marker = target_profile_dir.join("libagent.features");
     let agent_variant = if noptrace { "noptrace" } else { "ptrace" };
@@ -111,14 +112,20 @@ fn main() {
     println!("cargo:rustc-env=AGENT_SO_PATH={}", agent_so.display());
 
     if std::env::var_os("CARGO_FEATURE_QBDI").is_some() {
-        let helper_path = workspace_root
-            .join("target")
-            .join(&target)
-            .join(profile_dir)
-            .join("libqbdi_helper.so");
+        let helper_path = target_profile_dir.join("libqbdi_helper.so");
         println!("cargo:rustc-env=QBDI_HELPER_SO_PATH={}", helper_path.display());
         println!("cargo:rerun-if-changed={}", helper_path.display());
     }
+}
+
+fn current_target_profile_dir() -> PathBuf {
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set"));
+    out_dir
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| panic!("无法从 OUT_DIR 推导 target profile 目录: {}", out_dir.display()))
 }
 
 fn ensure_generated_blob(blob: &Path, command: &str) {
