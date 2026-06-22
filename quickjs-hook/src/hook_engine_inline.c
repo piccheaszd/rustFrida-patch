@@ -249,6 +249,7 @@ void* generate_attach_thunk(HookEntry* entry, HookCallback on_enter,
 
     /* Save return value (x0) back to context */
     arm64_writer_put_str_reg_reg_offset(&w, ARM64_REG_X0, ARM64_REG_SP, 0);
+    arm64_writer_put_fp_stp_offset(&w, 0, 1, ARM64_REG_SP, 280);
 
     /* Call on_leave callback if set */
     if (on_leave) {
@@ -257,6 +258,7 @@ void* generate_attach_thunk(HookEntry* entry, HookCallback on_enter,
 
     /* Restore x0 (return value, possibly modified by on_leave) */
     arm64_writer_put_ldr_reg_reg_offset(&w, ARM64_REG_X0, ARM64_REG_SP, 0);
+    arm64_writer_put_fp_ldp_offset(&w, 0, 1, ARM64_REG_SP, 280);
 
     /* Restore x30 (LR) */
     arm64_writer_put_ldr_reg_reg_offset(&w, ARM64_REG_X30, ARM64_REG_SP, 240);

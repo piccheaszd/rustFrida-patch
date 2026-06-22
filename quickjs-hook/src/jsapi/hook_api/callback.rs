@@ -433,6 +433,9 @@ pub(crate) unsafe extern "C" fn attach_on_enter_wrapper(
     if ctx_ptr.is_null() || user_data.is_null() {
         return;
     }
+    if native_callback_would_reenter_js_engine() {
+        return;
+    }
     let _in_flight_guard = InFlightNativeHookGuard::enter();
 
     let target_addr = user_data as u64;
@@ -497,6 +500,9 @@ pub(crate) unsafe extern "C" fn attach_on_leave_wrapper(
     user_data: *mut std::ffi::c_void,
 ) {
     if ctx_ptr.is_null() || user_data.is_null() {
+        return;
+    }
+    if native_callback_would_reenter_js_engine() {
         return;
     }
     let _in_flight_guard = InFlightNativeHookGuard::enter();
