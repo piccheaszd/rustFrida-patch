@@ -293,7 +293,11 @@ pub fn init() -> Result<(), String> {
     }
 
     quickjs_hook::recomp::set_cleanup_release_only(false);
-    init_hook_runtime()?;
+    if quickjs_hook::api_profile_name() == "minimal" {
+        log_msg("[quickjs] hook runtime deferred by minimal profile\n".to_string());
+    } else {
+        init_hook_runtime()?;
+    }
 
     if let Some(output_path) = crate::OUTPUT_PATH.get() {
         set_qbdi_output_dir(output_path.clone());

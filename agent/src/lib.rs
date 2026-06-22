@@ -305,22 +305,11 @@ pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
         (args.ctrl_fd, args.table)
     };
 
-    #[cfg(feature = "quickjs")]
-    let native_early_hook_result = quickjs_loader::init_hook_runtime();
-    #[cfg(not(feature = "quickjs"))]
-    let native_early_hook_result: Result<()> = Ok(());
-
-    // Send HELLO before any Rust stream setup so entry-stage failures are visible to the host.
+    // Send HELLO before any QuickJS or hook-runtime setup.  Hardened targets may
+    // terminate the process during early mmap/maps/proc work, and the host must
+    // still learn that the agent entrypoint was reached.
     let _ = send_hello_raw_fd(ctrl_fd);
-    match native_early_hook_result {
-        Ok(()) => trace_entry_raw(ctrl_fd, b"[agent-trace] 00 native-early-hook-installed\n"),
-        Err(ref e) => {
-            let _ = write_log_raw_fd(
-                ctrl_fd,
-                format!("[agent] native early hook init failed: {}\n", e).as_bytes(),
-            );
-        }
-    }
+    trace_entry_raw(ctrl_fd, b"[agent-trace] 00 hello-sent\n");
     trace_entry_raw(ctrl_fd, b"[agent-trace] 01 after-hello\n");
 
     trace_entry_raw(ctrl_fd, b"[agent-trace] 02 before-panic-hook\n");
@@ -576,9 +565,16 @@ fn cut_java_executor_hook_and_respond() {
 
 #[cfg(feature = "quickjs")]
 fn init_js_and_respond() {
+    log_msg("[quickjs] jsinit start\n".to_string());
     match quickjs_loader::init() {
-        Ok(_) => send_eval_ok("initialized"),
-        Err(e) => send_eval_err(&e),
+        Ok(_) => {
+            log_msg("[quickjs] jsinit ok\n".to_string());
+            send_eval_ok("initialized");
+        }
+        Err(e) => {
+            log_msg(format!("[quickjs] jsinit err: {}\n", e));
+            send_eval_err(&e);
+        }
     }
 }
 
@@ -664,23 +660,38 @@ fn set_java_stealth_and_respond(mode: i64) {
 }
 
 #[cfg(feature = "quickjs")]
+fn run_js_task<F>(label: &'static str, task: F)
+where
+    F: FnOnce(),
+{
+    let _raw_clone_js = quickjs_hook::mark_raw_clone_js_thread();
+    log_msg(format!("[quickjs-worker] begin task: {}\n", label));
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task)) {
+        let msg = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("unknown panic");
+        send_eval_err(&format!("[quickjs] JS worker panic: {}", msg));
+    }
+    log_msg(format!("[quickjs-worker] end task: {}\n", label));
+}
+
+#[cfg(feature = "quickjs")]
 fn dispatch_js_task<F>(label: &'static str, task: F)
 where
     F: FnOnce() + Send + 'static,
 {
     JS_TASKS_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
+    if quickjs_hook::api_profile_name() == "minimal" {
+        log_msg(format!("[quickjs-worker] inline task selected: {}\n", label));
+        run_js_task(label, task);
+        JS_TASKS_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+        return;
+    }
+
     match raw_thread::spawn_detached(b"wwb-js\0", move || {
-        let _raw_clone_js = quickjs_hook::mark_raw_clone_js_thread();
-        log_msg(format!("[quickjs-worker] begin task: {}\n", label));
-        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task)) {
-            let msg = payload
-                .downcast_ref::<&str>()
-                .copied()
-                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-                .unwrap_or("unknown panic");
-            send_eval_err(&format!("[quickjs] JS worker panic: {}", msg));
-        }
-        log_msg(format!("[quickjs-worker] end task: {}\n", label));
+        run_js_task(label, task);
         JS_TASKS_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
     }) {
         Ok(_) => {}

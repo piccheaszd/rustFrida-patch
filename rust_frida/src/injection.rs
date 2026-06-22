@@ -300,15 +300,18 @@ fn use_stream_agent_transfer() -> bool {
         {
             return true;
         }
-        log_warn!("未知 RF_AGENT_TRANSFER={}，默认使用 stream agent 传输", mode);
-        return true;
+        log_warn!("未知 RF_AGENT_TRANSFER={}，默认使用 memfd agent 传输", mode);
+        return false;
     }
 
+    if env_flag_enabled("RF_AGENT_MEMFD") {
+        return false;
+    }
     if let Ok(value) = std::env::var("RF_STREAM_AGENT") {
         return env_value_enabled(&value);
     }
 
-    !env_flag_enabled("RF_AGENT_MEMFD")
+    env_flag_enabled("RF_AGENT_STREAM")
 }
 
 #[cfg(not(feature = "noptrace"))]
@@ -2263,22 +2266,53 @@ fn inject_via_bootstrapper_once(
     // 写入 LibcApi（给 loader 用）
     mem_write_value(&mem, loader_libc_addr, &libc_api)?;
 
-    let loader_code_prot = if env_flag_enabled("RF_KEEP_LOADER_RWX") {
+    let keep_loader_rwx = env_flag_enabled("RF_KEEP_LOADER_RWX");
+    let loader_code_prot = if keep_loader_rwx {
         log_verbose!("loader code permission: keeping RWX (RF_KEEP_LOADER_RWX=1)");
         libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC
     } else {
         libc::PROT_READ | libc::PROT_EXEC
     };
-    remote_mprotect_syscall(
-        &mem,
-        trace_tid,
-        swap_addr,
-        &original_code,
-        alloc_return_trap_addr,
-        alloc_base,
-        code_pages,
-        loader_code_prot,
-    )?;
+    let loader_tail_pages = page_size.min(code_pages);
+    let loader_rx_pages = code_pages.saturating_sub(loader_tail_pages);
+    if keep_loader_rwx || loader_rx_pages == 0 {
+        remote_mprotect_syscall(
+            &mem,
+            trace_tid,
+            swap_addr,
+            &original_code,
+            alloc_return_trap_addr,
+            alloc_base,
+            code_pages,
+            loader_code_prot,
+        )?;
+    } else {
+        remote_mprotect_syscall(
+            &mem,
+            trace_tid,
+            swap_addr,
+            &original_code,
+            alloc_return_trap_addr,
+            alloc_base,
+            loader_rx_pages,
+            libc::PROT_READ | libc::PROT_EXEC,
+        )?;
+        remote_mprotect_syscall(
+            &mem,
+            trace_tid,
+            swap_addr,
+            &original_code,
+            alloc_return_trap_addr,
+            alloc_base + loader_rx_pages,
+            loader_tail_pages,
+            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+        )?;
+        log_verbose!(
+            "loader writable tail page: 0x{:x}-0x{:x} RWX",
+            alloc_base + loader_rx_pages,
+            alloc_base + loader_rx_pages + loader_tail_pages
+        );
+    }
     remote_mprotect_syscall(
         &mem,
         trace_tid,
@@ -2289,13 +2323,25 @@ fn inject_via_bootstrapper_once(
         data_size,
         libc::PROT_READ | libc::PROT_WRITE,
     )?;
-    log_verbose!(
-        "bootstrapper/loader 权限收敛: code=0x{:x}-0x{:x} RX, data=0x{:x}-0x{:x} RW",
-        alloc_base,
-        alloc_base + code_pages,
-        data_base,
-        data_base + data_size
-    );
+    if keep_loader_rwx {
+        log_verbose!(
+            "bootstrapper/loader 权限收敛: code=0x{:x}-0x{:x} RWX, data=0x{:x}-0x{:x} RW",
+            alloc_base,
+            alloc_base + code_pages,
+            data_base,
+            data_base + data_size
+        );
+    } else {
+        log_verbose!(
+            "bootstrapper/loader 权限收敛: code=0x{:x}-0x{:x} RX, tail=0x{:x}-0x{:x} RWX, data=0x{:x}-0x{:x} RW",
+            alloc_base,
+            alloc_base + loader_rx_pages,
+            alloc_base + loader_rx_pages,
+            alloc_base + code_pages,
+            data_base,
+            data_base + data_size
+        );
+    }
 
     // 调用 loader（执行 raw clone 后立即返回）
     log_verbose!("调用 loader...");

@@ -143,6 +143,15 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+#[cfg(not(feature = "noptrace"))]
+fn should_cleanup_remote_loader_mappings(spawn_mode: bool) -> bool {
+    if spawn_mode {
+        env_flag("RF_CLEANUP_REMOTE_LOADER")
+    } else {
+        !env_flag("RF_SKIP_REMOTE_LOADER_CLEANUP")
+    }
+}
+
 fn wait_process_alive(pid: i32, seconds: u64, label: &str) -> bool {
     for elapsed in 0..seconds {
         if !std::path::Path::new(&format!("/proc/{}/status", pid)).exists() {
@@ -838,7 +847,11 @@ fn main() {
     #[cfg(not(feature = "noptrace"))]
     if agent_disconnected {
         if let Some(pid) = target_pid {
-            cleanup_remote_loader_mappings(pid, &injection);
+            if should_cleanup_remote_loader_mappings(args.spawn.is_some()) {
+                cleanup_remote_loader_mappings(pid, &injection);
+            } else if args.spawn.is_some() {
+                log_verbose!("spawn 模式默认跳过远端 loader 残留清理；设置 RF_CLEANUP_REMOTE_LOADER=1 可显式启用");
+            }
         }
     }
 
