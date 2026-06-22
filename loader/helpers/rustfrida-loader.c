@@ -4,7 +4,8 @@
  * Based on Frida's loader.c (frida-core/src/linux/helpers/loader.c).
  * Runs as position-independent code in the target process after bootstrap.
  * Entry point creates a worker thread via raw clone; the worker receives the
- * agent SO as a control-socket stream by default (or a diagnostic fd fallback),
+ * agent SO either as a diagnostic control-socket stream or as an SCM_RIGHTS
+ * memfd, with the host currently defaulting to the memfd path,
  * links the agent with rustFrida's minimal ELF linker, and calls
  * hello_entry(&AgentArgs) which blocks in the agent's command loop.
  */
@@ -2813,7 +2814,7 @@ frida_main (void * user_data)
       goto beach;
   }
 
-  /* Link the agent SO from a memfd received over the socket. */
+  /* Link the agent SO from the selected host transfer path. */
   if (ctx->agent_handle == NULL)
   {
     char recv_diag[32];
@@ -3263,6 +3264,8 @@ frida_send_chunk (int sockfd, const void * buffer, size_t length, const FridaLib
 
     n = frida_raw_send (sockfd, cursor, remaining, MSG_NOSIGNAL);
     if (n == -1)
+      return false;
+    if (n == 0)
       return false;
 
     cursor += n;

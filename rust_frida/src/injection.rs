@@ -54,6 +54,7 @@ const SYS_PIDFD_GETFD: i64 = 438;
 #[cfg(not(feature = "noptrace"))]
 const PAGE_SIZE: u64 = 4096;
 const LOADER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+const LOADER_STREAM_TRANSFER_TIMEOUT: Duration = Duration::from_secs(30);
 const LOADER_IO_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 #[cfg(not(feature = "noptrace"))]
@@ -1776,16 +1777,17 @@ fn run_loader_handshake(
     let thread_id = i32::from_le_bytes(tid_buf);
     log_verbose!("Loader worker tid: {}", thread_id);
 
-    // 2. 发送 agent SO。默认经 loader 控制 socket 流式发送，避免目标进程临时出现
-    //    agent memfd fd；仅显式诊断/兼容开关才回退 SCM_RIGHTS memfd。
+    // 2. 发送 agent SO。默认使用 SCM_RIGHTS memfd，兼容 hardened targets 的
+    //    SELinux/MLS 约束；stream 仅作为显式诊断/兼容模式。
     if use_stream_agent_transfer() {
+        let transfer_deadline = Instant::now() + LOADER_STREAM_TRANSFER_TIMEOUT;
         let size = (AGENT_SO.len() as u64).to_le_bytes();
-        if let Err(e) = send_exact_timeout(ctrl_fd, &size, deadline, "发送 agent stream size") {
+        if let Err(e) = send_exact_timeout(ctrl_fd, &size, transfer_deadline, "发送 agent stream size") {
             log_warn!("agent stream size 发送失败，读取 loader 诊断: {}", e);
             drain_loader_messages_for(ctrl_fd, std::time::Duration::from_millis(750));
             return Err(e);
         }
-        if let Err(e) = send_exact_timeout(ctrl_fd, AGENT_SO, deadline, "发送 agent stream") {
+        if let Err(e) = send_exact_timeout(ctrl_fd, AGENT_SO, transfer_deadline, "发送 agent stream") {
             log_warn!("agent stream 发送失败，读取 loader 诊断: {}", e);
             drain_loader_messages_for(ctrl_fd, std::time::Duration::from_millis(750));
             return Err(e);
