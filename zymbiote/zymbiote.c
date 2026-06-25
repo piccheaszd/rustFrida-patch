@@ -144,6 +144,45 @@ raw_syscall6(long nr, long a0, long a1, long a2, long a3, long a4, long a5)
     return x0;
 }
 
+static size_t
+rustfrida_stage1_page_size(void)
+{
+    size_t page_size = (zymbiote.page_size != 0) ? (size_t)zymbiote.page_size : 4096u;
+
+    if ((page_size & (page_size - 1u)) != 0)
+        page_size = 4096u;
+
+    return page_size;
+}
+
+static bool
+rustfrida_stage1_layout_is_valid(const RustFridaPureStage1Header *h, size_t page_size)
+{
+    uint64_t mask = (uint64_t)page_size - 1u;
+
+    return h->code_size < h->image_size &&
+        (h->image_size & mask) == 0 &&
+        (h->code_size & mask) == 0 &&
+        h->ctx_offset >= h->code_size &&
+        h->resume_flag_offset >= h->code_size &&
+        h->stage0_done_flag_offset >= h->code_size;
+}
+
+static bool
+rustfrida_protect_stage1_image(char *mapping, const RustFridaPureStage1Header *h)
+{
+    if (raw_syscall6(__NR_mprotect, (long)mapping, (long)h->code_size,
+        PROT_READ | PROT_EXEC, 0, 0, 0) != 0)
+        return false;
+
+    if (h->code_size < h->image_size &&
+        raw_syscall6(__NR_mprotect, (long)(mapping + h->code_size),
+            (long)(h->image_size - h->code_size), PROT_READ | PROT_WRITE, 0, 0, 0) != 0)
+        return false;
+
+    return true;
+}
+
 static bool
 rustfrida_sleep_until_resume(volatile uint64_t *flag)
 {
@@ -166,6 +205,7 @@ rustfrida_receive_and_run_stage1(int sockfd)
 {
     RustFridaPureStage1Header h;
     char *mapping;
+    size_t page_size;
     int *ctrlfds;
     volatile uint64_t *resume_flag;
     volatile uint64_t *stage0_done_flag;
@@ -175,12 +215,14 @@ rustfrida_receive_and_run_stage1(int sockfd)
     if (!rustfrida_recv_all(sockfd, &h, sizeof(h)))
         return false;
 
-    if (h.image_size == 0 || h.image_size > (2u * 1024u * 1024u) ||
+    page_size = rustfrida_stage1_page_size();
+    if (h.image_size < 8u || h.image_size > (2u * 1024u * 1024u) ||
         h.code_size == 0 || h.code_size > h.image_size ||
-        h.ctx_offset + 8u > h.image_size ||
-        h.resume_flag_offset + 8u > h.image_size ||
-        h.stage0_done_flag_offset + 8u > h.image_size ||
-        h.reloc_count > 64u)
+        h.ctx_offset > h.image_size - 8u ||
+        h.resume_flag_offset > h.image_size - 8u ||
+        h.stage0_done_flag_offset > h.image_size - 8u ||
+        h.reloc_count > 64u ||
+        !rustfrida_stage1_layout_is_valid(&h, page_size))
         return false;
 
     mapping = (char *)raw_syscall6(__NR_mmap, 0, (long)h.image_size,
@@ -212,6 +254,9 @@ rustfrida_receive_and_run_stage1(int sockfd)
     *resume_flag = 0;
     stage0_done_flag = (volatile uint64_t *)(mapping + h.stage0_done_flag_offset);
     *stage0_done_flag = 0;
+
+    if (!rustfrida_protect_stage1_image(mapping, &h))
+        return false;
 
     loader_entry = (void (*)(void *))mapping;
     loader_entry(mapping + h.ctx_offset);

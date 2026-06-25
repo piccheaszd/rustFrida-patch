@@ -219,7 +219,7 @@ fn cleanup_remote_loader_mappings(pid: i32, injection: &InjectionResult) {
 }
 
 fn main() {
-    set_current_thread_name(b"wwb-rfmain\0");
+    set_current_thread_name(b"main\0");
 
     // Fix #8: 先解析参数（--help/--version 在此退出），再打印 banner
     let args = Args::parse();

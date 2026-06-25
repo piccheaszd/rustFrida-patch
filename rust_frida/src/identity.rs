@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
+use crate::proc_mem::ProcMem;
 use crate::{log_info, log_verbose, log_warn};
 
 #[derive(Clone, Debug)]
@@ -80,7 +81,7 @@ pub(crate) fn start_spawn_identity_watcher(target_pid: i32, spec: SpawnIdentityS
     );
 
     let _ = std::thread::Builder::new()
-        .name("wwb-idwatch".into())
+        .name("id-watch".into())
         .spawn(move || watch_spawn_identity(target_pid, spec, duration));
 }
 
@@ -136,6 +137,7 @@ fn watch_spawn_identity(target_pid: i32, spec: SpawnIdentitySpec, duration: Dura
 
             if direct_child {
                 if seen.insert((pid, "spoof-child")) {
+                    scrubbed_inherited_stage1_tail(pid);
                     log_warn!(
                         "检测到疑似伪装 child: pid={} tgid={} ppid={} uid={} cmdline={} status.Name={} tracer={}{}",
                         info.pid,
@@ -150,6 +152,7 @@ fn watch_spawn_identity(target_pid: i32, spec: SpawnIdentitySpec, duration: Dura
                 }
             } else if same_uid && info.maps_has_package {
                 if seen.insert((pid, "package-maps-spoof")) {
+                    scrubbed_inherited_stage1_tail(pid);
                     log_warn!(
                         "检测到同 UID 伪装进程归属: pid={} tgid={} uid={} cmdline={} status.Name={} maps 包含 {}{}",
                         info.pid,
@@ -166,6 +169,75 @@ fn watch_spawn_identity(target_pid: i32, spec: SpawnIdentitySpec, duration: Dura
 
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn scrubbed_inherited_stage1_tail(pid: i32) {
+    match scrub_inherited_stage1_tail(pid) {
+        Ok(0) => {}
+        Ok(count) => log_verbose!("已清理疑似继承 stage1 tail: pid={} regions={}", pid, count),
+        Err(e) => log_verbose!("清理继承 stage1 tail 失败: pid={} {}", pid, e),
+    }
+}
+
+fn scrub_inherited_stage1_tail(pid: i32) -> Result<usize, String> {
+    if pid <= 0 {
+        return Ok(0);
+    }
+
+    let maps = std::fs::read_to_string(format!("/proc/{}/maps", pid)).map_err(|e| format!("读取 maps 失败: {}", e))?;
+    let mem = ProcMem::open(pid as u32)?;
+    let mut scrubbed = 0usize;
+
+    for line in maps.lines() {
+        let Some((start, end, perms)) = parse_map_range(line) else {
+            continue;
+        };
+        if perms != "rw-p" || !line.contains(" 00:00 0") {
+            continue;
+        }
+        let size = end.saturating_sub(start);
+        if !(0x1000..=0x2_0000).contains(&size) {
+            continue;
+        }
+
+        let mut buf = vec![0u8; size as usize];
+        if mem.pread_exact(&mut buf, start).is_err() {
+            continue;
+        }
+        if !has_stage1_tail_signature(&buf) {
+            continue;
+        }
+
+        buf.fill(0);
+        mem.pwrite_all(&buf, start)?;
+        scrubbed += 1;
+    }
+
+    Ok(scrubbed)
+}
+
+fn parse_map_range(line: &str) -> Option<(u64, u64, &str)> {
+    let mut parts = line.split_whitespace();
+    let range = parts.next()?;
+    let perms = parts.next()?;
+    let (start, end) = range.split_once('-')?;
+    let start = u64::from_str_radix(start, 16).ok()?;
+    let end = u64::from_str_radix(end, 16).ok()?;
+    Some((start, end, perms))
+}
+
+fn has_stage1_tail_signature(buf: &[u8]) -> bool {
+    const NEEDLES: [&[u8]; 4] = [
+        b"agent-ctrl=loader",
+        b"frida_send_ready failed",
+        b"frida_receive_ack failed",
+        b"rustfrida_loadjs_current_thread",
+    ];
+    NEEDLES.iter().any(|needle| contains_bytes(buf, needle))
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|window| window == needle)
 }
 
 fn identity_watch_duration() -> Duration {

@@ -2,7 +2,7 @@
 
 /// 获取所有可用的字符串名称（用于 CLI --string 参数验证）
 pub(crate) fn get_string_table_names() -> Vec<&'static str> {
-    vec!["sym_name", "dlsym_err", "cmdline", "output_path"]
+    vec!["sym_name", "pthread_err", "dlsym_err", "cmdline", "output_path"]
 }
 
 /// 用户空间寄存器结构体
@@ -162,6 +162,12 @@ pub(crate) struct RustFridaLoaderContext {
     pub(crate) spawn_cleanup_capset_got_slot: u64,
     pub(crate) spawn_cleanup_capset_original: u64,
     pub(crate) spawn_cleanup_capset_got_protection: u64,
+    pub(crate) stage1_base: u64,
+    pub(crate) stage1_size: u64,
+    pub(crate) stage1_rx_size: u64,
+    pub(crate) stage1_ephemeral_start: u64,
+    pub(crate) stage1_ephemeral_size: u64,
+    pub(crate) stage1_cleanup_done_flag: u64,
 }
 
 impl Default for RustFridaLoaderContext {

@@ -176,7 +176,7 @@ fn handle_socket_connection(stream: UnixStream, session: Arc<Session>) {
                     );
                     let session2 = session.clone();
                     thread::Builder::new()
-                        .name("wwb-socktx".into())
+                        .name("socket-tx".into())
                         .spawn(move || {
                             let mut stream_clone = stream_clone;
                             while let Ok(msg) = rx.recv() {
@@ -192,7 +192,7 @@ fn handle_socket_connection(stream: UnixStream, session: Arc<Session>) {
                                 }
                             }
                         })
-                        .expect("spawn wwb-socktx thread");
+                        .expect("spawn socket-tx thread");
                 }
                 FRAME_KIND_COMPLETE => {
                     let text = String::from_utf8(payload).unwrap_or_default();
@@ -300,9 +300,9 @@ fn handle_socket_connection(stream: UnixStream, session: Arc<Session>) {
 pub(crate) fn start_socketpair_handler(host_fd: RawFd, session: Arc<Session>) -> JoinHandle<()> {
     let stream = unsafe { UnixStream::from_raw_fd(host_fd) };
     thread::Builder::new()
-        .name("wwb-sockrx".into())
+        .name("socket-rx".into())
         .spawn(move || {
             handle_socket_connection(stream, session);
         })
-        .expect("spawn wwb-sockrx thread")
+        .expect("spawn socket-rx thread")
 }

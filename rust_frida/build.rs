@@ -27,6 +27,10 @@ fn main() {
 
     let loader_bootstrapper = workspace_root.join("loader").join("build").join("bootstrapper.bin");
     let loader_blob = workspace_root.join("loader").join("build").join("rustfrida-loader.bin");
+    let loader_rx_size = workspace_root
+        .join("loader")
+        .join("build")
+        .join("rustfrida-loader.rx_size");
     if target == "aarch64-linux-android" && helpers_are_stale(workspace_root) {
         let status = std::process::Command::new("uv")
             .args(["run", "--python", "3"])
@@ -40,6 +44,7 @@ fn main() {
     }
     ensure_generated_blob(&loader_bootstrapper, "uv run --python 3 loader/build_helpers.py");
     ensure_generated_blob(&loader_blob, "uv run --python 3 loader/build_helpers.py");
+    ensure_generated_blob(&loader_rx_size, "uv run --python 3 loader/build_helpers.py");
 
     let zymbiote_sources = [
         "zymbiote/build.sh",
@@ -233,7 +238,11 @@ fn helpers_are_stale(workspace_root: &Path) -> bool {
         "loader/helpers/syscall.c",
         "loader/helpers/syscall.h",
     ];
-    let outputs = ["loader/build/bootstrapper.bin", "loader/build/rustfrida-loader.bin"];
+    let outputs = [
+        "loader/build/bootstrapper.bin",
+        "loader/build/rustfrida-loader.bin",
+        "loader/build/rustfrida-loader.rx_size",
+    ];
 
     let newest_input = inputs
         .iter()

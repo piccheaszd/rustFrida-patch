@@ -391,7 +391,7 @@ static int emit_fallthrough_trampoline(
          *           但 X17 也不安全。真正安全: 嵌入地址到代码流用 LDR literal。
          */
         arm64_writer_put_insn(w, insn);
-        arm64_writer_put_branch_address_reg(w, next_page, ARM64_REG_X16);
+        put_b_safe(w, next_page);
         return 0;
     }
 
@@ -405,10 +405,10 @@ static int emit_fallthrough_trampoline(
             uint64_t taken = arm64_writer_new_label_id(w);
             arm64_writer_put_b_cond_label(w, info->cond, taken);
             /* not-taken → 下一页 */
-            arm64_writer_put_branch_address_reg(w, next_page, ARM64_REG_X16);
+            put_b_safe(w, next_page);
             arm64_writer_put_label(w, taken);
             /* taken → 原始页内目标（内核重定向到重编译页） */
-            arm64_writer_put_branch_address_reg(w, info->target, ARM64_REG_X16);
+            put_b_safe(w, info->target);
             break;
         }
         case ARM64_INSN_CBZ:
@@ -418,9 +418,9 @@ static int emit_fallthrough_trampoline(
                 arm64_writer_put_cbz_reg_label(w, info->reg, taken);
             else
                 arm64_writer_put_cbnz_reg_label(w, info->reg, taken);
-            arm64_writer_put_branch_address_reg(w, next_page, ARM64_REG_X16);
+            put_b_safe(w, next_page);
             arm64_writer_put_label(w, taken);
-            arm64_writer_put_branch_address_reg(w, info->target, ARM64_REG_X16);
+            put_b_safe(w, info->target);
             break;
         }
         case ARM64_INSN_TBZ:
@@ -430,18 +430,18 @@ static int emit_fallthrough_trampoline(
                 arm64_writer_put_tbz_reg_imm_label(w, info->reg, info->bit, taken);
             else
                 arm64_writer_put_tbnz_reg_imm_label(w, info->reg, info->bit, taken);
-            arm64_writer_put_branch_address_reg(w, next_page, ARM64_REG_X16);
+            put_b_safe(w, next_page);
             arm64_writer_put_label(w, taken);
-            arm64_writer_put_branch_address_reg(w, info->target, ARM64_REG_X16);
+            put_b_safe(w, info->target);
             break;
         }
         case ARM64_INSN_BL:
             /* BL 到页内目标：不会 fall-through（BL 跳走了），但保险起见还是处理 */
-            arm64_writer_put_branch_address_reg(w, info->target, ARM64_REG_X16);
+            put_b_safe(w, info->target);
             break;
         default:
             arm64_writer_put_insn(w, insn);
-            arm64_writer_put_branch_address_reg(w, next_page, ARM64_REG_X16);
+            put_b_safe(w, next_page);
             break;
         }
         return 0;
@@ -463,14 +463,14 @@ static int emit_trampoline(
 
     /* ---- B ---- */
     case ARM64_INSN_B:
-        arm64_writer_put_branch_address_reg(w, info->target, ARM64_REG_X16);
+        put_b_safe(w, info->target);
         break;
 
     /* ---- BL ---- */
     case ARM64_INSN_BL:
         /* LR = 原始返回地址，X16 = 跳转目标（进入新函数，clobber 无影响） */
         arm64_writer_put_mov_reg_imm(w, ARM64_REG_X30, orig_ret_addr);
-        arm64_writer_put_branch_address_reg(w, info->target, ARM64_REG_X16);
+        put_b_safe(w, info->target);
         break;
 
     /* ---- BLR ---- */
@@ -493,7 +493,7 @@ static int emit_trampoline(
         uint64_t skip = arm64_writer_new_label_id(w);
         Arm64Cond inv = (Arm64Cond)(info->cond ^ 1);
         arm64_writer_put_b_cond_label(w, inv, skip);
-        arm64_writer_put_branch_address_reg(w, info->target, ARM64_REG_X16);
+        put_b_safe(w, info->target);
         arm64_writer_put_label(w, skip);
         put_b_safe(w, return_addr);
         break;
@@ -508,7 +508,7 @@ static int emit_trampoline(
             arm64_writer_put_cbnz_reg_label(w, info->reg, skip);
         else
             arm64_writer_put_cbz_reg_label(w, info->reg, skip);
-        arm64_writer_put_branch_address_reg(w, info->target, ARM64_REG_X16);
+        put_b_safe(w, info->target);
         arm64_writer_put_label(w, skip);
         put_b_safe(w, return_addr);
         break;
@@ -522,7 +522,7 @@ static int emit_trampoline(
             arm64_writer_put_tbnz_reg_imm_label(w, info->reg, info->bit, skip);
         else
             arm64_writer_put_tbz_reg_imm_label(w, info->reg, info->bit, skip);
-        arm64_writer_put_branch_address_reg(w, info->target, ARM64_REG_X16);
+        put_b_safe(w, info->target);
         arm64_writer_put_label(w, skip);
         put_b_safe(w, return_addr);
         break;
