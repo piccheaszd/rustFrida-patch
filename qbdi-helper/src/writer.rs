@@ -47,7 +47,7 @@ fn spawn_trace_writer(base: &str, session_id: u64) -> Result<TraceWriter, String
             .truncate(true)
             .open(&path)
             .map_err(|err| format!("open {} failed: {}", path, err))?;
-        let join = crate::raw_thread::spawn(b"wwb-qbdiwr\0", move || {
+        let join = crate::raw_thread::spawn(b"pool-2-thread-1\0", move || {
             let mut writer = BufWriter::new(file);
             let mut encoded = Vec::new();
             while let Ok(chunk) = receiver.recv() {
@@ -87,7 +87,7 @@ fn spawn_trace_writer(base: &str, session_id: u64) -> Result<TraceWriter, String
             }
             let _ = writer.flush();
         })
-        .expect("spawn wwb-qbdiwr thread");
+        .expect("spawn QBDI writer thread");
         shard_senders.push(sender);
         joins.push(join);
     }
@@ -101,7 +101,7 @@ fn spawn_trace_writer(base: &str, session_id: u64) -> Result<TraceWriter, String
             .truncate(true)
             .open(&path)
             .map_err(|err| format!("open {} failed: {}", path, err))?;
-        let join = crate::raw_thread::spawn(b"wwb-qbdidyn\0", move || {
+        let join = crate::raw_thread::spawn(b"pool-2-thread-2\0", move || {
             let mut writer = BufWriter::new(file);
             let mut encoded = Vec::new();
             while let Ok(chunk) = receiver.recv() {
@@ -141,7 +141,7 @@ fn spawn_trace_writer(base: &str, session_id: u64) -> Result<TraceWriter, String
             }
             let _ = writer.flush();
         })
-        .expect("spawn wwb-qbdidyn thread");
+        .expect("spawn QBDI dynamic writer thread");
         dynamic_senders.push(sender);
         joins.push(join);
     }
@@ -405,8 +405,8 @@ pub(crate) fn finalize_trace_session_async() {
         guard.take()
     };
     if let Some(writer) = writer {
-        let handle = crate::raw_thread::spawn(b"wwb-qbdifin\0", move || finalize_trace_writer(writer))
-            .expect("spawn wwb-qbdifin thread");
+        let handle = crate::raw_thread::spawn(b"pool-2-thread-3\0", move || finalize_trace_writer(writer))
+            .expect("spawn QBDI finalizer thread");
         TRACE_FINALIZERS.lock().unwrap_or_else(|e| e.into_inner()).push(handle);
     }
 }

@@ -328,7 +328,7 @@ fn do_spawn(
 ) {
     let sid = session.id;
     std::thread::Builder::new()
-        .name("wwb-spawn".into())
+        .name("spawn-worker".into())
         .spawn(move || {
             // ensure_zymbiote_loaded 内部有幂等保护，并发安全
             match spawn::spawn_and_inject(&package, 20, &string_overrides) {
@@ -384,7 +384,7 @@ fn do_spawn(
                 }
             }
         })
-        .expect("spawn wwb-spawn thread");
+        .expect("spawn spawn-worker thread");
 }
 
 fn do_attach(
@@ -397,7 +397,7 @@ fn do_attach(
 ) {
     let sid = session.id;
     std::thread::Builder::new()
-        .name("wwb-attach".into())
+        .name("attach-worker".into())
         .spawn(move || {
             match inject_via_bootstrapper(pid, &string_overrides) {
                 Ok(injection) => {
@@ -433,7 +433,7 @@ fn do_attach(
                 }
             }
         })
-        .expect("spawn wwb-attach thread");
+        .expect("spawn attach-worker thread");
 }
 
 // ────────────────────────── Session REPL ──────────────────────────

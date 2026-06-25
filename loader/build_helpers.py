@@ -83,7 +83,18 @@ def run_cmd(cmd, desc=""):
         sys.exit(1)
     return result
 
-def build_shellcode(cc, ld, objcopy, sources, output_name, extra_cflags=None):
+def read_symbol_value(nm, so_path, symbol_name):
+    """Read a symbol value from an ELF file."""
+    result = run_cmd([nm, "-n", so_path], f"读取 {symbol_name}")
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[-1] == symbol_name:
+            return int(parts[0], 16)
+    print(f"错误: 未找到符号 {symbol_name}")
+    sys.exit(1)
+
+
+def build_shellcode(cc, ld, objcopy, nm, sources, output_name, extra_cflags=None):
     """Compile C sources into a binary shellcode blob."""
     if extra_cflags is None:
         extra_cflags = []
@@ -139,6 +150,13 @@ def build_shellcode(cc, ld, objcopy, sources, output_name, extra_cflags=None):
         f"提取 {output_name}.bin"
     )
 
+    if output_name == "rustfrida-loader":
+        rx_size = read_symbol_value(nm, so_path, "__rustfrida_payload_rx_end")
+        meta_path = os.path.join(BUILD_DIR, output_name + ".rx_size")
+        with open(meta_path, "w", encoding="ascii") as f:
+            f.write(f"{rx_size}\n")
+        print(f"  ✓ {output_name}.rx_size: {rx_size} 字节")
+
     # Report size
     size = os.path.getsize(bin_path)
     print(f"  ✓ {output_name}.bin: {size} 字节")
@@ -163,9 +181,14 @@ def main():
     if not objcopy:
         print("错误: 未找到 objcopy")
         sys.exit(1)
+    nm = find_tool(ndk, "nm")
+    if not nm:
+        print("错误: 未找到 nm")
+        sys.exit(1)
 
     print(f"CC: {cc}")
     print(f"OBJCOPY: {objcopy}")
+    print(f"NM: {nm}")
     print()
 
     # Ensure build directory exists
@@ -174,7 +197,7 @@ def main():
     # Build bootstrapper (NOLIBC mode — no libc, raw syscalls only)
     print("[1/2] 构建 bootstrapper...")
     build_shellcode(
-        cc, ld, objcopy,
+        cc, ld, objcopy, nm,
         sources=["bootstrapper.c", "elf-parser.c"],
         output_name="bootstrapper",
         extra_cflags=[
@@ -189,7 +212,7 @@ def main():
     # Build loader (uses function pointers from bootstrapper, no direct libc calls)
     print("[2/2] 构建 rustfrida-loader...")
     build_shellcode(
-        cc, ld, objcopy,
+        cc, ld, objcopy, nm,
         sources=["rustfrida-loader.c", "syscall.c"],
         output_name="rustfrida-loader",
         extra_cflags=[

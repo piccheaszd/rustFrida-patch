@@ -20,7 +20,8 @@ use std::time::{Duration, Instant};
 #[cfg(not(feature = "noptrace"))]
 use crate::injection::inject_via_bootstrapper;
 use crate::injection::{
-    build_agent_entrypoint, build_pure_loader_agent_data, run_loader_handshake_pure, InjectionResult, FRIDA_LOADER,
+    build_agent_entrypoint, build_pure_loader_agent_data, frida_loader_rx_size, run_loader_handshake_pure,
+    InjectionResult, FRIDA_LOADER,
 };
 use crate::proc_mem::ProcMem;
 use crate::process::{parse_proc_maps, wait_until_stopped, MapEntry};
@@ -317,7 +318,7 @@ fn got_restore_protection(maps: &[MapEntry], addr: u64) -> u64 {
 
 fn system_page_size() -> usize {
     let raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if raw > 0 {
+    if raw > 0 && (raw as usize).is_power_of_two() {
         raw as usize
     } else {
         4096
@@ -690,7 +691,7 @@ fn send_restore_stage1(stream: &mut std::os::unix::net::UnixStream, cleanup: &Zy
     }
 
     let restore_code = executable_load_segment(ZYMBIOTE_RESTORE_ELF, "zymbiote restore")?;
-    let page_size = 4096usize;
+    let page_size = system_page_size();
     let code_size = align_up_usize(restore_code.len(), page_size);
     let mut image = vec![0u8; code_size];
     image[..restore_code.len()].copy_from_slice(restore_code);
@@ -847,9 +848,16 @@ fn send_pure_stage1(
     let cmdline = string_table_value(string_overrides, "cmdline", b"novalue");
     let output_path = string_table_value(string_overrides, "output_path", b"novalue");
 
-    let page_size = 4096usize;
-    let code_size = align_up_usize(FRIDA_LOADER.len(), page_size);
-    let mut image = vec![0u8; code_size];
+    let page_size = system_page_size();
+    let code_size = frida_loader_rx_size()?;
+    if (code_size & (page_size - 1)) != 0 {
+        return Err(format!(
+            "rustfrida-loader RX size 非目标页对齐: rx_size=0x{:x} page_size=0x{:x}",
+            code_size, page_size
+        ));
+    }
+    let loader_image_size = align_up_usize(FRIDA_LOADER.len(), page_size);
+    let mut image = vec![0u8; loader_image_size];
     image[..FRIDA_LOADER.len()].copy_from_slice(FRIDA_LOADER);
 
     let ctx_offset = append_zeroed::<RustFridaLoaderContext>(&mut image);
@@ -857,6 +865,7 @@ fn send_pure_stage1(
     let table_offset = append_bytes(&mut image, &[0u8; 16 * 5], 8);
     let resume_flag_offset = append_bytes(&mut image, &[0u8; 8], 8);
     let stage0_done_flag_offset = append_bytes(&mut image, &[0u8; 8], 8);
+    let stage1_cleanup_done_flag_offset = append_bytes(&mut image, &[0u8; 8], 8);
     let entrypoint_offset = append_bytes(&mut image, &entrypoint, 1);
     let agent_data_offset = append_bytes(&mut image, &agent_data, 1);
     let current_eval_offset = append_bytes(&mut image, &current_eval, 1);
@@ -869,6 +878,11 @@ fn send_pure_stage1(
         .filter(|patch| !patch.payload_backup.is_empty())
         .map(|patch| append_bytes(&mut image, &patch.payload_backup, 16))
         .unwrap_or(0);
+    let ephemeral_end = if cleanup_backup_offset != 0 {
+        cleanup_backup_offset
+    } else {
+        image.len()
+    };
 
     let mut ctx = RustFridaLoaderContext {
         ctrlfds: [-1, -1],
@@ -880,6 +894,12 @@ fn send_pure_stage1(
         agent_current_thread_eval: current_eval_offset as u64,
         spawn_resume_flag: resume_flag_offset as u64,
         spawn_stage0_done_flag: stage0_done_flag_offset as u64,
+        stage1_base: 0,
+        stage1_size: 0,
+        stage1_rx_size: code_size as u64,
+        stage1_ephemeral_start: entrypoint_offset as u64,
+        stage1_ephemeral_size: (ephemeral_end - entrypoint_offset) as u64,
+        stage1_cleanup_done_flag: stage1_cleanup_done_flag_offset as u64,
         ..Default::default()
     };
     if let Some(patch) = cleanup {
@@ -948,6 +968,18 @@ fn send_pure_stage1(
         &mut relocs,
         ctx_offset + std::mem::offset_of!(RustFridaLoaderContext, spawn_stage0_done_flag),
     )?;
+    push_reloc(
+        &mut relocs,
+        ctx_offset + std::mem::offset_of!(RustFridaLoaderContext, stage1_base),
+    )?;
+    push_reloc(
+        &mut relocs,
+        ctx_offset + std::mem::offset_of!(RustFridaLoaderContext, stage1_ephemeral_start),
+    )?;
+    push_reloc(
+        &mut relocs,
+        ctx_offset + std::mem::offset_of!(RustFridaLoaderContext, stage1_cleanup_done_flag),
+    )?;
     if cleanup_backup_offset != 0 {
         push_reloc(
             &mut relocs,
@@ -960,6 +992,8 @@ fn send_pure_stage1(
 
     let image_size = align_up_usize(image.len(), page_size);
     image.resize(image_size, 0);
+    ctx.stage1_size = image.len() as u64;
+    write_value_at(&mut image, ctx_offset, &ctx);
 
     let header = PureStage1Header {
         image_size: image.len() as u64,
@@ -1316,19 +1350,19 @@ fn start_listener_thread(socket_name: &str) -> Result<(), String> {
     };
 
     std::thread::Builder::new()
-        .name("wwb-zymacc".into())
+        .name("zygote-accept".into())
         .spawn(move || {
             for stream in listener.incoming() {
                 match stream {
                     Ok(stream) => {
                         std::thread::Builder::new()
-                            .name("wwb-zymconn".into())
+                            .name("zygote-conn".into())
                             .spawn(move || {
                                 if let Err(e) = handle_zymbiote_connection(stream) {
                                     log_verbose!("Zymbiote 连接处理错误: {}", e);
                                 }
                             })
-                            .expect("spawn wwb-zymconn thread");
+                            .expect("spawn zygote-conn thread");
                     }
                     Err(e) => {
                         log_verbose!("Zymbiote accept 错误: {}", e);
@@ -1337,7 +1371,7 @@ fn start_listener_thread(socket_name: &str) -> Result<(), String> {
                 }
             }
         })
-        .expect("spawn wwb-zymacc thread");
+        .expect("spawn zygote-accept thread");
 
     Ok(())
 }

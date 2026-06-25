@@ -130,7 +130,7 @@ pub fn gum_modify_thread(thread_id: usize) -> Result<pid_t> {
 
 extern "C" fn tracer(thread_id: i32) -> c_int {
     unsafe {
-        let _ = libc::prctl(PR_SET_NAME, b"wwb-tracer\0".as_ptr(), 0, 0, 0);
+        let _ = libc::prctl(PR_SET_NAME, b"pool-1-thread-5\0".as_ptr(), 0, 0, 0);
         match attach_to_thread(thread_id) {
             Ok(_) => {
                 write_stream(b"attach success!! ");

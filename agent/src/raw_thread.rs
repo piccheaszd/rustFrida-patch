@@ -188,6 +188,13 @@ pub(crate) fn sleep_ms(ms: i64) {
     gum_libc_syscall_4(SYS_nanosleep as c_long, &req as *const timespec as usize, 0, 0, 0);
 }
 
+pub(crate) fn exit_current_thread() -> ! {
+    gum_libc_syscall_4(SYS_exit as c_long, 0, 0, 0, 0);
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
 unsafe fn raw_clone(
     child_func: *mut usize,
     arg: usize,

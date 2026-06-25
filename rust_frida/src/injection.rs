@@ -40,6 +40,7 @@ use crate::{log_success, log_verbose, log_warn};
 #[cfg(not(feature = "noptrace"))]
 pub(crate) const BOOTSTRAPPER: &[u8] = include_bytes!("../../loader/build/bootstrapper.bin");
 pub(crate) const FRIDA_LOADER: &[u8] = include_bytes!("../../loader/build/rustfrida-loader.bin");
+const FRIDA_LOADER_RX_SIZE: &str = include_str!("../../loader/build/rustfrida-loader.rx_size");
 
 pub(crate) const AGENT_SO: &[u8] = include_bytes!(env!("AGENT_SO_PATH"));
 
@@ -56,6 +57,23 @@ const PAGE_SIZE: u64 = 4096;
 const LOADER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const LOADER_STREAM_TRANSFER_TIMEOUT: Duration = Duration::from_secs(30);
 const LOADER_IO_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+pub(crate) fn frida_loader_rx_size() -> Result<usize, String> {
+    let rx_size = FRIDA_LOADER_RX_SIZE
+        .trim()
+        .parse::<usize>()
+        .map_err(|e| format!("解析 rustfrida-loader RX size 失败: {}", e))?;
+
+    if rx_size == 0 || rx_size > FRIDA_LOADER.len() || (rx_size & 0xfff) != 0 {
+        return Err(format!(
+            "非法 rustfrida-loader RX size: {} loader_len={}",
+            rx_size,
+            FRIDA_LOADER.len()
+        ));
+    }
+
+    Ok(rx_size)
+}
 
 #[cfg(not(feature = "noptrace"))]
 fn align_down(value: u64, alignment: u64) -> u64 {
@@ -276,6 +294,41 @@ fn env_flag_enabled(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+const DEFAULT_AGENT_VMA_NAME: &str = "wwb_so";
+
+fn configured_agent_vma_name() -> Result<Option<String>, String> {
+    let name = match std::env::var("RF_AGENT_VMA_NAME") {
+        Ok(name) => name,
+        Err(_) => DEFAULT_AGENT_VMA_NAME.to_string(),
+    };
+
+    if name.is_empty()
+        || name == "0"
+        || name.eq_ignore_ascii_case("false")
+        || name.eq_ignore_ascii_case("off")
+        || name.eq_ignore_ascii_case("none")
+    {
+        return Ok(None);
+    }
+
+    if name.len() > 63 {
+        return Err("RF_AGENT_VMA_NAME 最多 63 字节".to_string());
+    }
+    if !name.bytes().all(|b| (0x21..=0x7e).contains(&b) && b != b';') {
+        return Err("RF_AGENT_VMA_NAME 仅允许非空白 ASCII，且不能包含分号".to_string());
+    }
+
+    Ok(Some(name))
+}
+
+fn append_agent_vma_token(tokens: &mut Vec<String>) -> Result<(), String> {
+    if let Some(name) = configured_agent_vma_name()? {
+        log_verbose!("agent VMA name: {}", name);
+        tokens.push(format!("vma={}", name));
+    }
+    Ok(())
+}
+
 #[cfg(not(feature = "noptrace"))]
 fn env_value_enabled(value: &str) -> bool {
     value != "0" && !value.eq_ignore_ascii_case("false")
@@ -352,18 +405,7 @@ fn build_loader_agent_data() -> Result<Vec<u8>, String> {
         tokens.push("catch-signals".to_string());
     }
 
-    if let Ok(name) = std::env::var("RF_AGENT_VMA_NAME") {
-        if !name.is_empty() {
-            if name.len() > 63 {
-                return Err("RF_AGENT_VMA_NAME 最多 63 字节".to_string());
-            }
-            if !name.bytes().all(|b| (0x21..=0x7e).contains(&b) && b != b';') {
-                return Err("RF_AGENT_VMA_NAME 仅允许非空白 ASCII，且不能包含分号".to_string());
-            }
-            log_verbose!("agent VMA name: {}", name);
-            tokens.push(format!("vma={}", name));
-        }
-    }
+    append_agent_vma_token(&mut tokens)?;
 
     let mut data = if tokens.is_empty() {
         Vec::new()
@@ -394,18 +436,7 @@ pub(crate) fn build_pure_loader_agent_data() -> Result<Vec<u8>, String> {
         tokens.push("catch-signals".to_string());
     }
 
-    if let Ok(name) = std::env::var("RF_AGENT_VMA_NAME") {
-        if !name.is_empty() {
-            if name.len() > 63 {
-                return Err("RF_AGENT_VMA_NAME 最多 63 字节".to_string());
-            }
-            if !name.bytes().all(|b| (0x21..=0x7e).contains(&b) && b != b';') {
-                return Err("RF_AGENT_VMA_NAME 仅允许非空白 ASCII，且不能包含分号".to_string());
-            }
-            log_verbose!("agent VMA name: {}", name);
-            tokens.push(format!("vma={}", name));
-        }
-    }
+    append_agent_vma_token(&mut tokens)?;
 
     let mut data = tokens.join(";").into_bytes();
     data.push(0);

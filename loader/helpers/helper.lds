@@ -5,8 +5,12 @@ SECTIONS {
   {
     KEEP(*(.text.entrypoint))
     *(.text*)
+    . = ALIGN(16384);
+    __rustfrida_payload_rx_end = .;
     *(.rodata*)
     *(.data*)
+    *(.bss*)
+    *(COMMON)
   }
 
   .dynstr : { *(.dynstr) }

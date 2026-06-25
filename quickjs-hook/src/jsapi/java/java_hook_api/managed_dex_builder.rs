@@ -145,7 +145,7 @@ pub(super) fn build_java_worker_dex(class_id: u64) -> Result<GeneratedJavaWorker
         vec!["Ljava/lang/String;".to_string()],
     );
     let mut ctor = DexIrBuilder::new(2, 1, 2);
-    ctor.const_string(0, "wwb-javawoker");
+    ctor.const_string(0, "pool-1-thread-1");
     ctor.invoke_direct(vec![1, 0], thread_ctor.clone());
     ctor.return_void();
     class.direct_method("<init>", "V", Vec::new(), ACC_PUBLIC | ACC_CONSTRUCTOR, ctor.finish()?);

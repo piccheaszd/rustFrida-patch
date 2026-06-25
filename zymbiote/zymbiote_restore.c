@@ -11,13 +11,18 @@
 #include <stdint.h>
 #include <sys/mman.h>
 
+#define __NR_openat    56
 #define __NR_close     57
+#define __NR_read      63
 #define __NR_write     64
 #define __NR_nanosleep 101
+#define __NR_munmap    215
 #define __NR_clone     220
 #define __NR_mmap      222
 #define __NR_mprotect  226
 
+#define MY_AT_FDCWD      -100
+#define MY_O_RDONLY      0
 #define MY_MAP_PRIVATE   0x02
 #define MY_MAP_ANONYMOUS 0x20
 
@@ -84,12 +89,14 @@ static void rustfrida_restore_thread(void *user_data);
 static void rustfrida_sleep_ms(uint32_t millis);
 static RustFridaRestoreStatus rustfrida_restore_cleanup(RustFridaRestoreContext *ctx);
 static void rustfrida_fill_slots_from_payload_context(RustFridaRestoreContext *ctx);
+static void rustfrida_scrub_inherited_stage1_tail(void);
 static bool rustfrida_restore_memory(uint64_t address, const void *backup, uint64_t size,
                                      uint64_t protection, uint64_t page_size, bool executable);
 static bool rustfrida_restore_slot(uint64_t slot, uint64_t value, uint64_t protection, uint64_t page_size);
 static uint64_t rustfrida_load_ctx_u64(const RustFridaRestoreContext *ctx, uint64_t offset);
 static void rustfrida_send_status(RustFridaRestoreContext *ctx, const RustFridaRestoreStatus *status);
 static void rustfrida_memcpy(void *dst, const void *src, size_t size);
+static void rustfrida_bzero_volatile(uintptr_t start, size_t size);
 static void rustfrida_clear_icache(uintptr_t start, uintptr_t end);
 
 __attribute__((section(".text.entrypoint")))
@@ -203,10 +210,189 @@ rustfrida_restore_cleanup(RustFridaRestoreContext *ctx)
             status.failed |= RUSTFRIDA_RESTORE_CAPSET;
     }
 
+    rustfrida_scrub_inherited_stage1_tail();
+
     if (status.failed != 0 || (status.restored & RUSTFRIDA_RESTORE_PAYLOAD) == 0)
         status.status = RUSTFRIDA_RESTORE_PARTIAL;
 
     return status;
+}
+
+static int
+rustfrida_hex_value(char c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+static const char *
+rustfrida_parse_hex(const char *p, uintptr_t *value)
+{
+    uintptr_t result = 0;
+    int digit;
+
+    if (p == NULL || value == NULL)
+        return NULL;
+
+    digit = rustfrida_hex_value(*p);
+    if (digit < 0)
+        return NULL;
+
+    while ((digit = rustfrida_hex_value(*p)) >= 0)
+    {
+        result = (result << 4) | (uintptr_t)digit;
+        p++;
+    }
+
+    *value = result;
+    return p;
+}
+
+static bool
+rustfrida_line_contains(const char *line, const char *needle)
+{
+    const char *p;
+    const char *n;
+
+    if (line == NULL || needle == NULL || *needle == '\0')
+        return false;
+
+    for (p = line; *p != '\0'; p++)
+    {
+        n = needle;
+        while (*n != '\0' && p[n - needle] == *n)
+            n++;
+        if (*n == '\0')
+            return true;
+    }
+
+    return false;
+}
+
+static bool
+rustfrida_region_contains(uintptr_t start, size_t size, const char *needle)
+{
+    const unsigned char *region = (const unsigned char *)start;
+    const unsigned char *pat = (const unsigned char *)needle;
+    size_t pat_len = 0;
+    size_t i;
+    size_t j;
+
+    while (pat[pat_len] != '\0')
+        pat_len++;
+    if (pat_len == 0 || size < pat_len)
+        return false;
+
+    for (i = 0; i <= size - pat_len; i++)
+    {
+        for (j = 0; j < pat_len; j++)
+        {
+            if (region[i + j] != pat[j])
+                break;
+        }
+        if (j == pat_len)
+            return true;
+    }
+
+    return false;
+}
+
+static bool
+rustfrida_region_has_stage1_tail_signature(uintptr_t start, size_t size)
+{
+    return rustfrida_region_contains(start, size, "agent-ctrl=loader") ||
+        rustfrida_region_contains(start, size, "frida_send_ready failed") ||
+        rustfrida_region_contains(start, size, "frida_receive_ack failed") ||
+        rustfrida_region_contains(start, size, "rustfrida_loadjs_current_thread");
+}
+
+static void
+rustfrida_process_maps_line_for_stage1_tail(const char *line)
+{
+    const char *p;
+    uintptr_t start;
+    uintptr_t end;
+    size_t size;
+
+    p = rustfrida_parse_hex(line, &start);
+    if (p == NULL || *p != '-')
+        return;
+    p = rustfrida_parse_hex(p + 1, &end);
+    if (p == NULL || *p != ' ')
+        return;
+    p++;
+
+    if (!(p[0] == 'r' && p[1] == 'w' && p[2] == '-' && p[3] == 'p'))
+        return;
+    if (!rustfrida_line_contains(line, " 00:00 0"))
+        return;
+    if (end <= start)
+        return;
+
+    size = (size_t)(end - start);
+    if (size < 4096u || size > (128u * 1024u))
+        return;
+
+    if (!rustfrida_region_has_stage1_tail_signature(start, size))
+        return;
+
+    rustfrida_bzero_volatile(start, size);
+    raw_syscall6(__NR_munmap, (long)start, (long)size, 0, 0, 0, 0);
+}
+
+static void
+rustfrida_scrub_inherited_stage1_tail(void)
+{
+    int fd;
+    char read_buf[1024];
+    char line[512];
+    size_t line_len = 0;
+
+    fd = (int)raw_syscall6(__NR_openat, MY_AT_FDCWD, (long)"/proc/self/maps",
+                           MY_O_RDONLY, 0, 0, 0);
+    if (fd < 0)
+        return;
+
+    for (;;)
+    {
+        long n = raw_syscall6(__NR_read, fd, (long)read_buf, sizeof(read_buf), 0, 0, 0);
+        long i;
+
+        if (n <= 0)
+            break;
+
+        for (i = 0; i < n; i++)
+        {
+            char c = read_buf[i];
+            if (c == '\n')
+            {
+                line[line_len] = '\0';
+                rustfrida_process_maps_line_for_stage1_tail(line);
+                line_len = 0;
+            }
+            else if (line_len + 1 < sizeof(line))
+            {
+                line[line_len++] = c;
+            }
+            else
+            {
+                line_len = 0;
+            }
+        }
+    }
+
+    if (line_len != 0)
+    {
+        line[line_len] = '\0';
+        rustfrida_process_maps_line_for_stage1_tail(line);
+    }
+
+    raw_syscall6(__NR_close, fd, 0, 0, 0, 0, 0);
 }
 
 static void
@@ -339,6 +525,18 @@ rustfrida_memcpy(void *dst, const void *src, size_t size)
     while (size != 0)
     {
         *d++ = *s++;
+        size--;
+    }
+}
+
+static void
+rustfrida_bzero_volatile(uintptr_t start, size_t size)
+{
+    volatile unsigned char *p = (volatile unsigned char *)start;
+
+    while (size != 0)
+    {
+        *p++ = 0;
         size--;
     }
 }

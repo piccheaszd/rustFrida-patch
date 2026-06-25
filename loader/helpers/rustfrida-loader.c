@@ -203,6 +203,12 @@ typedef struct {
   uint64_t spawn_cleanup_capset_got_slot;
   uint64_t spawn_cleanup_capset_original;
   uint64_t spawn_cleanup_capset_got_protection;
+  uint64_t stage1_base;
+  uint64_t stage1_size;
+  uint64_t stage1_rx_size;
+  uint64_t stage1_ephemeral_start;
+  uint64_t stage1_ephemeral_size;
+  uint64_t stage1_cleanup_done_flag;
 } RustFridaLoaderContext;
 
 /*
@@ -214,6 +220,12 @@ typedef struct {
   int32_t  ctrl_fd;     /* REPL socketpair fd */
   int32_t  agent_memfd; /* -1 (unused in this path) */
   uint64_t resume_flag; /* pure spawn resume flag, 0 otherwise */
+  uint64_t stage1_base;
+  uint64_t stage1_size;
+  uint64_t stage1_rx_size;
+  uint64_t stage1_ephemeral_start;
+  uint64_t stage1_ephemeral_size;
+  uint64_t stage1_cleanup_done_flag;
 } AgentArgs;
 
 typedef void * (* hello_entry_fn) (void *);
@@ -494,6 +506,18 @@ frida_main_raw (void * user_data)
 }
 
 static void
+rustfrida_mark_stage1_cleanup_done (RustFridaLoaderContext * ctx)
+{
+  volatile uint64_t * done_flag;
+
+  if (ctx->stage1_cleanup_done_flag == 0)
+    return;
+
+  done_flag = (volatile uint64_t *) (uintptr_t) ctx->stage1_cleanup_done_flag;
+  *done_flag = 1;
+}
+
+static void
 rustfrida_spawn_cleanup_raw (void * user_data)
 {
   RustFridaLoaderContext * ctx = user_data;
@@ -508,6 +532,7 @@ rustfrida_spawn_cleanup_raw (void * user_data)
 
   frida_sleep_ms (1);
   rustfrida_restore_spawn_cleanup (ctx);
+  rustfrida_mark_stage1_cleanup_done (ctx);
 }
 
 static void
@@ -517,17 +542,26 @@ rustfrida_start_spawn_cleanup (RustFridaLoaderContext * ctx)
   const size_t flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM;
   void * stack;
   void * stack_top;
+  ssize_t tid;
 
   if (ctx->spawn_stage0_done_flag == 0 || ctx->spawn_cleanup_payload_base == 0 ||
       ctx->spawn_cleanup_payload_backup == 0 || ctx->spawn_cleanup_payload_size == 0)
+  {
+    rustfrida_mark_stage1_cleanup_done (ctx);
     return;
+  }
 
   stack = frida_raw_mmap (NULL, stack_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (stack == MAP_FAILED)
+  {
+    rustfrida_mark_stage1_cleanup_done (ctx);
     return;
+  }
 
   stack_top = (void *) (((uintptr_t) stack + stack_size) & ~(uintptr_t) 15);
-  (void) frida_clone_thread (flags, stack_top, rustfrida_spawn_cleanup_raw, ctx);
+  tid = frida_clone_thread (flags, stack_top, rustfrida_spawn_cleanup_raw, ctx);
+  if (tid <= 0)
+    rustfrida_mark_stage1_cleanup_done (ctx);
 }
 
 static void
@@ -2935,6 +2969,12 @@ frida_main (void * user_data)
     args.ctrl_fd    = agent_ctrlfd;
     args.agent_memfd = -1;
     args.resume_flag = ctx->spawn_resume_flag;
+    args.stage1_base = ctx->stage1_base;
+    args.stage1_size = ctx->stage1_size;
+    args.stage1_rx_size = ctx->stage1_rx_size;
+    args.stage1_ephemeral_start = ctx->stage1_ephemeral_start;
+    args.stage1_ephemeral_size = ctx->stage1_ephemeral_size;
+    args.stage1_cleanup_done_flag = ctx->stage1_cleanup_done_flag;
 
     if (catch_entry_signals)
     {

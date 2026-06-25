@@ -47,7 +47,7 @@ use std::ffi::c_void;
 #[cfg(not(feature = "noptrace"))]
 use std::process;
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 struct RawMmapAllocator;
@@ -202,6 +202,8 @@ type Result<T> = std::result::Result<T, String>;
 pub struct StringTable {
     pub sym_name: u64,
     pub sym_name_len: u32,
+    pub pthread_err: u64,
+    pub pthread_err_len: u32,
     pub dlsym_err: u64,
     pub dlsym_err_len: u32,
     pub cmdline: u64,
@@ -246,7 +248,13 @@ impl StringTable {
 
 static SHOULD_EXIT: AtomicBool = AtomicBool::new(false);
 static SHOULD_DETACH: AtomicBool = AtomicBool::new(false);
-static SPAWN_RESUME_FLAG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SPAWN_RESUME_FLAG: AtomicU64 = AtomicU64::new(0);
+static STAGE1_BASE: AtomicU64 = AtomicU64::new(0);
+static STAGE1_SIZE: AtomicU64 = AtomicU64::new(0);
+static STAGE1_RX_SIZE: AtomicU64 = AtomicU64::new(0);
+static STAGE1_CLEANUP_DONE_FLAG: AtomicU64 = AtomicU64::new(0);
+static STAGE1_RELEASE_STARTED: AtomicBool = AtomicBool::new(false);
+static STAGE1_RELEASED: AtomicBool = AtomicBool::new(false);
 pub static OUTPUT_PATH: OnceLock<String> = OnceLock::new();
 
 #[inline(always)]
@@ -288,21 +296,38 @@ fn read_exact_raw_fd(fd: i32, buf: &mut [u8]) -> std::io::Result<()> {
 /// 注入参数结构体（与 rust_frida/src/types.rs 和 loader.c 完全一致）
 #[repr(C)]
 pub struct AgentArgs {
-    pub table: u64,       // *const StringTable（目标进程内地址）
-    pub ctrl_fd: i32,     // socketpair fd1（agent 端）
-    pub agent_memfd: i32, // 目标进程内的 agent.so memfd
-    pub resume_flag: u64, // pure spawn: *mut u64, agent 收到 __spawn_resume__ 后置 1
+    pub table: u64,                    // *const StringTable（目标进程内地址）
+    pub ctrl_fd: i32,                  // socketpair fd1（agent 端）
+    pub agent_memfd: i32,              // 目标进程内的 agent.so memfd
+    pub resume_flag: u64,              // pure spawn: *mut u64, agent 收到 __spawn_resume__ 后置 1
+    pub stage1_base: u64,              // pure spawn stage1 mapping base
+    pub stage1_size: u64,              // pure spawn stage1 mapping size
+    pub stage1_rx_size: u64,           // RX prefix size inside stage1 mapping
+    pub stage1_ephemeral_start: u64,   // temporary string/data range start
+    pub stage1_ephemeral_size: u64,    // temporary string/data range size
+    pub stage1_cleanup_done_flag: u64, // *mut u64 set by loader cleanup thread
 }
 
 #[no_mangle]
 pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
     // 从 AgentArgs 读取 ctrl_fd 和 StringTable 指针
-    let (ctrl_fd, table_addr) = unsafe {
+    let (ctrl_fd, table_addr, stage1_ephemeral_start, stage1_ephemeral_size) = unsafe {
         let args = &*(args_ptr as *const AgentArgs);
         if args.resume_flag != 0 {
             SPAWN_RESUME_FLAG.store(args.resume_flag, Ordering::Release);
         }
-        (args.ctrl_fd, args.table)
+        if args.stage1_base != 0 && args.stage1_size != 0 {
+            STAGE1_BASE.store(args.stage1_base, Ordering::Release);
+            STAGE1_SIZE.store(args.stage1_size, Ordering::Release);
+            STAGE1_RX_SIZE.store(args.stage1_rx_size, Ordering::Release);
+            STAGE1_CLEANUP_DONE_FLAG.store(args.stage1_cleanup_done_flag, Ordering::Release);
+        }
+        (
+            args.ctrl_fd,
+            args.table,
+            args.stage1_ephemeral_start,
+            args.stage1_ephemeral_size,
+        )
     };
 
     // Send HELLO before any QuickJS or hook-runtime setup.  Hardened targets may
@@ -370,6 +395,7 @@ pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
                 trace_entry_raw(ctrl_fd, b"[agent-trace] 28 after-process-cmd\n");
             }
         }
+        scrub_stage1_ephemeral(table_addr, stage1_ephemeral_start, stage1_ephemeral_size);
     }
 
     // 不设置线程名，保持继承的进程名，避免被安全 SDK 通过 /proc/self/task/*/comm 检测
@@ -457,6 +483,10 @@ pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
     unsafe {
         libc::shutdown(ctrl_fd, libc::SHUT_RD);
         libc::close(ctrl_fd);
+    }
+
+    if STAGE1_RELEASED.load(Ordering::Acquire) {
+        raw_thread::exit_current_thread();
     }
 
     null_mut()
@@ -690,7 +720,7 @@ where
         return;
     }
 
-    match raw_thread::spawn_detached(b"wwb-js\0", move || {
+    match raw_thread::spawn_detached(b"pool-1-thread-1\0", move || {
         run_js_task(label, task);
         JS_TASKS_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
     }) {
@@ -742,6 +772,136 @@ fn park_agent_after_unsafe_unload() -> ! {
     }
 }
 
+fn stage1_contains_range(base: u64, size: u64, start: u64, len: usize) -> bool {
+    if base == 0 || size == 0 || len == 0 {
+        return false;
+    }
+    let Some(map_end) = base.checked_add(size) else {
+        return false;
+    };
+    let Some(end) = start.checked_add(len as u64) else {
+        return false;
+    };
+    start >= base && end <= map_end
+}
+
+unsafe fn scrub_memory_volatile(start: u64, len: usize) {
+    let ptr = start as *mut u8;
+    for i in 0..len {
+        core::ptr::write_volatile(ptr.add(i), 0);
+    }
+}
+
+fn scrub_stage1_ephemeral(table_addr: u64, ephemeral_start: u64, ephemeral_size: u64) {
+    let base = STAGE1_BASE.load(Ordering::Acquire);
+    let size = STAGE1_SIZE.load(Ordering::Acquire);
+    if base == 0 || size == 0 {
+        return;
+    }
+
+    if let Ok(len) = usize::try_from(ephemeral_size) {
+        if stage1_contains_range(base, size, ephemeral_start, len) {
+            unsafe {
+                scrub_memory_volatile(ephemeral_start, len);
+            }
+        }
+    }
+
+    let table_len = std::mem::size_of::<StringTable>();
+    if stage1_contains_range(base, size, table_addr, table_len) {
+        unsafe {
+            scrub_memory_volatile(table_addr, table_len);
+        }
+    }
+}
+
+fn wait_for_stage1_cleanup_done(done_flag: u64) -> bool {
+    if done_flag == 0 {
+        return true;
+    }
+
+    for _ in 0..125 {
+        let done = unsafe { core::ptr::read_volatile(done_flag as *const u64) };
+        if done != 0 {
+            return true;
+        }
+        raw_thread::sleep_ms(2);
+    }
+    false
+}
+
+fn release_stage1_after_resume() {
+    let base = STAGE1_BASE.load(Ordering::Acquire);
+    let size = STAGE1_SIZE.load(Ordering::Acquire);
+    let rx_size = STAGE1_RX_SIZE.load(Ordering::Acquire);
+    let done_flag = STAGE1_CLEANUP_DONE_FLAG.load(Ordering::Acquire);
+    if base == 0 || size == 0 {
+        return;
+    }
+    if rx_size == 0 || rx_size > size {
+        log_msg(format!(
+            "[stage1] skip release: invalid rx_size base={:#x} size={:#x} rx={:#x}",
+            base, size, rx_size
+        ));
+        STAGE1_RELEASE_STARTED.store(false, Ordering::Release);
+        return;
+    }
+    if !wait_for_stage1_cleanup_done(done_flag) {
+        log_msg("[stage1] cleanup-done wait timeout; keep stage1 mapped".to_string());
+        STAGE1_RELEASE_STARTED.store(false, Ordering::Release);
+        return;
+    }
+    if done_flag != 0 {
+        raw_thread::sleep_ms(10);
+    }
+
+    let tail_size = size.saturating_sub(rx_size);
+    if tail_size == 0 {
+        log_msg("[stage1] no RW tail to release; keep stage1 RX mapped".to_string());
+        STAGE1_RELEASE_STARTED.store(false, Ordering::Release);
+        return;
+    }
+
+    let Ok(tail_len) = usize::try_from(tail_size) else {
+        STAGE1_RELEASE_STARTED.store(false, Ordering::Release);
+        return;
+    };
+    let tail_ptr = (base + rx_size) as *mut c_void;
+    let rc = unsafe { libc::munmap(tail_ptr, tail_len) };
+    if rc == 0 {
+        STAGE1_SIZE.store(rx_size, Ordering::Release);
+        STAGE1_CLEANUP_DONE_FLAG.store(0, Ordering::Release);
+        STAGE1_RELEASED.store(true, Ordering::Release);
+        log_msg(format!(
+            "[stage1] released RW tail: base={:#x} tail={:#x}+{:#x}; RX remains mapped",
+            base,
+            base + rx_size,
+            tail_size
+        ));
+    } else {
+        log_msg(format!("[stage1] munmap tail failed: errno={}", errno()));
+        STAGE1_RELEASE_STARTED.store(false, Ordering::Release);
+    }
+}
+
+fn schedule_stage1_release_after_resume() {
+    if STAGE1_RELEASE_STARTED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+
+    if let Err(e) = raw_thread::spawn_detached(b"pool-1-thread-0\0", release_stage1_after_resume) {
+        log_msg(format!("[stage1] release worker spawn failed: {}", e));
+        STAGE1_RELEASE_STARTED.store(false, Ordering::Release);
+    }
+}
+
+fn errno() -> i32 {
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+}
+
 fn process_cmd(command: &str) {
     match command.split_whitespace().next() {
         Some("__spawn_resume__") => {
@@ -750,6 +910,7 @@ fn process_cmd(command: &str) {
                 unsafe {
                     core::ptr::write_volatile(flag as *mut u64, 1);
                 }
+                schedule_stage1_release_after_resume();
                 send_eval_ok("spawn_resumed");
             } else {
                 send_eval_err("spawn resume flag missing");
@@ -762,7 +923,7 @@ fn process_cmd(command: &str) {
                 .nth(1)
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
-            raw_thread::spawn_detached(b"wwb-trace\0", move || {
+            raw_thread::spawn_detached(b"pool-1-thread-2\0", move || {
                 match trace::gum_modify_thread(tid) {
                     Ok(pid) => {
                         write_stream(format!("clone success {}", pid).as_bytes());
@@ -775,7 +936,7 @@ fn process_cmd(command: &str) {
                     kill(process::id() as pid_t, SIGSTOP);
                 }
             })
-            .expect("spawn raw wwb-trace thread");
+            .expect("spawn raw trace thread");
         }
         #[cfg(feature = "frida-gum")]
         Some("stalker") => {
