@@ -108,6 +108,9 @@ PROFILE=release tools/verify-build-matrix.sh
 - pure spawn 的 pre-resume 脚本统一通过 agent socket 发送；Java 主线程 eval 的 remote-agent 分支在 `noptrace` 下不可用。
 - `hello_entry()` 入口最前面安装 native early hook；不等待 JS、Java 初始化或 log writer。
 - target pure child 会把 zygote payload 备份和 hook 槽原值随 stage-1 一起下发；loader 在 agent entry 前启动 raw clone 清理线程，等 stage-0 退出 resume 等待后优先恢复 payload 页，再恢复 `setArgV0`/`setcontext` 槽。未匹配 child 不再只走 hook slot 自恢复：host 会下发 restore-only stage-1，由 child 侧恢复 payload 页和 hook 槽；找不到父 zygote patch 时会尝试从 child maps/backing file 重建 cleanup，失败则拒绝 hook-only fallback 并显式报警。
+- `noptrace` stage-1 会在 agent 读取完启动参数后清理临时字符串/指针表；子进程恢复后异步释放 stage-1 RW tail。host identity watcher 也会在 BOCHK self-trace / 伪装 child 中扫描并清零继承的 stage-1 tail 签名。
+- 当前不会强制 `munmap` stage-1 RX 或 linker veneer。BOCHK 实测中对 RX 段做完整 `munmap` / `mprotect` / 清零会导致目标退出或崩溃，因此先保留匿名 `r-xp` 以换稳定性和可调试性。
+- 如果加载了 `kpm-hide-maps` 1.1.1 或更新版本，stage-1 loader 会在进入 agent 前通过 `PR_HIDEMAPS_REGISTER` 注册 stage-1 RX 和 linker veneer 的精确范围；KPM 只过滤同一 `mm` 中精确匹配的 `/proc/<pid>/maps` 行，并在首次命中时动态校准当前内核的 `vm_area_struct.vm_mm` 偏移，避免不同 Android 6.1 结构布局导致注册成功但过滤失败。
 - 普通 `--spawn package` 默认走 late spawn：先恢复子进程，等待主线程回到 Looper idle 后再按 PID attach。这个模式不保证早期 hook，但更适合交互式 REPL。
 - `--spawn -l script.js` 默认走 early spawn：在 zygote/setcontext 阻塞窗口里注入并加载脚本，脚本完成后再恢复子进程，用于抢 `Application.onCreate` / `RegisterNatives` 等早期逻辑。
 - `--spawn-early` 可强制无脚本时也走 early spawn；这是诊断/特殊场景用法，稳定性弱于 late。
@@ -215,7 +218,17 @@ adb shell su -c 'chmod 755 /data/local/tmp/rf-noptrace'
 printf 'jseval 1+1\nexit\n' | adb shell su -c '/data/local/tmp/rf-noptrace --spawn com.coloros.note --spawn-pure -l /data/local/tmp/rf_smoke.js --verbose'
 ```
 
-已在 Android 14 arm64 设备上验证 `com.coloros.note` 和 `com.bochk.app.aos` 的 pure spawn；`com.bochk.app.aos` 可在 pre-resume 脚本里监听 `RegisterNatives`，也验证过 `Hook.WXSHADOW` patch。
+已在 Android 14 arm64 设备上验证 `com.coloros.note` 和 `com.bochk.app.aos` 的 pure spawn。
+
+BOCHK 当前实测结论（2026-06-26）：
+
+- 已解决：`noptrace --spawn-pure` 不再对目标子进程执行 ptrace attach、寄存器改写或远程调用；BOCHK 可完成 agent 连接，`jsinit` 返回 `=> initialized`，`jseval 1+1` 返回 `=> 2`。
+- 已解决：zygote patch 在退出时恢复；未匹配 child 通过 restore-only stage-1 恢复；BOCHK self-trace child 会被 identity watcher 识别。
+- 已解决：stage-1 临时字符串、指针表和 main process RW tail 已清理；self-trace child 中继承的 stage-1 tail 签名会被 host 侧清零。针对 stage-1 RX、tail、veneer 的直接内存扫描未再命中 `frida`、`quickjs`、`rustfrida-loader`、`stage1` 等字符串。
+- 已解决：当前 BOCHK pure-spawn + minimal QuickJS 路径未观察到 `rwxp` VMA。
+- 已解决：`kpm-hide-maps` 1.1.1 已在 BOCHK 设备侧复测，stage-1 RX 和 linker veneer 注册返回 OK；外部读取主进程 `/proc/<pid>/maps` 时匿名 `r-xp` 列表只剩 `[vdso]`，不再暴露这两个 RF range。这是 procfs 输出过滤，不是实际 `munmap`。
+- 剩余：BOCHK 的 self-trace child 仍会让主进程 `TracerPid` 指向 App 自己的 watchdog child；RF 不再 ptrace 目标，但 App 原生自检仍可能把“被 trace 状态”作为业务信号。
+- 剩余：`Hook.WXSHADOW` / `Hook.RECOMP` 在 BOCHK 上还需要逐个 hook profile 验证；不要把 pure spawn + REPL 通过等同于所有 native hook 都安全。
 
 BOCHK 的 `noptrace` / WXSHADOW 分阶段探测记录和复测顺序见
 [`docs/bochk-noptrace-test-notes.md`](docs/bochk-noptrace-test-notes.md)。
@@ -227,9 +240,9 @@ BOCHK 的 `noptrace` / WXSHADOW 分阶段探测记录和复测顺序见
 | 普通 arm64 App | 已在 ColorOS / Android 14 上用 `com.coloros.note` pure spawn 通过 | agent 连接、pre-resume 脚本执行、退出恢复 zygote patch |
 | 多进程 App | 部分覆盖；仍需专门枚举 secondary process | 未匹配 child 通过 restore-only stage-1 恢复 payload 页和 hook 槽，不留下 `libstagefright.so` 尾页覆盖 |
 | 含 `:remote` / `:push` 的 App | 待专测 | 只消费目标进程 hello，非目标进程恢复后继续运行 |
-| 有 self-ptrace watchdog 的 App | 待专测 | host/App 侧没有 `ptrace` syscall，watchdog 不因注入触发 |
-| 早期 `JNI_OnLoad` 检测 App | 已用 `com.bochk.app.aos` 的 `RegisterNatives` pre-resume hook 做 smoke；BOCHK 后续 native 检测链路仍在拆分 | native early hook 在 JS/Java/log writer 前安装 |
-| 大量 SO 加载 App | `com.bochk.app.aos` 部分覆盖；已确认 libc inline hook 会触发检测，WXSHADOW 仍需继续拆分信号源 | loader/agent 自链接稳定，脚本能在大量 dlopen 场景下保持连接 |
+| 有 self-ptrace watchdog 的 App | 已用 `com.bochk.app.aos` 覆盖 RF 不 ptrace 目标、BOCHK 自己拉起 self-trace child 的路径 | `TracerPid` 不指向 RF；identity watcher 能识别 self-trace / 伪装 child 并清理继承的 stage-1 tail 签名 |
+| 早期 `JNI_OnLoad` 检测 App | 已用 `com.bochk.app.aos` 验证 pure spawn、minimal QuickJS REPL 和 `RegisterNatives` pre-resume smoke；BOCHK 后续 native hook 检测链路仍在拆分 | native early hook 在 JS/Java/log writer 前安装；stage-1 临时字符串不留在 RW tail |
+| 大量 SO 加载 App | `com.bochk.app.aos` 部分覆盖；pure spawn 连接稳定，普通 libc inline hook 会触发检测，WXSHADOW/RECOMP 仍需逐 profile 验证 | loader/agent 自链接稳定，脚本能在大量 dlopen 场景下保持连接；hook 后 maps/code-integrity 信号可分离 |
 | WebView-heavy App | 待专测 | WebView 初始化和多进程 sandbox 不触发未恢复 payload 页执行 |
 | 厂商 ROM | ColorOS / Android 14 已测；MIUI / OneUI / HarmonyOS Android 分支（NEXT 前）待测 | zygote64 布局、`libstagefright.so` host 页选择、SELinux/tracefs 验证能力 |
 | no-ptrace 证明 | tracefs raw syscall 在当前 ColorOS 设备上受 SELinux 限制，无法写入 `sys_enter_ptrace` filter | 用 eBPF tracepoint/kprobe 或可写 tracefs 验证 `sys_enter_ptrace(id==117)` 无 rustfrida/App 命中 |

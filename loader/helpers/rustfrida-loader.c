@@ -124,6 +124,12 @@
 #ifndef PR_SET_VMA_ANON_NAME
 # define PR_SET_VMA_ANON_NAME 0
 #endif
+#ifndef PR_HIDEMAPS_REGISTER
+# define PR_HIDEMAPS_REGISTER 0x484d0001UL
+#endif
+#ifndef HIDEMAPS_F_EXACT
+# define HIDEMAPS_F_EXACT 0x1UL
+#endif
 #ifndef PROT_BTI
 # define PROT_BTI 0x10
 #endif
@@ -326,6 +332,8 @@ static void rustfrida_set_error (RustFridaLinkedModule * module, const FridaLibc
 static void rustfrida_set_symbol_error (RustFridaLinkedModule * module, const FridaLibcApi * libc, const char * prefix, const char * name);
 static bool rustfrida_protect_load_segments (RustFridaLinkedModule * module, const FridaLibcApi * libc, bool enable_bti);
 static void rustfrida_name_load_segments (RustFridaLinkedModule * module, const char * name);
+static void rustfrida_register_hide_maps_ranges (RustFridaLoaderContext * ctx, RustFridaLinkedModule * module,
+    int diagfd, const FridaLibcApi * libc);
 static void rustfrida_get_fd_vma_name (int fd, char * name, size_t name_size, const FridaLibcApi * libc);
 static void rustfrida_set_vma_name (ElfW(Addr) address, size_t size, const char * name);
 static bool rustfrida_address_is_executable (ElfW(Addr) address);
@@ -2592,6 +2600,38 @@ rustfrida_name_load_segments (RustFridaLinkedModule * module, const char * name)
   }
 }
 
+static void
+rustfrida_register_hide_maps_range (ElfW(Addr) start, size_t size, int diagfd, const FridaLibcApi * libc,
+    const char * begin_msg, const char * ok_msg, const char * fail_msg)
+{
+  ssize_t ret;
+
+  if (start == 0 || size == 0)
+    return;
+
+  frida_send_debug (diagfd, begin_msg, libc);
+  ret = frida_syscall_5 (__NR_prctl, PR_HIDEMAPS_REGISTER, 0,
+      start, size, HIDEMAPS_F_EXACT);
+  frida_send_debug (diagfd, ret == 0 ? ok_msg : fail_msg, libc);
+}
+
+static void
+rustfrida_register_hide_maps_ranges (RustFridaLoaderContext * ctx, RustFridaLinkedModule * module,
+    int diagfd, const FridaLibcApi * libc)
+{
+  if (ctx != NULL && ctx->stage1_base != 0 && ctx->stage1_rx_size != 0)
+    rustfrida_register_hide_maps_range ((ElfW(Addr)) ctx->stage1_base,
+        (size_t) ctx->stage1_rx_size, diagfd, libc,
+        "hide-maps:register-stage1", "hide-maps:register-stage1-ok",
+        "hide-maps:register-stage1-failed");
+
+  if (module != NULL && module->veneer_start != 0 && module->veneer_end > module->veneer_start)
+    rustfrida_register_hide_maps_range (module->veneer_start,
+        (size_t) (module->veneer_end - module->veneer_start), diagfd, libc,
+        "hide-maps:register-veneer", "hide-maps:register-veneer-ok",
+        "hide-maps:register-veneer-failed");
+}
+
 static char *
 rustfrida_append_literal (char * cursor, const char * end, const char * text)
 {
@@ -2889,6 +2929,7 @@ frida_main (void * user_data)
     }
     frida_send_debug (ctrlfd, "loader:link-agent-ok", libc);
     frida_send_log (ctrlfd, "worker: agent linked", libc);
+    rustfrida_register_hide_maps_ranges (ctx, &agent_module, ctrlfd, libc);
 
     frida_send_debug (ctrlfd, "loader:find-entry", libc);
     ctx->agent_entrypoint_impl = rustfrida_find_export (&agent_module, ctx->agent_entrypoint);

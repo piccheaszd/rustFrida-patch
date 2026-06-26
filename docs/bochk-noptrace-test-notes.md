@@ -13,6 +13,54 @@ not as a general user guide.
 - The host pure-spawn path must not call `inject_via_bootstrapper()`, must not
   rewrite target registers, and must not use ptrace for loader startup.
 
+## Current Status (2026-06-26)
+
+Confirmed fixed or reduced:
+
+- Pure spawn works on BOCHK without host ptrace attach, target register rewrite,
+  or target-side remote call. The minimal QuickJS path reached `jsinit =>
+  initialized` and `jseval 1+1 => 2`.
+- Zygote patch restoration completes on exit. Unmatched children use the
+  restore-only stage-1 path instead of hook-slot-only fallback.
+- Stage-1 temporary strings and pointer tables are scrubbed after the agent
+  reads them. The main BOCHK process releases the stage-1 RW tail after resume
+  cleanup.
+- BOCHK self-trace or spoof children are reported by the identity watcher. If a
+  small inherited anonymous RW tail still contains stage-1 signatures, the host
+  scrubs it through `/proc/<pid>/mem`.
+- Direct memory scans over the stage-1 RX, stage-1 tail, and linker veneer did
+  not find the previously visible `frida`, `quickjs`, `rustfrida-loader`,
+  `stage1`, or related loader strings.
+- No `rwxp` VMA was observed in the latest pure-spawn + minimal QuickJS run.
+- The stage-1 loader now registers the stage-1 RX and linker veneer exact ranges
+  with `kpm-hide-maps` 1.1.1 through `PR_HIDEMAPS_REGISTER` before entering the
+  agent. The KPM filters matching `/proc/<pid>/maps` lines for the current `mm`,
+  dynamically calibrates `vm_area_struct.vm_mm` on first range hit, and
+  propagates those ranges across `dup_mmap` forks.
+- BOCHK device retest confirmed the range path: both loader registrations
+  returned OK, and an external `/proc/<pid>/maps` read of the main process showed
+  only `[vdso]` in the anonymous executable list. The previous stage-1 RX and
+  linker veneer anonymous `r-xp` entries were filtered.
+
+Still open:
+
+- The underlying anonymous executable mappings still exist in memory. Attempts
+  to fully `munmap`, `mprotect`, or zero the RX mapping caused BOCHK to exit or
+  crash, so the current stable path keeps them mapped and hides procfs output
+  instead.
+- The range filter is device-verified through procfs, but BOCHK's full internal
+  decision path still needs per-profile validation, especially when native hooks
+  are enabled.
+- The BOCHK main process can still show `TracerPid` pointing at BOCHK's own
+  self-trace child. RF is no longer the tracer, but app-local detection can still
+  treat "being traced" as a signal.
+- A self-trace child can retain the anonymous RW VMA shape after host-side
+  scrubbing. The signatures are gone, but the map shape itself is not removed.
+- KPM hide-maps / recompile / wxshadow coverage is device and kernel specific.
+  Target process visibility must be measured through the exact BOCHK read path.
+- WXSHADOW and RECOMP hook profiles still need per-hook validation. A clean
+  pure-spawn REPL does not prove that BOCHK accepts every native hook backend.
+
 ## Build
 
 ```bash
@@ -81,7 +129,18 @@ through the agent socket:
 
 ## Findings So Far
 
-- Pure spawn baseline on BOCHK is clean enough to start and connect.
+- Pure spawn baseline on BOCHK is clean enough to start and connect, initialize
+  QuickJS, and run a trivial eval.
+- The latest pure-spawn run did not expose `rwxp` memory and did not retain the
+  old stage-1 string signatures in the scanned stage-1 RX/tail/veneer ranges.
+- The main process releases the stage-1 RW tail. BOCHK self-trace children can
+  inherit a tail-shaped anonymous RW VMA, but identity-watch scrubbing removes
+  the recognizable signatures.
+- Anonymous `r-xp` stage-1 RX and linker veneer mappings remain in memory by
+  design for now. Removing or blanking the RX mapping was unstable on BOCHK.
+- `kpm-hide-maps` 1.1.1 hides those two mappings from procfs maps output after
+  RF registers the exact ranges. This was verified on the BOCHK device: the main
+  process anonymous executable maps list no longer exposed stage-1 RX or veneer.
 - Passive profiles (`runtime`, `resolve`, `read-maps`, `maps-dump`,
   `bytes-getpid`) did not reproduce the browser/security warning in the last
   round.
@@ -103,7 +162,7 @@ Current working hypothesis: BOCHK is not only checking for a raw ptrace event.
 The detection likely combines one or more of these signals:
 
 - inline hook code-integrity mismatch;
-- anonymous executable or RWX hook/runtime pools in maps;
+- anonymous executable hook/runtime pools in maps;
 - WXSHADOW/kernel page metadata or execution-view mismatch;
 - app-local native detector in `libbochk_aos.so` around its early maps/integrity
   checks.
@@ -134,10 +193,12 @@ Record for each run:
 
 ## Next Engineering Targets
 
-- Add a passive BOCHK maps-diff probe that records maps before and after hook
-  runtime initialization without installing an inline hook.
+- Keep measuring BOCHK's actual detector path with `kpm-hide-maps` loaded,
+  especially self-trace child reads of parent maps and hook-enabled profiles.
+- Split hook validation by backend: no hook, runtime only, resolver only,
+  passive maps read, normal inline hook, WXSHADOW, and RECOMP.
 - Add a non-inline app-local probe path, for example a GOT/PLT or loader-event
   probe, so analysis is not forced through libc inline patching.
-- Reduce or hide anonymous executable/RWX hook-runtime artifacts before BOCHK's
-  early maps scan.
+- Investigate a stable way to remove or relocate the remaining executable
+  stage-1/veneer mappings only if BOCHK proves it can see and reject them.
 - Keep `bytes-cold2-wx-fast` disabled until the async read crash is understood.
