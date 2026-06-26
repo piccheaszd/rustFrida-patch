@@ -130,6 +130,9 @@
 #ifndef HIDEMAPS_F_EXACT
 # define HIDEMAPS_F_EXACT 0x1UL
 #endif
+#ifndef PR_ANTIDETECT_REGISTER
+# define PR_ANTIDETECT_REGISTER 0x41440001UL
+#endif
 #ifndef PROT_BTI
 # define PROT_BTI 0x10
 #endif
@@ -332,6 +335,7 @@ static void rustfrida_set_error (RustFridaLinkedModule * module, const FridaLibc
 static void rustfrida_set_symbol_error (RustFridaLinkedModule * module, const FridaLibcApi * libc, const char * prefix, const char * name);
 static bool rustfrida_protect_load_segments (RustFridaLinkedModule * module, const FridaLibcApi * libc, bool enable_bti);
 static void rustfrida_name_load_segments (RustFridaLinkedModule * module, const char * name);
+static void rustfrida_register_anti_detect_profile (const char * agent_data, int diagfd, const FridaLibcApi * libc);
 static void rustfrida_register_hide_maps_ranges (RustFridaLoaderContext * ctx, RustFridaLinkedModule * module,
     int diagfd, const FridaLibcApi * libc);
 static void rustfrida_get_fd_vma_name (int fd, char * name, size_t name_size, const FridaLibcApi * libc);
@@ -408,6 +412,7 @@ static int frida_memcmp (const void * a, const void * b, size_t n);
 
 static bool frida_agent_data_has_token (const char * data, const char * token);
 static const char * frida_agent_data_get_last_value (const char * data, const char * key);
+static bool frida_agent_data_get_u64 (const char * data, const char * key, uint64_t * value);
 
 static pid_t frida_gettid (void);
 
@@ -481,6 +486,85 @@ frida_agent_data_get_last_value (const char * data, const char * key)
   }
 
   return NULL;
+}
+
+static bool
+frida_agent_data_parse_u64 (const char * value, const char * end, uint64_t * parsed)
+{
+  uint64_t result = 0;
+  uint32_t base = 10;
+  const char * cursor = value;
+
+  if (value == NULL || end == NULL || parsed == NULL || value == end)
+    return false;
+
+  if (end - cursor > 2 && cursor[0] == '0' && (cursor[1] == 'x' || cursor[1] == 'X'))
+  {
+    base = 16;
+    cursor += 2;
+    if (cursor == end)
+      return false;
+  }
+
+  while (cursor < end)
+  {
+    uint8_t digit;
+    char ch = *cursor++;
+
+    if (ch >= '0' && ch <= '9')
+      digit = (uint8_t) (ch - '0');
+    else if (base == 16 && ch >= 'a' && ch <= 'f')
+      digit = (uint8_t) (ch - 'a' + 10);
+    else if (base == 16 && ch >= 'A' && ch <= 'F')
+      digit = (uint8_t) (ch - 'A' + 10);
+    else
+      return false;
+
+    if (digit >= base)
+      return false;
+
+    result = (result * base) + digit;
+  }
+
+  *parsed = result;
+  return true;
+}
+
+static bool
+frida_agent_data_get_u64 (const char * data, const char * key, uint64_t * value)
+{
+  size_t key_len;
+  const char * cursor;
+  bool found = false;
+
+  if (data == NULL || key == NULL || value == NULL || *data == '\0')
+    return false;
+
+  key_len = frida_strlen (key);
+  cursor = data;
+
+  while (*cursor != '\0')
+  {
+    const char * end = frida_strchr (cursor, ';');
+
+    if (end == NULL)
+      end = cursor + frida_strlen (cursor);
+
+    if (frida_strncmp (cursor, key, key_len) == 0 && cursor[key_len] == '=')
+    {
+      uint64_t parsed;
+
+      if (!frida_agent_data_parse_u64 (cursor + key_len + 1, end, &parsed))
+        return false;
+
+      *value = parsed;
+      found = true;
+    }
+
+    cursor = (*end == ';') ? end + 1 : end;
+  }
+
+  return found;
 }
 
 __attribute__ ((section (".text.entrypoint")))
@@ -2601,6 +2685,24 @@ rustfrida_name_load_segments (RustFridaLinkedModule * module, const char * name)
 }
 
 static void
+rustfrida_register_anti_detect_profile (const char * agent_data, int diagfd, const FridaLibcApi * libc)
+{
+  uint64_t flags = 0;
+  uint64_t profile_id = 0;
+  ssize_t ret;
+
+  if (!frida_agent_data_get_u64 (agent_data, "anti-detect-flags", &flags))
+    return;
+  (void) frida_agent_data_get_u64 (agent_data, "anti-detect-profile", &profile_id);
+
+  frida_send_debug (diagfd, "anti-detect:register-profile", libc);
+  ret = frida_syscall_5 (__NR_prctl, PR_ANTIDETECT_REGISTER, 0,
+      (size_t) flags, (size_t) profile_id, 0);
+  frida_send_debug (diagfd, ret == 0 ? "anti-detect:register-profile-ok" :
+      "anti-detect:register-profile-failed", libc);
+}
+
+static void
 rustfrida_register_hide_maps_range (ElfW(Addr) start, size_t size, int diagfd, const FridaLibcApi * libc,
     const char * begin_msg, const char * ok_msg, const char * fail_msg)
 {
@@ -2887,6 +2989,8 @@ frida_main (void * user_data)
     if (!frida_send_hello (ctrlfd, thread_id, libc))
       goto beach;
   }
+
+  rustfrida_register_anti_detect_profile (ctx->agent_data, ctrlfd, libc);
 
   /* Link the agent SO from the selected host transfer path. */
   if (ctx->agent_handle == NULL)

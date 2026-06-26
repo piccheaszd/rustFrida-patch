@@ -444,6 +444,7 @@ pub fn load_script_with_filename(script: &str, filename: &str) -> Result<String,
 }
 
 /// 将任意字符串编码成 JS 字符串字面量（带双引号），可直接拼入 JS 源码。
+#[cfg(feature = "rpc-api")]
 fn js_string_literal(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -480,6 +481,7 @@ fn js_string_literal(s: &str) -> String {
 /// # 返回
 /// * `Ok(json)` - 返回值的 JSON 字符串表示；`undefined` 返回 `"null"`
 /// * `Err(msg)` - 引擎未初始化 / 方法不存在 / JS 异常
+#[cfg(feature = "rpc-api")]
 pub fn dispatch_rpc(method: &str, args_json: &str) -> Result<String, String> {
     let engine = JS_ENGINE
         .lock()
@@ -502,6 +504,11 @@ pub fn dispatch_rpc(method: &str, args_json: &str) -> Result<String, String> {
         .unwrap_or_else(|| "null".to_string());
     value.free(engine.context().as_ptr());
     Ok(result)
+}
+
+#[cfg(not(feature = "rpc-api"))]
+pub fn dispatch_rpc(_method: &str, _args_json: &str) -> Result<String, String> {
+    Err("RPC API is not compiled into this agent".to_string())
 }
 
 /// Cleanup the global JS engine

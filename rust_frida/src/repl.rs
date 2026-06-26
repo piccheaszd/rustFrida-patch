@@ -21,6 +21,7 @@ pub(crate) const EVAL_DEFAULT_TIMEOUT_SECS: u64 = 5;
 pub(crate) const EVAL_RECOMP_TIMEOUT_SECS: u64 = 8;
 pub(crate) const EVAL_JAVA_TIMEOUT_SECS: u64 = 60;
 pub(crate) const LOAD_DEFAULT_TIMEOUT_SECS: u64 = 5;
+pub(crate) const LOAD_RECOMP_TIMEOUT_SECS: u64 = 15;
 pub(crate) const LOAD_JAVA_TIMEOUT_SECS: u64 = 60;
 pub(crate) const LOAD_STOP_WORKER_TIMEOUT_SECS: u64 = 2;
 pub(crate) const LOAD_PRE_RESUME_JAVA_TIMEOUT_SECS: u64 = 30;
@@ -748,16 +749,16 @@ fn load_script_file_with_mode(
     }
     send_command(sender, format!("loadjs_init [{}]\n{}", filename, script))
         .map_err(|e| format!("发送脚本到 raw clone TLS JS worker 失败: {}", e))?;
-    print_eval_result(
-        session,
-        if stop_worker_after_load {
-            LOAD_STOP_WORKER_TIMEOUT_SECS
-        } else if uses_java_api {
-            LOAD_JAVA_TIMEOUT_SECS
-        } else {
-            LOAD_DEFAULT_TIMEOUT_SECS
-        },
-    );
+    let timeout_secs = if uses_java_api {
+        LOAD_JAVA_TIMEOUT_SECS
+    } else if script.contains("Hook.RECOMP") || script.contains("Java.RECOMP") {
+        LOAD_RECOMP_TIMEOUT_SECS
+    } else if stop_worker_after_load {
+        LOAD_STOP_WORKER_TIMEOUT_SECS
+    } else {
+        LOAD_DEFAULT_TIMEOUT_SECS
+    };
+    print_eval_result(session, timeout_secs);
     Ok(PreResumeLoad::Loaded { uses_java_api })
 }
 

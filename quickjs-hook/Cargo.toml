@@ -9,6 +9,22 @@ license = "Apache-2.0"
 [features]
 default = []
 std = []
+full-api = [
+    "cmodule-api",
+    "file-api",
+    "jni-api",
+    "js-module-api",
+    "lazy-java-api",
+    "native-js-boot-api",
+    "rpc-api",
+]
+cmodule-api = []
+file-api = []
+jni-api = []
+js-module-api = []
+lazy-java-api = []
+native-js-boot-api = []
+rpc-api = []
 qbdi = []
 
 [dependencies]

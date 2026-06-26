@@ -1007,7 +1007,7 @@ fn process_cmd(command: &str) {
                     Err(e) => send_eval_err(&format!("nativeaudit {} failed: {}", profile, e)),
                 },
                 None => send_eval_err(
-                    "nativeaudit requires profile: bochk|bochk-wx|bochk-runtime|bochk-resolve|bochk-read-maps|bochk-bytes-noop-wx|bochk-bytes-cold2-wx|bochk-noop-wx|bochk-prctl-wx-silent|bochk-open-wx-silent|bochk-open-only-wx|bochk-openat-only-wx",
+                    "nativeaudit requires profile: bochk|bochk-wx|bochk-runtime|bochk-resolve|bochk-read-maps|bochk-bytes-noop|bochk-bytes-noop-wx|bochk-bytes-noop-recomp|bochk-bytes-cold2-wx|bochk-noop-wx|bochk-prctl-wx-silent|bochk-open-wx-silent|bochk-open-only-wx|bochk-openat-only-wx",
                 ),
             }
         }

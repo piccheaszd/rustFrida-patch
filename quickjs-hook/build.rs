@@ -100,7 +100,8 @@ fn main() {
     // compiler API, so we build the single-source library and feed it headers
     // from Rust callbacks at runtime instead of installing a tcc sysroot.
     let tinycc_src = PathBuf::from(&manifest_dir).join("third_party/tinycc");
-    if tinycc_src.join("libtcc.c").exists() {
+    let cmodule_api_enabled = env::var_os("CARGO_FEATURE_CMODULE_API").is_some();
+    if cmodule_api_enabled && tinycc_src.join("libtcc.c").exists() {
         let tcc_config_dir = out_path.join("tinycc_config");
         std::fs::create_dir_all(&tcc_config_dir).expect("create tinycc config dir");
         std::fs::write(
@@ -145,7 +146,7 @@ fn main() {
         println!("cargo:rerun-if-changed=third_party/tinycc/libtcc.c");
         println!("cargo:rerun-if-changed=third_party/tinycc/libtcc.h");
         println!("cargo:rerun-if-changed=third_party/tinycc/tcc.h");
-    } else {
+    } else if cmodule_api_enabled {
         println!("cargo:warning=TinyCC source not found at {:?}", tinycc_src);
     }
 

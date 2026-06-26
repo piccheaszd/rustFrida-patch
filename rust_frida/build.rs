@@ -8,6 +8,13 @@ fn main() {
     let workspace_root = manifest_dir.parent().expect("rust_frida must be inside workspace root");
     let profile_dir = if profile == "release" { "release" } else { "debug" };
     let noptrace = std::env::var_os("CARGO_FEATURE_NOPTRACE").is_some();
+    println!("cargo:rerun-if-env-changed=RF_AGENT_API");
+    let agent_api = std::env::var("RF_AGENT_API").unwrap_or_else(|_| "min".to_string());
+    let full_api_agent = match agent_api.as_str() {
+        "min" | "native-min" | "quickjs" => false,
+        "full" | "full-api" | "quickjs-full-api" => true,
+        other => panic!("unsupported RF_AGENT_API={}; use min or full", other),
+    };
 
     let loader_inputs = [
         "loader/build_helpers.py",
@@ -62,7 +69,12 @@ fn main() {
     let target_profile_dir = current_target_profile_dir();
     let built_agent_so = target_profile_dir.join("libagent.so");
     let built_agent_feature_marker = target_profile_dir.join("libagent.features");
-    let agent_variant = if noptrace { "noptrace" } else { "ptrace" };
+    let agent_variant = match (noptrace, full_api_agent) {
+        (true, true) => "noptrace-full",
+        (true, false) => "noptrace",
+        (false, true) => "ptrace-full",
+        (false, false) => "ptrace",
+    };
     let agent_so = target_profile_dir.join(format!("libagent.{}.so", agent_variant));
     let agent_feature_marker = target_profile_dir.join(format!("libagent.{}.features", agent_variant));
 
@@ -98,20 +110,24 @@ fn main() {
     );
 
     let release_flag = if profile_dir == "release" { " --release" } else { "" };
-    let agent_feature_flag = if noptrace {
-        " --no-default-features --features quickjs,noptrace"
-    } else {
-        ""
+    let agent_feature_flag = match (noptrace, full_api_agent) {
+        (true, true) => " --no-default-features --features quickjs-full-api,noptrace",
+        (true, false) => " --no-default-features --features quickjs,noptrace",
+        (false, true) => " --no-default-features --features quickjs-full-api",
+        (false, false) => "",
     };
     let agent_build_flag = format!("{}{}", release_flag, agent_feature_flag);
-    let expected_agent_feature = if noptrace { "noptrace=1" } else { "noptrace=0" };
+    let expected_agent_features = [
+        if noptrace { "noptrace=1" } else { "noptrace=0" },
+        if full_api_agent { "full_api=1" } else { "full_api=0" },
+    ];
     ensure_agent_variant(
         &built_agent_so,
         &built_agent_feature_marker,
         &agent_so,
         &agent_feature_marker,
         newest_agent_input,
-        expected_agent_feature,
+        &expected_agent_features,
         &agent_build_flag,
     );
     println!("cargo:rustc-env=AGENT_SO_PATH={}", agent_so.display());
@@ -150,10 +166,10 @@ fn ensure_agent_variant(
     embedded_agent_so: &Path,
     embedded_marker: &Path,
     newest_input: SystemTime,
-    expected_feature: &str,
+    expected_features: &[&str],
     agent_build_flag: &str,
 ) {
-    if embedded_agent_is_current(embedded_agent_so, embedded_marker, newest_input, expected_feature) {
+    if embedded_agent_is_current(embedded_agent_so, embedded_marker, newest_input, expected_features) {
         return;
     }
 
@@ -184,10 +200,10 @@ fn ensure_agent_variant(
             agent_build_flag
         )
     });
-    if !feature_marker_matches(&built_features, expected_feature) {
+    if !feature_marker_matches(&built_features, expected_features) {
         panic!(
-            "built agent feature mismatch: expected {}, got {:?}. Run `cargo build -p agent{}` first",
-            expected_feature,
+            "built agent feature mismatch: expected {:?}, got {:?}. Run `cargo build -p agent{}` first",
+            expected_features,
             built_features.trim(),
             agent_build_flag
         );
@@ -204,11 +220,16 @@ fn ensure_agent_variant(
             e
         )
     });
-    std::fs::write(embedded_marker, format!("{}\n", expected_feature))
+    std::fs::write(embedded_marker, format!("{}\n", expected_features.join("\n")))
         .unwrap_or_else(|e| panic!("write {} failed: {}", embedded_marker.display(), e));
 }
 
-fn embedded_agent_is_current(agent_so: &Path, marker: &Path, newest_input: SystemTime, expected_feature: &str) -> bool {
+fn embedded_agent_is_current(
+    agent_so: &Path,
+    marker: &Path,
+    newest_input: SystemTime,
+    expected_features: &[&str],
+) -> bool {
     let Ok(agent_mtime) = std::fs::metadata(agent_so).and_then(|meta| meta.modified()) else {
         return false;
     };
@@ -218,11 +239,13 @@ fn embedded_agent_is_current(agent_so: &Path, marker: &Path, newest_input: Syste
     let Ok(features) = std::fs::read_to_string(marker) else {
         return false;
     };
-    feature_marker_matches(&features, expected_feature)
+    feature_marker_matches(&features, expected_features)
 }
 
-fn feature_marker_matches(features: &str, expected_feature: &str) -> bool {
-    features.lines().any(|line| line.trim() == expected_feature)
+fn feature_marker_matches(features: &str, expected_features: &[&str]) -> bool {
+    expected_features
+        .iter()
+        .all(|expected| features.lines().any(|line| line.trim() == *expected))
 }
 
 fn helpers_are_stale(workspace_root: &Path) -> bool {

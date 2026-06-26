@@ -294,6 +294,80 @@ fn env_flag_enabled(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn parse_env_u64(name: &str, value: &str) -> Result<u64, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(format!("{} 不能为空", name));
+    }
+
+    let parsed = if let Some(hex) = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16)
+    } else {
+        value.parse::<u64>()
+    };
+
+    parsed.map_err(|e| format!("解析 {}={} 失败: {}", name, value, e))
+}
+
+const AD_F_AUDIT_ONLY: u64 = 1;
+const AD_F_FEATURE_MASK: u64 = 0x1fe;
+
+fn append_anti_detect_tokens(tokens: &mut Vec<String>) -> Result<(), String> {
+    let mode = match std::env::var("RF_ANTIDETECT") {
+        Ok(mode) => mode,
+        Err(_) => return Ok(()),
+    };
+    let mode = mode.trim();
+    if mode.is_empty()
+        || mode == "0"
+        || mode.eq_ignore_ascii_case("false")
+        || mode.eq_ignore_ascii_case("off")
+        || mode.eq_ignore_ascii_case("none")
+    {
+        return Ok(());
+    }
+
+    let mut flags = match mode {
+        value
+            if value.eq_ignore_ascii_case("audit")
+                || value.eq_ignore_ascii_case("audit-only")
+                || value.eq_ignore_ascii_case("register")
+                || value.eq_ignore_ascii_case("register-only") =>
+        {
+            AD_F_AUDIT_ONLY
+        }
+        value if value.eq_ignore_ascii_case("audit-full") || value.eq_ignore_ascii_case("full-audit") => {
+            AD_F_AUDIT_ONLY | AD_F_FEATURE_MASK
+        }
+        value if value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("on") => {
+            AD_F_AUDIT_ONLY
+        }
+        value if value.eq_ignore_ascii_case("enforce") || value.eq_ignore_ascii_case("apply") => 0,
+        value => {
+            log_warn!("未知 RF_ANTIDETECT={}，按 audit-only 注册 anti-detect profile", value);
+            AD_F_AUDIT_ONLY
+        }
+    };
+
+    if let Ok(raw_flags) = std::env::var("RF_ANTIDETECT_FLAGS") {
+        flags = parse_env_u64("RF_ANTIDETECT_FLAGS", &raw_flags)?;
+    }
+
+    let profile_id = match std::env::var("RF_ANTIDETECT_PROFILE_ID") {
+        Ok(raw) => parse_env_u64("RF_ANTIDETECT_PROFILE_ID", &raw)?,
+        Err(_) => 0,
+    };
+
+    log_verbose!(
+        "anti-detect profile: register flags=0x{:x} profile_id={}",
+        flags,
+        profile_id
+    );
+    tokens.push(format!("anti-detect-flags=0x{:x}", flags));
+    tokens.push(format!("anti-detect-profile={}", profile_id));
+    Ok(())
+}
+
 const DEFAULT_AGENT_VMA_NAME: &str = "wwb_so";
 
 fn configured_agent_vma_name() -> Result<Option<String>, String> {
@@ -405,6 +479,7 @@ fn build_loader_agent_data() -> Result<Vec<u8>, String> {
         tokens.push("catch-signals".to_string());
     }
 
+    append_anti_detect_tokens(&mut tokens)?;
     append_agent_vma_token(&mut tokens)?;
 
     let mut data = if tokens.is_empty() {
@@ -436,6 +511,7 @@ pub(crate) fn build_pure_loader_agent_data() -> Result<Vec<u8>, String> {
         tokens.push("catch-signals".to_string());
     }
 
+    append_anti_detect_tokens(&mut tokens)?;
     append_agent_vma_token(&mut tokens)?;
 
     let mut data = tokens.join(";").into_bytes();

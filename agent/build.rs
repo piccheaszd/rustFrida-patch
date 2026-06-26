@@ -1,5 +1,6 @@
 fn main() -> anyhow::Result<()> {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NOPTRACE");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_QUICKJS_FULL_API");
 
     // 编译 C 代码
     cc::Build::new().file("src/transform.c").compile("my_c_lib");
@@ -17,7 +18,15 @@ fn main() -> anyhow::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let noptrace = std::env::var_os("CARGO_FEATURE_NOPTRACE").is_some();
-    std::fs::write(marker, format!("noptrace={}\n", if noptrace { "1" } else { "0" }))?;
+    let full_api = std::env::var_os("CARGO_FEATURE_QUICKJS_FULL_API").is_some();
+    std::fs::write(
+        marker,
+        format!(
+            "noptrace={}\nfull_api={}\n",
+            if noptrace { "1" } else { "0" },
+            if full_api { "1" } else { "0" }
+        ),
+    )?;
 
     Ok(())
 }

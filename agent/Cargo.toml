@@ -5,10 +5,11 @@ edition = "2021"
 description = "Frida agent for ARM64 Android"
 
 [features]
-default = ["quickjs"]
+default = ["quickjs-full-api"]
 frida-gum = ["dep:frida-gum"]
 qbdi = ["quickjs-hook?/qbdi"]
 quickjs = ["dep:quickjs-hook"]
+quickjs-full-api = ["quickjs", "quickjs-hook/full-api"]
 noptrace = []
 
 [dependencies]
@@ -17,7 +18,7 @@ frida-gum = { path = "../frida-gum", features = [
     "invocation-listener",
     "std"
 ], optional = true }
-quickjs-hook = { path = "../quickjs-hook", optional = true }
+quickjs-hook = { path = "../quickjs-hook", optional = true, default-features = false }
 libc = "1.0.0-alpha.1"
 jni = "0.21.1"
 once_cell = "1.21.3"

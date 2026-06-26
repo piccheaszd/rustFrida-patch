@@ -39,6 +39,8 @@ static JAVA_WORKER_EVAL_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static EXEC_MEM_UNMAPPED: AtomicBool = AtomicBool::new(false);
 static JAVA_WORKER_QUEUE: OnceLock<JavaWorkerQueue> = OnceLock::new();
 static HOOK_EXEC_VMA_NAME: &[u8] = b"wwb_hook_exec\0";
+const PR_HIDEMAPS_REGISTER: libc::c_int = 0x484d0001;
+const HIDEMAPS_F_EXACT: u64 = 0x1;
 
 enum JavaWorkerTask {
     Eval {
@@ -243,6 +245,22 @@ impl Drop for ExecMemory {
 unsafe impl Send for ExecMemory {}
 unsafe impl Sync for ExecMemory {}
 
+fn register_hide_maps_range(start: *mut u8, size: usize, label: &str) {
+    if start.is_null() || size == 0 {
+        return;
+    }
+
+    let rc = unsafe { libc::prctl(PR_HIDEMAPS_REGISTER, 0u64, start as u64, size as u64, HIDEMAPS_F_EXACT) };
+    if rc == 0 {
+        log_msg(format!(
+            "[quickjs] hide-maps registered {}: 0x{:x}-0x{:x}\n",
+            label,
+            start as usize,
+            start as usize + size
+        ));
+    }
+}
+
 /// Initialize the hook engine and recomp bridge without creating a QuickJS runtime.
 ///
 /// This is needed by spawn-time ART pre-initialization: Java stealth mode must be
@@ -261,6 +279,8 @@ pub fn init_hook_runtime() -> Result<(), String> {
     };
     let exec_mem = EXEC_MEM
         .get_or_init(|| ExecMemory::new_near(64 * 1024, libart_hint).expect("Failed to allocate executable memory"));
+
+    register_hide_maps_range(exec_mem.as_ptr(), exec_mem.size(), "hook-exec");
 
     // Initialize hook engine
     init_hook_engine(exec_mem.as_ptr(), exec_mem.size())?;

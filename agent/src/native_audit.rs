@@ -10,6 +10,7 @@ use std::thread;
 
 const HOOK_NORMAL: i32 = 0;
 const HOOK_WXSHADOW: i32 = 1;
+const HOOK_RECOMP: i32 = 2;
 const HOOK_OK: i32 = 0;
 const HOOK_ALREADY_HOOKED: i32 = -3;
 
@@ -19,6 +20,30 @@ static PROC_LOGS: AtomicU32 = AtomicU32::new(0);
 static LIB_LOGS: AtomicU32 = AtomicU32::new(0);
 
 pub(crate) fn install_bochk_audit(profile: &str) -> Result<String, String> {
+    if profile == "runtime" {
+        audit_log(format!(
+            "[bochk-native-audit] passive runtime probe profile={} hook-runtime=deferred\n",
+            profile
+        ));
+        return Ok("bochk native audit passive runtime probe".to_string());
+    }
+
+    match profile {
+        "resolve" => return resolve_probe(),
+        "read-maps" => return read_proc_probe("/proc/self/maps"),
+        "read-status" => return read_proc_probe("/proc/self/status"),
+        "read-stat" => return read_proc_probe("/proc/self/stat"),
+        "maps-dump" => return dump_maps_probe("maps-dump"),
+        _ => {}
+    }
+
+    if let Some(probe) = byte_probe_profile(profile) {
+        if probe.mode.is_none() {
+            let libc = open_libc()?;
+            return install_byte_probe(libc, probe);
+        }
+    }
+
     if INSTALLED.swap(true, Ordering::AcqRel) {
         return Ok("bochk native audit already installed".to_string());
     }
@@ -29,24 +54,20 @@ pub(crate) fn install_bochk_audit(profile: &str) -> Result<String, String> {
         profile
     ));
 
-    match profile {
-        "runtime" => return Ok("bochk native audit runtime initialized".to_string()),
-        "resolve" => return resolve_probe(),
-        "read-maps" => return read_proc_probe("/proc/self/maps"),
-        "read-status" => return read_proc_probe("/proc/self/status"),
-        "read-stat" => return read_proc_probe("/proc/self/stat"),
-        "maps-dump" => return dump_maps_probe("maps-dump"),
-        _ => {}
-    }
-
-    let libc = unsafe { libc::dlopen(c"libc.so".as_ptr(), libc::RTLD_NOW) };
-    if libc.is_null() {
-        INSTALLED.store(false, Ordering::Release);
-        return Err("dlopen(libc.so) failed".to_string());
-    }
+    let libc = match open_libc() {
+        Ok(libc) => libc,
+        Err(e) => {
+            INSTALLED.store(false, Ordering::Release);
+            return Err(e);
+        }
+    };
 
     if let Some(probe) = byte_probe_profile(profile) {
-        return install_byte_probe(libc, probe);
+        let result = install_byte_probe(libc, probe);
+        if result.is_err() {
+            INSTALLED.store(false, Ordering::Release);
+        }
+        return result;
     }
 
     let dump_after_install = matches!(profile, "cold-dump" | "cold-wx-dump");
@@ -151,11 +172,21 @@ pub(crate) fn install_bochk_audit(profile: &str) -> Result<String, String> {
     }
 }
 
+fn open_libc() -> Result<*mut c_void, String> {
+    let libc = unsafe { libc::dlopen(c"libc.so".as_ptr(), libc::RTLD_NOW) };
+    if libc.is_null() {
+        Err("dlopen(libc.so) failed".to_string())
+    } else {
+        Ok(libc)
+    }
+}
+
 type HookCallback = unsafe extern "C" fn(*mut hook_ffi::HookContext, *mut c_void);
 
 fn hook_mode_name(mode: i32) -> &'static str {
     match mode {
         HOOK_WXSHADOW => "wxshadow",
+        HOOK_RECOMP => "recomp",
         _ => "normal",
     }
 }
@@ -204,6 +235,11 @@ fn byte_probe_profile(profile: &str) -> Option<ByteProbe> {
             mode: Some(HOOK_WXSHADOW),
             after: ByteAfterMode::Full,
         }),
+        "bytes-noop-recomp" => Some(ByteProbe {
+            symbol: "getpid",
+            mode: Some(HOOK_RECOMP),
+            after: ByteAfterMode::Full,
+        }),
         "bytes-cold" => Some(ByteProbe {
             symbol: "memmem",
             mode: Some(HOOK_NORMAL),
@@ -248,7 +284,6 @@ fn install_byte_probe(libc: *mut c_void, probe: ByteProbe) -> Result<String, Str
     let mode = probe.mode;
     let addr = unsafe { libc::dlsym(libc, cstr_ptr(symbol)) };
     if addr.is_null() {
-        INSTALLED.store(false, Ordering::Release);
         return Err(format!("missing libc!{}", symbol));
     }
 
@@ -262,19 +297,14 @@ fn install_byte_probe(libc: *mut c_void, probe: ByteProbe) -> Result<String, Str
 
     let mut hooked = false;
     if let Some(mode) = mode {
-        let rc = unsafe { hook_ffi::hook_attach(addr, Some(silent_enter), None, null_mut(), mode) };
-        if rc == HOOK_OK || rc == HOOK_ALREADY_HOOKED {
-            hooked = true;
-            audit_log(format!(
-                "[bochk-native-audit] bytes hooked libc!{} @ 0x{:x} mode={}\n",
-                symbol,
-                addr as usize,
-                hook_mode_name(mode)
-            ));
-        } else {
-            INSTALLED.store(false, Ordering::Release);
-            return Err(format!("hook libc!{} failed rc={}", symbol, rc));
-        }
+        install_byte_hook(addr as usize, mode)?;
+        hooked = true;
+        audit_log(format!(
+            "[bochk-native-audit] bytes hooked libc!{} @ 0x{:x} mode={}\n",
+            symbol,
+            addr as usize,
+            hook_mode_name(mode)
+        ));
     }
 
     match probe.after {
@@ -299,6 +329,83 @@ fn install_byte_probe(libc: *mut c_void, probe: ByteProbe) -> Result<String, Str
         symbol,
         if hooked { " hooked" } else { "" }
     ))
+}
+
+fn install_byte_hook(orig_addr: usize, mode: i32) -> Result<(), String> {
+    let (hook_addr, engine_mode) = if mode == HOOK_RECOMP {
+        quickjs_hook::recomp::ensure_and_translate(orig_addr)
+            .map_err(|e| format!("recomp translate 0x{:x}: {}", orig_addr, e))?;
+        let slot = quickjs_hook::recomp::alloc_trampoline_slot(orig_addr)
+            .map_err(|e| format!("recomp slot 0x{:x}: {}", orig_addr, e))?;
+        (slot, HOOK_NORMAL)
+    } else {
+        (orig_addr, mode)
+    };
+
+    let rc = unsafe {
+        hook_ffi::hook_attach(
+            hook_addr as *mut c_void,
+            Some(silent_enter),
+            None,
+            null_mut(),
+            engine_mode,
+        )
+    };
+    if rc != HOOK_OK && rc != HOOK_ALREADY_HOOKED {
+        if mode == HOOK_RECOMP {
+            let _ = quickjs_hook::recomp::try_revert_slot_patch(orig_addr);
+        }
+        return Err(format!(
+            "hook attach 0x{:x} mode={} failed rc={}",
+            orig_addr,
+            hook_mode_name(mode),
+            rc
+        ));
+    }
+
+    if mode != HOOK_RECOMP {
+        return Ok(());
+    }
+
+    let trampoline = unsafe { hook_ffi::hook_get_trampoline(hook_addr as *mut c_void) };
+    if trampoline.is_null() {
+        unsafe {
+            hook_ffi::hook_remove(hook_addr as *mut c_void);
+        }
+        let _ = quickjs_hook::recomp::try_revert_slot_patch(orig_addr);
+        return Err(format!("recomp hook trampoline is null for 0x{:x}", orig_addr));
+    }
+
+    if let Err(e) = quickjs_hook::recomp::fixup_slot_trampoline(trampoline as *mut u8, orig_addr) {
+        unsafe {
+            hook_ffi::hook_remove(hook_addr as *mut c_void);
+        }
+        let _ = quickjs_hook::recomp::try_revert_slot_patch(orig_addr);
+        return Err(format!("recomp fixup trampoline 0x{:x}: {}", orig_addr, e));
+    }
+
+    let mark_rc = unsafe { hook_ffi::hook_mark_recomp_hook(hook_addr as *mut c_void) };
+    if mark_rc != HOOK_OK {
+        unsafe {
+            hook_ffi::hook_remove(hook_addr as *mut c_void);
+        }
+        let _ = quickjs_hook::recomp::try_revert_slot_patch(orig_addr);
+        return Err(format!("recomp mark hook 0x{:x} failed rc={}", orig_addr, mark_rc));
+    }
+
+    if let Err(e) = quickjs_hook::recomp::commit_slot_patch(orig_addr) {
+        unsafe {
+            hook_ffi::hook_remove(hook_addr as *mut c_void);
+        }
+        let _ = quickjs_hook::recomp::try_revert_slot_patch(orig_addr);
+        return Err(format!("recomp commit slot 0x{:x}: {}", orig_addr, e));
+    }
+
+    audit_log(format!(
+        "[bochk-native-audit] bytes recomp slot orig=0x{:x} slot=0x{:x}\n",
+        orig_addr, hook_addr
+    ));
+    Ok(())
 }
 
 fn snapshot_symbol_map(symbol: &str, addr: usize, tag: &str) {
@@ -511,11 +618,7 @@ fn audit_log(msg: String) {
 }
 
 fn resolve_probe() -> Result<String, String> {
-    let libc = unsafe { libc::dlopen(c"libc.so".as_ptr(), libc::RTLD_NOW) };
-    if libc.is_null() {
-        INSTALLED.store(false, Ordering::Release);
-        return Err("dlopen(libc.so) failed".to_string());
-    }
+    let libc = open_libc()?;
 
     let symbols = ["prctl", "open", "openat", "getpid", "memmem", "ether_ntoa_r"];
     let mut resolved = 0usize;
@@ -534,13 +637,11 @@ fn resolve_probe() -> Result<String, String> {
 
 fn read_proc_probe(path: &str) -> Result<String, String> {
     let Some(c_path) = proc_path_ptr(path) else {
-        INSTALLED.store(false, Ordering::Release);
         return Err(format!("unsupported proc probe path: {}", path));
     };
 
     let fd = unsafe { libc::open(c_path, libc::O_RDONLY | libc::O_CLOEXEC) };
     if fd < 0 {
-        INSTALLED.store(false, Ordering::Release);
         return Err(format!("open({}) failed", path));
     }
 
@@ -550,7 +651,6 @@ fn read_proc_probe(path: &str) -> Result<String, String> {
         libc::close(fd);
     }
     if n < 0 {
-        INSTALLED.store(false, Ordering::Release);
         return Err(format!("read({}) failed", path));
     }
 

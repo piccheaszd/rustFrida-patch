@@ -42,7 +42,7 @@ fn auto_load_delay() -> Duration {
 
 fn bochk_native_audit_command() -> Option<&'static str> {
     let value = std::env::var("RF_BOCHK_AUDIT").ok()?;
-    match value.as_str() {
+    match value.trim() {
         "0" => None,
         value if value.eq_ignore_ascii_case("false") => None,
         "runtime" => Some("nativeaudit bochk-runtime"),
@@ -55,6 +55,9 @@ fn bochk_native_audit_command() -> Option<&'static str> {
         "bytes-noop" | "bytes-getpid-hook" => Some("nativeaudit bochk-bytes-noop"),
         "bytes-noop-wx" | "bytes-getpid-wx" | "wx-bytes-noop" | "wx-bytes-getpid" => {
             Some("nativeaudit bochk-bytes-noop-wx")
+        }
+        "bytes-noop-recomp" | "bytes-getpid-recomp" | "recomp-bytes-noop" | "recomp-bytes-getpid" => {
+            Some("nativeaudit bochk-bytes-noop-recomp")
         }
         "bytes-cold" | "bytes-memmem" => Some("nativeaudit bochk-bytes-cold"),
         "bytes-cold-wx" | "bytes-memmem-wx" | "wx-bytes-cold" | "wx-bytes-memmem" => {
@@ -95,7 +98,10 @@ fn bochk_native_audit_command() -> Option<&'static str> {
         "openat-only-wx" | "wx-openat-only" => Some("nativeaudit bochk-openat-only-wx"),
         "wx" | "wxshadow" | "all-wx" | "bochk-wx" => Some("nativeaudit bochk-wx"),
         "1" | "true" | "all" | "bochk" => Some("nativeaudit bochk"),
-        _ => Some("nativeaudit bochk"),
+        other => {
+            eprintln!("RF_BOCHK_AUDIT: unsupported profile '{}', skipping native audit", other);
+            None
+        }
     }
 }
 

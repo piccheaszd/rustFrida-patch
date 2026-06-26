@@ -1,7 +1,14 @@
 //! hook() and unhook() API implementation
 
 mod callback;
+#[cfg(feature = "cmodule-api")]
 mod cmodule;
+#[cfg(not(feature = "cmodule-api"))]
+mod cmodule {
+    pub(crate) fn is_cmodule_code_address(_addr: u64) -> bool {
+        false
+    }
+}
 mod functions;
 #[cfg(feature = "qbdi")]
 mod qbdi;
@@ -55,6 +62,7 @@ pub fn register_hook_api(ctx: &JSContext) {
         add_cfunction_to_object(ctx.as_ptr(), interceptor, "flush", js_interceptor_flush, 0);
         global.set_property(ctx.as_ptr(), "Interceptor", crate::value::JSValue(interceptor));
 
+        #[cfg(feature = "cmodule-api")]
         cmodule::register_cmodule_api(ctx.as_ptr(), g);
     }
 
@@ -67,22 +75,21 @@ pub fn register_hook_api(ctx: &JSContext) {
 
     global.free(ctx.as_ptr());
 
-    if crate::is_minimal_api_profile() {
-        return;
-    }
+    #[cfg(feature = "native-js-boot-api")]
+    if !crate::is_minimal_api_profile() {
+        // Load NativeFunction JS wrapper (Frida-compatible API)
+        let boot = include_str!("native_boot.js");
+        match ctx.eval(boot, "<native_boot>") {
+            Ok(val) => val.free(ctx.as_ptr()),
+            Err(e) => crate::jsapi::console::output_message(&format!("[hook_api] native_boot error: {}", e)),
+        }
 
-    // Load NativeFunction JS wrapper (Frida-compatible API)
-    let boot = include_str!("native_boot.js");
-    match ctx.eval(boot, "<native_boot>") {
-        Ok(val) => val.free(ctx.as_ptr()),
-        Err(e) => crate::jsapi::console::output_message(&format!("[hook_api] native_boot error: {}", e)),
-    }
-
-    // Load Interceptor helpers (args/retval Proxy wrappers for Frida-compatible onEnter/onLeave)
-    let interceptor_boot = include_str!("interceptor_boot.js");
-    match ctx.eval(interceptor_boot, "<interceptor_boot>") {
-        Ok(val) => val.free(ctx.as_ptr()),
-        Err(e) => crate::jsapi::console::output_message(&format!("[hook_api] interceptor_boot error: {}", e)),
+        // Load Interceptor helpers (args/retval Proxy wrappers for Frida-compatible onEnter/onLeave)
+        let interceptor_boot = include_str!("interceptor_boot.js");
+        match ctx.eval(interceptor_boot, "<interceptor_boot>") {
+            Ok(val) => val.free(ctx.as_ptr()),
+            Err(e) => crate::jsapi::console::output_message(&format!("[hook_api] interceptor_boot error: {}", e)),
+        }
     }
 }
 

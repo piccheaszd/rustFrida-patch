@@ -17,6 +17,7 @@
 //! // For overloaded methods:
 //! Activity.foo.overload("(II)V").impl = function(ctx) { ... };
 //! ```
+#![cfg_attr(not(feature = "lazy-java-api"), allow(dead_code, unused_imports))]
 
 /// Transmute a JNI function pointer from the function table by index.
 macro_rules! jni_fn {
@@ -1254,6 +1255,7 @@ pub(crate) fn lazy_init_reflect_cache() {
     }
 }
 
+#[cfg(feature = "lazy-java-api")]
 unsafe extern "C" fn js_java_ensure_initialized(
     ctx: *mut ffi::JSContext,
     _this: ffi::JSValue,
@@ -1266,6 +1268,7 @@ unsafe extern "C" fn js_java_ensure_initialized(
     }
 }
 
+#[cfg(feature = "lazy-java-api")]
 pub fn register_lazy_java_api(ctx: &JSContext) {
     let global = ctx.global_object();
 
@@ -1327,6 +1330,7 @@ pub fn register_lazy_java_api(ctx: &JSContext) {
 
 /// Install full Java API: hook/unhook (C-level) + _methods, then eval boot script
 /// to set up the Proxy-based Java.use() API.
+#[cfg(feature = "lazy-java-api")]
 unsafe fn install_java_api(ctx_ptr: *mut ffi::JSContext) -> Result<ffi::JSValue, String> {
     if ctx_ptr.is_null() {
         return Err("Java lazy init: JSContext is null".to_string());
@@ -1512,6 +1516,7 @@ unsafe fn install_java_api(ctx_ptr: *mut ffi::JSContext) -> Result<ffi::JSValue,
     Ok(installed)
 }
 
+#[cfg(feature = "lazy-java-api")]
 pub fn register_java_api(ctx: &JSContext) {
     unsafe {
         match install_java_api(ctx.as_ptr()) {

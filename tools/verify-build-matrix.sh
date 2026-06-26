@@ -32,6 +32,7 @@ run cargo build -p agent --target "$TARGET" "${PROFILE_ARGS[@]}"
 run cargo check -p rust_frida --target "$TARGET" "${PROFILE_ARGS[@]}"
 
 run cargo build -p agent --target "$TARGET" "${PROFILE_ARGS[@]}" --no-default-features --features quickjs,noptrace
+run cargo build -p agent --target "$TARGET" "${PROFILE_ARGS[@]}" --no-default-features --features quickjs-full-api,noptrace
 run cargo check -p rust_frida --target "$TARGET" "${PROFILE_ARGS[@]}" --no-default-features --features noptrace
 
 # Leave the workspace in the default ptrace-agent state for ordinary development.

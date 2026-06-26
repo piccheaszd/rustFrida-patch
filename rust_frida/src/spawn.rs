@@ -470,6 +470,14 @@ fn spawn_and_wait_hello(package: &str, timeout_secs: u64) -> Result<SpawnHello, 
 }
 
 pub(crate) fn wait_for_repl_ready(pid: i32) {
+    if std::env::var("RF_SKIP_REPL_READY")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes"))
+        .unwrap_or(false)
+    {
+        log_verbose!("RF_SKIP_REPL_READY=1，跳过 spawn 后 /proc 状态轮询");
+        return;
+    }
+
     let start = Instant::now();
     loop {
         let elapsed = start.elapsed();
