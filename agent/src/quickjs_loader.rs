@@ -188,7 +188,7 @@ impl ExecMemory {
     /// 调用 C 侧 hook_mmap_near 扫描 maps 空隙分配 nearby RWX 内存。
     /// hint=0 时退化为普通 mmap。
     fn new_near(size: usize, hint: usize) -> Option<Self> {
-        let minimal = quickjs_hook::api_profile_name() == "minimal";
+        let minimal = quickjs_hook::api_surface_name() == "minimal";
         let page_size = if minimal {
             4096usize
         } else {
@@ -245,9 +245,9 @@ impl Drop for ExecMemory {
 unsafe impl Send for ExecMemory {}
 unsafe impl Sync for ExecMemory {}
 
-fn register_hide_maps_range(start: *mut u8, size: usize, label: &str) {
+fn register_hide_maps_range(start: *mut u8, size: usize, label: &str) -> Result<(), String> {
     if start.is_null() || size == 0 {
-        return;
+        return Ok(());
     }
 
     let rc = unsafe { libc::prctl(PR_HIDEMAPS_REGISTER, 0u64, start as u64, size as u64, HIDEMAPS_F_EXACT) };
@@ -258,6 +258,17 @@ fn register_hide_maps_range(start: *mut u8, size: usize, label: &str) {
             start as usize,
             start as usize + size
         ));
+        Ok(())
+    } else {
+        let err = std::io::Error::last_os_error();
+        log_msg(format!(
+            "[quickjs] hide-maps register failed {}: 0x{:x}-0x{:x}: {}\n",
+            label,
+            start as usize,
+            start as usize + size,
+            err
+        ));
+        Err(format!("hide-maps register {} failed: {}", label, err))
     }
 }
 
@@ -272,7 +283,7 @@ pub fn init_hook_runtime() -> Result<(), String> {
 
     // Minimal profile avoids /proc/self/maps during engine initialization; some
     // hardened apps crash on that read path immediately after injection.
-    let libart_hint = if quickjs_hook::api_profile_name() == "minimal" {
+    let libart_hint = if quickjs_hook::api_surface_name() == "minimal" {
         0
     } else {
         find_libart_base().unwrap_or(0)
@@ -280,7 +291,11 @@ pub fn init_hook_runtime() -> Result<(), String> {
     let exec_mem = EXEC_MEM
         .get_or_init(|| ExecMemory::new_near(64 * 1024, libart_hint).expect("Failed to allocate executable memory"));
 
-    register_hide_maps_range(exec_mem.as_ptr(), exec_mem.size(), "hook-exec");
+    if let Err(e) = register_hide_maps_range(exec_mem.as_ptr(), exec_mem.size(), "hook-exec") {
+        if quickjs_hook::is_hardened_api_profile() {
+            return Err(format!("hardened profile fail-closed: {}", e));
+        }
+    }
 
     // Initialize hook engine
     init_hook_engine(exec_mem.as_ptr(), exec_mem.size())?;
@@ -302,6 +317,7 @@ pub fn init_hook_runtime() -> Result<(), String> {
         crate::recompiler::patch_suspend_polls(addr, entry)
     });
 
+    quickjs_hook::seal_hook_engine_exec();
     HOOK_RUNTIME_INITIALIZED.store(true, Ordering::SeqCst);
     Ok(())
 }
@@ -313,7 +329,7 @@ pub fn init() -> Result<(), String> {
     }
 
     quickjs_hook::recomp::set_cleanup_release_only(false);
-    if quickjs_hook::api_profile_name() == "minimal" {
+    if quickjs_hook::api_surface_name() == "minimal" {
         log_msg("[quickjs] hook runtime deferred by minimal profile\n".to_string());
     } else {
         init_hook_runtime()?;
@@ -504,7 +520,9 @@ pub fn execute_script(script: &str) -> Result<String, String> {
         return Err("JS 引擎未初始化，请先执行 jsinit".to_string());
     }
 
-    load_script(script)
+    let result = load_script(script);
+    quickjs_hook::seal_hook_engine_exec();
+    result
 }
 
 /// Load + execute 指定源文件名的脚本（错误信息会显示 `filename:line:col`）
@@ -513,7 +531,9 @@ pub fn execute_script_with_filename(script: &str, filename: &str) -> Result<Stri
         return Err("JS 引擎未初始化，请先执行 jsinit".to_string());
     }
 
-    load_script_with_filename(script, filename)
+    let result = load_script_with_filename(script, filename);
+    quickjs_hook::seal_hook_engine_exec();
+    result
 }
 
 /// Get tab-completion candidates for the given prefix from the live JS engine.

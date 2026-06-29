@@ -388,6 +388,7 @@
             address: base,
             namePtr: namePtr,
             sigPtr: sigPtr,
+            fnPtrSlot: base.add(_POINTER_SIZE * 2),
             fnPtr: fnPtr,
             name: _readCStringMaybe(namePtr),
             sig: _readCStringMaybe(sigPtr)

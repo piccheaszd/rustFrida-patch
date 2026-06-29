@@ -133,6 +133,27 @@
 #ifndef PR_ANTIDETECT_REGISTER
 # define PR_ANTIDETECT_REGISTER 0x41440001UL
 #endif
+#ifndef PR_ANTIDETECT_ADD_SELF_PROTECT_RULE
+# define PR_ANTIDETECT_ADD_SELF_PROTECT_RULE 0x41440004UL
+#endif
+#ifndef AD_F_BLOCK_SELF_EXIT
+# define AD_F_BLOCK_SELF_EXIT 0x80UL
+#endif
+#ifndef AD_F_BLOCK_SELF_KILL
+# define AD_F_BLOCK_SELF_KILL 0x100UL
+#endif
+#ifndef AD_RULE_EXIT
+# define AD_RULE_EXIT 0x1UL
+#endif
+#ifndef AD_RULE_KILL
+# define AD_RULE_KILL 0x2UL
+#endif
+#ifndef AD_RULE_PC
+# define AD_RULE_PC 0x4UL
+#endif
+#ifndef AD_RULE_LR
+# define AD_RULE_LR 0x8UL
+#endif
 #ifndef PROT_BTI
 # define PROT_BTI 0x10
 #endif
@@ -336,6 +357,9 @@ static void rustfrida_set_symbol_error (RustFridaLinkedModule * module, const Fr
 static bool rustfrida_protect_load_segments (RustFridaLinkedModule * module, const FridaLibcApi * libc, bool enable_bti);
 static void rustfrida_name_load_segments (RustFridaLinkedModule * module, const char * name);
 static void rustfrida_register_anti_detect_profile (const char * agent_data, int diagfd, const FridaLibcApi * libc);
+static bool rustfrida_agent_data_wants_self_protect_rules (const char * agent_data);
+static void rustfrida_register_anti_detect_self_protect_rule (ElfW(Addr) start, size_t size, int diagfd,
+    const FridaLibcApi * libc, const char * begin_msg, const char * ok_msg, const char * fail_msg);
 static void rustfrida_register_hide_maps_ranges (RustFridaLoaderContext * ctx, RustFridaLinkedModule * module,
     int diagfd, const FridaLibcApi * libc);
 static void rustfrida_get_fd_vma_name (int fd, char * name, size_t name_size, const FridaLibcApi * libc);
@@ -2702,6 +2726,33 @@ rustfrida_register_anti_detect_profile (const char * agent_data, int diagfd, con
       "anti-detect:register-profile-failed", libc);
 }
 
+static bool
+rustfrida_agent_data_wants_self_protect_rules (const char * agent_data)
+{
+  uint64_t flags = 0;
+
+  if (!frida_agent_data_get_u64 (agent_data, "anti-detect-flags", &flags))
+    return false;
+
+  return flags == 0 || (flags & (AD_F_BLOCK_SELF_EXIT | AD_F_BLOCK_SELF_KILL)) != 0;
+}
+
+static void
+rustfrida_register_anti_detect_self_protect_rule (ElfW(Addr) start, size_t size, int diagfd,
+    const FridaLibcApi * libc, const char * begin_msg, const char * ok_msg, const char * fail_msg)
+{
+  ssize_t ret;
+  size_t flags = AD_RULE_EXIT | AD_RULE_KILL | AD_RULE_PC | AD_RULE_LR;
+
+  if (start == 0 || size == 0)
+    return;
+
+  frida_send_debug (diagfd, begin_msg, libc);
+  ret = frida_syscall_5 (__NR_prctl, PR_ANTIDETECT_ADD_SELF_PROTECT_RULE, 0,
+      start, size, flags);
+  frida_send_debug (diagfd, ret == 0 ? ok_msg : fail_msg, libc);
+}
+
 static void
 rustfrida_register_hide_maps_range (ElfW(Addr) start, size_t size, int diagfd, const FridaLibcApi * libc,
     const char * begin_msg, const char * ok_msg, const char * fail_msg)
@@ -2991,6 +3042,13 @@ frida_main (void * user_data)
   }
 
   rustfrida_register_anti_detect_profile (ctx->agent_data, ctrlfd, libc);
+  if (ctx != NULL && rustfrida_agent_data_wants_self_protect_rules (ctx->agent_data) &&
+      ctx->stage1_base != 0 && ctx->stage1_rx_size != 0)
+    rustfrida_register_anti_detect_self_protect_rule ((ElfW(Addr)) ctx->stage1_base,
+        (size_t) ctx->stage1_rx_size, ctrlfd, libc,
+        "anti-detect:register-stage1-self-protect",
+        "anti-detect:register-stage1-self-protect-ok",
+        "anti-detect:register-stage1-self-protect-failed");
 
   /* Link the agent SO from the selected host transfer path. */
   if (ctx->agent_handle == NULL)
@@ -3034,6 +3092,13 @@ frida_main (void * user_data)
     frida_send_debug (ctrlfd, "loader:link-agent-ok", libc);
     frida_send_log (ctrlfd, "worker: agent linked", libc);
     rustfrida_register_hide_maps_ranges (ctx, &agent_module, ctrlfd, libc);
+    if (ctx != NULL && rustfrida_agent_data_wants_self_protect_rules (ctx->agent_data) &&
+        agent_module.veneer_start != 0 && agent_module.veneer_end > agent_module.veneer_start)
+      rustfrida_register_anti_detect_self_protect_rule (agent_module.veneer_start,
+          (size_t) (agent_module.veneer_end - agent_module.veneer_start), ctrlfd, libc,
+          "anti-detect:register-veneer-self-protect",
+          "anti-detect:register-veneer-self-protect-ok",
+          "anti-detect:register-veneer-self-protect-failed");
 
     frida_send_debug (ctrlfd, "loader:find-entry", libc);
     ctx->agent_entrypoint_impl = rustfrida_find_export (&agent_module, ctx->agent_entrypoint);

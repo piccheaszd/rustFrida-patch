@@ -107,6 +107,8 @@ typedef struct {
  * @return              0 on success, -1 on failure
  */
 int hook_engine_init(void* exec_mem, size_t size);
+int hook_engine_seal_exec(void);
+int hook_engine_unseal_exec(void);
 
 /*
  * Install a simple replacement hook

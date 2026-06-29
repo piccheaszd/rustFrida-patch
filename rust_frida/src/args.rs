@@ -16,6 +16,8 @@ pub(crate) enum QuickJsProfile {
     Full,
     /// Minimal API surface for hardened apps that crash during optional bootstraps.
     Minimal,
+    /// Minimal API surface with fail-closed hardening checks.
+    Hardened,
 }
 
 impl QuickJsProfile {
@@ -23,6 +25,7 @@ impl QuickJsProfile {
         match self {
             QuickJsProfile::Full => "full",
             QuickJsProfile::Minimal => "minimal",
+            QuickJsProfile::Hardened => "hardened",
         }
     }
 }

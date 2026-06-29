@@ -34,6 +34,27 @@ mod quickjs_loader;
 #[cfg(feature = "frida-gum")]
 mod stalker;
 
+#[cfg(feature = "noptrace")]
+const AGENT_FEATURE_NOPTRACE_BIT: u8 = 0x01;
+#[cfg(not(feature = "noptrace"))]
+const AGENT_FEATURE_NOPTRACE_BIT: u8 = 0x00;
+#[cfg(feature = "quickjs-full-api")]
+const AGENT_FEATURE_FULL_API_BIT: u8 = 0x02;
+#[cfg(not(feature = "quickjs-full-api"))]
+const AGENT_FEATURE_FULL_API_BIT: u8 = 0x00;
+
+#[used]
+static AGENT_BUILD_FEATURE_MARKER: [u8; 8] = [
+    0x9b,
+    0x31,
+    0x6c,
+    0xd4,
+    AGENT_FEATURE_NOPTRACE_BIT | AGENT_FEATURE_FULL_API_BIT,
+    (AGENT_FEATURE_NOPTRACE_BIT | AGENT_FEATURE_FULL_API_BIT) ^ 0x5a,
+    0xa7,
+    0x0d,
+];
+
 use crate::communication::{
     flush_cached_logs, is_cmd_frame, is_qbdi_helper_frame, log_msg, log_msg_sync, register_stream_fd, send_bye,
     send_complete, send_eval_err, send_eval_ok, send_hello_raw_fd, send_rpc_err, send_rpc_ok, shutdown_log_writer,
@@ -713,7 +734,7 @@ where
     F: FnOnce() + Send + 'static,
 {
     JS_TASKS_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
-    if quickjs_hook::api_profile_name() == "minimal" {
+    if quickjs_hook::api_surface_name() == "minimal" {
         log_msg(format!("[quickjs-worker] inline task selected: {}\n", label));
         run_js_task(label, task);
         JS_TASKS_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);

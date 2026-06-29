@@ -72,6 +72,7 @@ const JS_TOP_LEVEL_EXECUTION_TIMEOUT_MS: u64 = 6_500;
 static QBDI_OUTPUT_DIR: OnceLock<String> = OnceLock::new();
 static QBDI_HELPER_BLOB: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 static API_PROFILE: AtomicU8 = AtomicU8::new(API_PROFILE_FULL);
+static API_PROFILE_HARDENED: AtomicU8 = AtomicU8::new(0);
 static JS_EXECUTION_DEADLINE_MS: AtomicU64 = AtomicU64::new(0);
 
 const API_PROFILE_FULL: u8 = 0;
@@ -81,17 +82,34 @@ pub fn set_api_profile(profile: &str) -> Result<&'static str, String> {
     match profile.trim().to_ascii_lowercase().as_str() {
         "" | "full" => {
             API_PROFILE.store(API_PROFILE_FULL, Ordering::Release);
+            API_PROFILE_HARDENED.store(0, Ordering::Release);
             Ok("full")
         }
-        "minimal" | "safe" | "hardened" => {
+        "minimal" | "safe" => {
             API_PROFILE.store(API_PROFILE_MINIMAL, Ordering::Release);
+            API_PROFILE_HARDENED.store(0, Ordering::Release);
             Ok("minimal")
+        }
+        "hardened" => {
+            API_PROFILE.store(API_PROFILE_MINIMAL, Ordering::Release);
+            API_PROFILE_HARDENED.store(1, Ordering::Release);
+            Ok("hardened")
         }
         other => Err(format!("unsupported QuickJS profile: {}", other)),
     }
 }
 
 pub fn api_profile_name() -> &'static str {
+    if is_hardened_api_profile() {
+        "hardened"
+    } else if is_minimal_api_profile() {
+        "minimal"
+    } else {
+        "full"
+    }
+}
+
+pub fn api_surface_name() -> &'static str {
     if is_minimal_api_profile() {
         "minimal"
     } else {
@@ -101,6 +119,16 @@ pub fn api_profile_name() -> &'static str {
 
 pub(crate) fn is_minimal_api_profile() -> bool {
     API_PROFILE.load(Ordering::Acquire) == API_PROFILE_MINIMAL
+}
+
+pub fn is_hardened_api_profile() -> bool {
+    API_PROFILE_HARDENED.load(Ordering::Acquire) != 0
+}
+
+pub fn seal_hook_engine_exec() {
+    unsafe {
+        let _ = ffi::hook::hook_engine_seal_exec();
+    }
 }
 
 pub fn set_qbdi_output_dir(output_dir: impl Into<String>) {

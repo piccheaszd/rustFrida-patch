@@ -22,7 +22,8 @@ use crate::jsapi::util::add_cfunction_to_object;
 use callback::{in_flight_native_hook_callbacks, wait_for_in_flight_native_hook_callbacks};
 use functions::{
     js_attach_native, js_call_native, js_diag_alloc_near, js_hook, js_hook_native, js_interceptor_attach,
-    js_interceptor_detach_all, js_interceptor_flush, js_interceptor_replace, js_native_call, js_recomp_hook, js_unhook,
+    js_interceptor_detach_all, js_interceptor_flush, js_interceptor_replace, js_interceptor_replace_slot,
+    js_interceptor_restore_slot, js_native_call, js_recomp_hook, js_unhook,
 };
 #[cfg(feature = "qbdi")]
 pub use qbdi::preload_qbdi_helper;
@@ -58,6 +59,8 @@ pub fn register_hook_api(ctx: &JSContext) {
         let interceptor = ffi::JS_NewObject(ctx.as_ptr());
         add_cfunction_to_object(ctx.as_ptr(), interceptor, "attach", js_interceptor_attach, 2);
         add_cfunction_to_object(ctx.as_ptr(), interceptor, "replace", js_interceptor_replace, 2);
+        add_cfunction_to_object(ctx.as_ptr(), interceptor, "replaceSlot", js_interceptor_replace_slot, 2);
+        add_cfunction_to_object(ctx.as_ptr(), interceptor, "restoreSlot", js_interceptor_restore_slot, 1);
         add_cfunction_to_object(ctx.as_ptr(), interceptor, "detachAll", js_interceptor_detach_all, 0);
         add_cfunction_to_object(ctx.as_ptr(), interceptor, "flush", js_interceptor_flush, 0);
         global.set_property(ctx.as_ptr(), "Interceptor", crate::value::JSValue(interceptor));
@@ -127,6 +130,7 @@ pub(crate) unsafe fn free_hook_callback(data: &registry::HookData) {
 /// Phase 1 - 切断 native hook 入口 (hook() JS API 装的所有 hook，不释放 callback)。
 /// 注册表条目不 take，保留到 `free_native_hooks` 再批量释放 JS callback。
 pub fn cut_native_hooks() {
+    functions::restore_all_slots();
     let hooks = {
         let guard = HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         guard

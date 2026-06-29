@@ -12,7 +12,6 @@ mod props;
 #[cfg(not(feature = "noptrace"))]
 mod remote_agent;
 mod repl;
-#[cfg(not(feature = "noptrace"))]
 mod selinux;
 #[cfg(not(feature = "noptrace"))]
 mod server;

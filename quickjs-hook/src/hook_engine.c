@@ -13,6 +13,7 @@
 
 /* Global engine state */
 HookEngine g_engine = {0};
+static int g_exec_mem_sealed = 0;
 
 /* hook_engine_cleanup 快照的扩展 pool 范围。Rust 侧 safepoint + munmap 共用。 */
 ExecPoolRange g_retained_pool_ranges[MAX_EXEC_POOLS];
@@ -204,7 +205,62 @@ int hook_engine_init(void* exec_mem, size_t size) {
     g_engine.exec_mem_page_size = (size_t)sysconf(_SC_PAGESIZE);
     hook_lock_init(&g_engine.lock);
     g_engine.initialized = 1;
+    g_exec_mem_sealed = 0;
 
+    return 0;
+}
+
+static int hook_engine_set_pool_prot(int prot) {
+    int rc = 0;
+
+    if (!g_engine.initialized)
+        return -1;
+
+    if (g_engine.exec_mem && g_engine.exec_mem_size &&
+        mprotect(g_engine.exec_mem, g_engine.exec_mem_size, prot) != 0) {
+        hook_log("hook_engine_set_pool_prot: mprotect initial %p+%zu prot=0x%x errno=%d",
+                 g_engine.exec_mem, g_engine.exec_mem_size, prot, errno);
+        rc = -1;
+    }
+
+    int pool_count = g_engine.pool_count;
+    if (pool_count > MAX_EXEC_POOLS)
+        pool_count = MAX_EXEC_POOLS;
+    for (int i = 0; i < pool_count; i++) {
+        ExecPool* pool = &g_engine.pools[i];
+        if (!pool->base || !pool->size)
+            continue;
+        if (mprotect(pool->base, pool->size, prot) != 0) {
+            hook_log("hook_engine_set_pool_prot: mprotect pool#%d %p+%zu prot=0x%x errno=%d",
+                     i, pool->base, pool->size, prot, errno);
+            rc = -1;
+        }
+    }
+
+    return rc;
+}
+
+int hook_engine_seal_exec(void) {
+    if (!g_engine.initialized)
+        return -1;
+    if (g_exec_mem_sealed)
+        return 0;
+    if (hook_engine_set_pool_prot(PROT_READ | PROT_EXEC) != 0)
+        return -1;
+    g_exec_mem_sealed = 1;
+    hook_log("hook_engine_seal_exec: exec pools RX");
+    return 0;
+}
+
+int hook_engine_unseal_exec(void) {
+    if (!g_engine.initialized)
+        return -1;
+    if (!g_exec_mem_sealed)
+        return 0;
+    if (hook_engine_set_pool_prot(PROT_READ | PROT_WRITE | PROT_EXEC) != 0)
+        return -1;
+    g_exec_mem_sealed = 0;
+    hook_log("hook_engine_unseal_exec: exec pools RWX");
     return 0;
 }
 

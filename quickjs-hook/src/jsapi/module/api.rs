@@ -302,6 +302,42 @@ unsafe extern "C" fn js_module_enumerate_imports(
     arr
 }
 
+/// Module.findImportSlot(moduleName, symbolName) → NativePointer | null
+unsafe extern "C" fn js_module_find_import_slot(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 2 {
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"Module.findImportSlot(moduleName, symbolName) requires 2 arguments\0".as_ptr() as *const _,
+        );
+    }
+    let module_name = match require_string_arg(ctx, JSValue(*argv), "moduleName") {
+        Ok(s) => s,
+        Err(exc) => return exc,
+    };
+    let symbol_name = match require_string_arg(ctx, JSValue(*argv.add(1)), "symbolName") {
+        Ok(s) => s,
+        Err(exc) => return exc,
+    };
+
+    let Some((path, base)) = resolve_module_for_enumeration(&module_name) else {
+        return JSValue::null().raw();
+    };
+
+    let imports = elf_module_enumerate_imports(&path, base);
+    for rec in imports {
+        if rec.name == symbol_name {
+            return create_native_pointer(ctx, rec.slot).raw();
+        }
+    }
+
+    JSValue::null().raw()
+}
+
 /// Module.enumerateSymbols(moduleName) → Array of {type, name, address, isGlobal, isDefined}
 unsafe extern "C" fn js_module_enumerate_symbols(
     ctx: *mut ffi::JSContext,
@@ -547,6 +583,13 @@ pub fn register_module_api(ctx: &JSContext) {
             "enumerateImports",
             js_module_enumerate_imports,
             1,
+        );
+        add_cfunction_to_object(
+            ctx_ptr,
+            module_obj,
+            "findImportSlot",
+            js_module_find_import_slot,
+            2,
         );
         add_cfunction_to_object(
             ctx_ptr,

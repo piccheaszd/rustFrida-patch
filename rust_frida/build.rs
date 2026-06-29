@@ -9,7 +9,7 @@ fn main() {
     let profile_dir = if profile == "release" { "release" } else { "debug" };
     let noptrace = std::env::var_os("CARGO_FEATURE_NOPTRACE").is_some();
     println!("cargo:rerun-if-env-changed=RF_AGENT_API");
-    let agent_api = std::env::var("RF_AGENT_API").unwrap_or_else(|_| "min".to_string());
+    let agent_api = std::env::var("RF_AGENT_API").unwrap_or_else(|_| "full".to_string());
     let full_api_agent = match agent_api.as_str() {
         "min" | "native-min" | "quickjs" => false,
         "full" | "full-api" | "quickjs-full-api" => true,
@@ -114,7 +114,7 @@ fn main() {
         (true, true) => " --no-default-features --features quickjs-full-api,noptrace",
         (true, false) => " --no-default-features --features quickjs,noptrace",
         (false, true) => " --no-default-features --features quickjs-full-api",
-        (false, false) => "",
+        (false, false) => " --no-default-features --features quickjs",
     };
     let agent_build_flag = format!("{}{}", release_flag, agent_feature_flag);
     let expected_agent_features = [
@@ -192,21 +192,27 @@ fn ensure_agent_variant(
         );
     }
 
-    let built_features = std::fs::read_to_string(built_marker).unwrap_or_else(|e| {
-        panic!(
-            "missing built agent feature marker {}: {}. Run `cargo build -p agent{}` first",
-            built_marker.display(),
-            e,
-            agent_build_flag
-        )
-    });
-    if !feature_marker_matches(&built_features, expected_features) {
-        panic!(
-            "built agent feature mismatch: expected {:?}, got {:?}. Run `cargo build -p agent{}` first",
-            expected_features,
-            built_features.trim(),
-            agent_build_flag
-        );
+    let built_features = std::fs::read_to_string(built_marker);
+    let marker_matches = built_features
+        .as_deref()
+        .is_ok_and(|features| feature_marker_matches(features, expected_features));
+    if !marker_matches {
+        if agent_binary_feature_marker_matches(built_agent_so, expected_features) {
+            let _ = std::fs::write(built_marker, format!("{}\n", expected_features.join("\n")));
+        } else if let Ok(features) = built_features {
+            panic!(
+                "built agent feature mismatch: expected {:?}, got {:?}. Run `cargo build -p agent{}` first",
+                expected_features,
+                features.trim(),
+                agent_build_flag
+            );
+        } else {
+            panic!(
+                "missing built agent feature marker {}. Run `cargo build -p agent{}` first",
+                built_marker.display(),
+                agent_build_flag
+            );
+        }
     }
 
     if let Some(parent) = embedded_agent_so.parent() {
@@ -246,6 +252,43 @@ fn feature_marker_matches(features: &str, expected_features: &[&str]) -> bool {
     expected_features
         .iter()
         .all(|expected| features.lines().any(|line| line.trim() == *expected))
+}
+
+fn expected_agent_feature_bits(expected_features: &[&str]) -> Option<u8> {
+    let mut bits = 0u8;
+    let mut saw_noptrace = false;
+    let mut saw_full_api = false;
+    for feature in expected_features {
+        match *feature {
+            "noptrace=0" => saw_noptrace = true,
+            "noptrace=1" => {
+                saw_noptrace = true;
+                bits |= 0x01;
+            }
+            "full_api=0" => saw_full_api = true,
+            "full_api=1" => {
+                saw_full_api = true;
+                bits |= 0x02;
+            }
+            _ => {}
+        }
+    }
+    if saw_noptrace && saw_full_api {
+        Some(bits)
+    } else {
+        None
+    }
+}
+
+fn agent_binary_feature_marker_matches(agent_so: &Path, expected_features: &[&str]) -> bool {
+    let Some(bits) = expected_agent_feature_bits(expected_features) else {
+        return false;
+    };
+    let Ok(blob) = std::fs::read(agent_so) else {
+        return false;
+    };
+    let marker = [0x9b, 0x31, 0x6c, 0xd4, bits, bits ^ 0x5a, 0xa7, 0x0d];
+    blob.windows(marker.len()).any(|window| window == marker)
 }
 
 fn helpers_are_stale(workspace_root: &Path) -> bool {

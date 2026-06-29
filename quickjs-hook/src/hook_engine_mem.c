@@ -938,6 +938,7 @@ int hook_rebuild_trampoline(void* trampoline, size_t trampoline_size,
 
 int hook_register_pool(void* base, size_t size) {
     if (!g_engine.initialized || !base || size == 0) return -1;
+    hook_engine_unseal_exec();
     if (g_engine.pool_count >= MAX_EXEC_POOLS) {
         hook_log("hook_register_pool: pool slots exhausted (%d)", g_engine.pool_count);
         return -1;
@@ -952,6 +953,7 @@ int hook_register_pool(void* base, size_t size) {
 
 void* hook_alloc(size_t size) {
     if (!g_engine.initialized) return NULL;
+    hook_engine_unseal_exec();
     size = (size + 7) & ~7;
 
     /* 先试初始 pool */
@@ -974,6 +976,7 @@ void* hook_alloc(size_t size) {
 
 void* hook_alloc_near(size_t size, void* target) {
     if (!g_engine.initialized) return NULL;
+    hook_engine_unseal_exec();
     size = (size + 7) & ~7;
 
     int64_t b_range = (int64_t)128 << 20;     /* ±128MB — B 指令 4B patch */
@@ -1056,6 +1059,7 @@ void* hook_alloc_near(size_t size, void* target) {
  * 空隙都没有，但 4KB~16KB 的小空隙往往存在）。 */
 void* hook_alloc_near_range(size_t size, void* target, int64_t max_range) {
     if (!g_engine.initialized || !target) return NULL;
+    hook_engine_unseal_exec();
     size = (size + 7) & ~7;
 
     /* Phase 1: 初始 pool */

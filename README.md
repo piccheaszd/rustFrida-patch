@@ -62,18 +62,18 @@ target/aarch64-linux-android/release/rustfrida
 ```bash
 # 强检测目标优先：native-min agent，只编译 QuickJS core/native hook/Memory。
 cargo build -p agent --release --no-default-features --features quickjs,noptrace
-cargo build -p rust_frida --release --no-default-features --features noptrace
+RF_AGENT_API=min cargo build -p rust_frida --release --no-default-features --features noptrace
 
-# 需要完整 JS API 时使用 full-api agent。
+# 默认和普通 agent 保持一致：完整 JS API。
 cargo build -p agent --release --no-default-features --features quickjs-full-api,noptrace
-RF_AGENT_API=full cargo build -p rust_frida --release --no-default-features --features noptrace
+cargo build -p rust_frida --release --no-default-features --features noptrace
 ```
 
 `noptrace` 版仍然内嵌同一个 loader blob，但 host 不会在目标 App 子进程中调用 `inject_via_bootstrapper()`，也不会读写子进程寄存器。host 只通过 zymbiote socket 传输 stage-1 loader、agent SO 和 pre-resume 脚本。
 
 `agent` 默认 feature 是 `quickjs-full-api`，普通 `cargo build -p agent` 仍保留完整 API。`--no-default-features --features quickjs,noptrace` 是编译期 native-min：不编译 TinyCC/CModule，也不注册 File、Jni、Module、lazy Java、RPC 和 NativeFunction/Interceptor JS bootstrap；保留 `console`、`ptr`、native hook C API、`Memory`、RECOMP/WXSHADOW 底层和 ART cleanup 必需代码。
 
-`rust_frida` host 默认仍嵌入 native-min noptrace agent；需要 `Jni` / `Module` / `Interceptor` 等完整 JS API 时，构建 host 时必须设置 `RF_AGENT_API=full`。构建脚本会用 `libagent.features` 中的 `noptrace` 和 `full_api` marker 校验嵌入变体。
+`rust_frida` host 默认嵌入 full-api agent，和普通 `cargo build -p agent` 的默认 feature 对齐；需要 native-min 时显式设置 `RF_AGENT_API=min`。构建脚本会用 `libagent.features` 中的 `noptrace` 和 `full_api` marker 校验嵌入变体，避免 host 以 full/min 错配的 agent 打包。
 
 修改 `zymbiote/` 后需要重新生成 zymbiote ELF；默认构建嵌入 `zymbiote.elf`，`noptrace` 构建嵌入 `zymbiote-pure.elf` 和用于未匹配 child 清理的 `zymbiote-restore.elf`：
 
@@ -114,13 +114,14 @@ PROFILE=release tools/verify-build-matrix.sh
 - `--spawn-pure` 是 no-ptrace 子进程路径：`noptrace` 构建嵌入独立的 pure-only zymbiote stage-0，只负责阻塞子进程、接收 stage-1 loader 并跳转；loader 在 App 子进程内自链接 agent。
 - pure-only zymbiote stage-0 不内置 ELF linker、QuickJS、hook engine、属性 remap 或 capset mount hook；当前 executable payload 约 2.3KB，小于一页但仍会覆盖真实 `libstagefright.so` 尾页代码。
 - `noptrace` 构建只扫描和 patch `zygote64`，不再处理 32-bit zygote / usap；因此只支持 arm64 目标 App。
+- `noptrace --spawn-pure` 也需要读取和 patch `zygote64` 的 maps/内存；host 会在进入 zymbiote 注入前执行 SELinux policy patch。通过 adb 启动时优先使用 `adb shell "su -c '...'"`，避免 `adb shell su -c 'cmd; cmd'` 因本地/远端引号拆分导致后续片段落回 `u:r:shell:s0`，从而读 `/proc/zygote64/maps` 或 SELinux policy 时得到 `Permission denied`。
 - pure spawn 的 pre-resume 脚本统一通过 agent socket 发送；Java 主线程 eval 的 remote-agent 分支在 `noptrace` 下不可用。
 - `hello_entry()` 入口最前面安装 native early hook；不等待 JS、Java 初始化或 log writer。
 - target pure child 会把 zygote payload 备份和 hook 槽原值随 stage-1 一起下发；loader 在 agent entry 前启动 raw clone 清理线程，等 stage-0 退出 resume 等待后优先恢复 payload 页，再恢复 `setArgV0`/`setcontext` 槽。未匹配 child 不再只走 hook slot 自恢复：host 会下发 restore-only stage-1，由 child 侧恢复 payload 页和 hook 槽；找不到父 zygote patch 时会尝试从 child maps/backing file 重建 cleanup，失败则拒绝 hook-only fallback 并显式报警。
 - `noptrace` stage-1 会在 agent 读取完启动参数后清理临时字符串/指针表；子进程恢复后异步释放 stage-1 RW tail。host identity watcher 也会在 BOCHK self-trace / 伪装 child 中扫描并清零继承的 stage-1 tail 签名。
 - 当前不会强制 `munmap` stage-1 RX 或 linker veneer。BOCHK 实测中对 RX 段做完整 `munmap` / `mprotect` / 清零会导致目标退出或崩溃，因此先保留匿名 `r-xp` 以换稳定性和可调试性。
 - 如果加载了 `kpm-hide-maps` 1.1.2 或更新版本，stage-1 loader 会在进入 agent 前通过 `PR_HIDEMAPS_REGISTER` 注册 stage-1 RX 和 linker veneer 的精确范围；KPM 只过滤同一 `mm` 中精确匹配的 `/proc/<pid>/maps` 行，并在首次命中时动态校准当前内核的 `vm_area_struct.vm_mm` 偏移，避免不同 Android 6.1 结构布局导致注册成功但过滤失败。1.1.2 之后 maps token 扫描不再在 `show_map_vma` 热路径分配临时内存。
-- 如果加载了 `anti-detect` 1.2.24 或更新版本，可通过环境变量让 loader 在进入 agent 前注册 per-mm profile。默认关闭；`RF_ANTIDETECT=1`、`RF_ANTIDETECT=audit` 或 `RF_ANTIDETECT=register-only` 只以 `AD_F_AUDIT_ONLY` 注册轻量 profile，不启用具体 syscall 检测面；需要全量审计时显式使用 `RF_ANTIDETECT=audit-full`，需要指定精确 flags 时设置 `RF_ANTIDETECT_FLAGS=0x...`，可选 `RF_ANTIDETECT_PROFILE_ID=<id>` 用于日志区分。
+- 如果加载了 `anti-detect` 1.2.26 或更新版本，可通过环境变量让 loader 在进入 agent 前注册 per-mm profile。默认关闭；`RF_ANTIDETECT=1`、`RF_ANTIDETECT=audit` 或 `RF_ANTIDETECT=register-only` 只以 `AD_F_AUDIT_ONLY` 注册轻量 profile，不启用具体 syscall 检测面；需要全量审计时显式使用 `RF_ANTIDETECT=audit-full`，需要指定精确 flags 时设置 `RF_ANTIDETECT_FLAGS=0x...`，可选 `RF_ANTIDETECT_PROFILE_ID=<id>` 用于日志区分。KPM 侧默认 profile-only strict，未注册 App 不再走旧 UID/进程名 fallback；active exit/kill blocking 只接受 loader 预注册的 stage-1 / veneer 精确 range，不再按通用 caller path token 判断。
 - 强对抗目标或 KPM 回归测试中可设置 `RF_SKIP_REPL_READY=1`，跳过 spawn 恢复后的 `/proc/<pid>/task/<pid>/status` / `wchan` 轮询，避免 procfs hook 或目标早期状态异常导致 host 卡在 post-resume 等待。
 - 普通 `--spawn package` 默认走 late spawn：先恢复子进程，等待主线程回到 Looper idle 后再按 PID attach。这个模式不保证早期 hook，但更适合交互式 REPL。
 - `--spawn -l script.js` 默认走 early spawn：在 zygote/setcontext 阻塞窗口里注入并加载脚本，脚本完成后再恢复子进程，用于抢 `Application.onCreate` / `RegisterNatives` 等早期逻辑。
@@ -241,19 +242,20 @@ BOCHK 当前实测结论（2026-06-26）：
 - 已解决：`kpm-hide-maps` 1.1.2 已在 BOCHK 设备侧复测，stage-1 RX 和 linker veneer 注册返回 OK；外部读取主进程 `/proc/<pid>/maps` 时未观察到匿名 `r-xp` 或 `rwxp` 行，也未命中 `rustfrida` / `frida` / `libagent` / `wxshadow` / `recompile` 等 RF token。2026-06-26 复测中，KPM-enabled self maps probe 也未再暴露 stage-1 / veneer / RF token 行；KPM 首次命中时将 `vm_area_struct.vm_mm` offset 从 `0x40` 校准到 `0x10`，并在 `exit_mmap` 清理 2 个注册 range。这是 procfs 输出过滤，不是实际 `munmap`。
 - 已解决：`anti-detect` 可由 loader 在 agent entry 前注册 per-mm profile；`anti-detect` 1.2.24 起 `AD_F_AUDIT_ONLY` 不再自动扩成全检测面。BOCHK 旧版 `1.2.23` 实测中 KPM 将 `AD_F_AUDIT_ONLY` 规范化为 `0x1ff`，`exit_mmap` 输出统计为 `path=529 tracerpid=37 dumpable=2092 exit=72 kill=1`；该全量 audit-only 组合在后续 KPM-enabled `runtime` 复测中导致设备卡死，因此 BOCHK 默认只使用轻量 profile，确需全量审计时再显式设置 `RF_ANTIDETECT=audit-full`。
 - 已解决：新增 `RF_SKIP_REPL_READY=1`，用于 BOCHK/KPM 回归时跳过 host 侧 post-resume `/proc` 轮询；之前一次 KPM-enabled `runtime` 卡死停在 stage1 tail release 之后、`spawn 已恢复` 之前，符合这段同步 procfs 读取被卡住的表现。使用 `anti-detect 1.2.24`、`kpm-hide-maps 1.1.2`、`RF_ANTIDETECT=1`、`RF_SKIP_REPL_READY=1`、`RF_IDENTITY_WATCH_SECS=0` 后，BOCHK baseline、`runtime`、`resolve`、`read-maps`、`maps-dump`、`bytes-getpid` 均通过并保持设备响应。
-- 已解决：分检测面测试中 `RF_ANTIDETECT_FLAGS=0x11` 和 `0x61` 通过，旧版 `0x181` 在 BOCHK 恢复后导致 adb offline。根因收窄到 exit/kill audit-only 仍调用 active self-protect classifier，该 classifier 会在 exit/kill syscall 路径里走 `find_vma()` / `d_path()` 解析 caller module。`anti-detect` 1.2.25 起 audit-only 只做轻量 status/signal 计数，caller VMA/path 分类只留给 active blocking mode；重载 `anti-detect` 1.2.25 和 `kpm-hide-maps` 1.1.2 后，`0x181` 复测 RF `rc=0`、adb 保持响应，stage-1 / veneer range 注册和 `exit_mmap` 清理正常。注意 active blocking 模式仍可能为了通用 loader-token 判断走 caller path 解析，需要单独验证。
-- 已验证：`RF_ANTIDETECT_FLAGS=0x180` active exit/kill 复测中，KPM 命中 `bypass self-protect exit nr=93 status=0 comm=e.process.gapps ... reason=4`，说明 active 分支确实执行；RF `rc=0`、adb 保持响应、无 security UI/Firefox 残留，stage-1 / veneer range 清理正常。但 BOCHK 进程仍进入 `exit_mmap`，RF 看到 `socket EOF after HELLO` / `Broken pipe`，所以该模式只证明不会复现卡死，不代表能保住目标进程生命周期。
+- 已解决：分检测面测试中 `RF_ANTIDETECT_FLAGS=0x11` 和 `0x61` 通过，旧版 `0x181` 在 BOCHK 恢复后导致 adb offline。根因收窄到 exit/kill audit-only 仍调用 active self-protect classifier，该 classifier 会在 exit/kill syscall 路径里走 `find_vma()` / `d_path()` 解析 caller module。`anti-detect` 1.2.25 起 audit-only 只做轻量 status/signal 计数；`anti-detect` 1.2.26 起 active exit/kill 也不再按 caller path token 判断，只匹配 loader 预注册的 stage-1 / veneer exact range。重载 `anti-detect` 1.2.25 和 `kpm-hide-maps` 1.1.2 后，`0x181` 复测 RF `rc=0`、adb 保持响应，stage-1 / veneer range 注册和 `exit_mmap` 清理正常；1.2.26 还会减少未注册 App 和非精确 caller 的误伤面。
+- 已验证：`RF_ANTIDETECT_FLAGS=0x180` active exit/kill 复测中，KPM 命中 `bypass self-protect exit nr=93 status=0 comm=e.process.gapps ... reason=4`，说明 active 分支确实执行；RF `rc=0`、adb 保持响应、无 security UI/Firefox 残留，stage-1 / veneer range 清理正常。但 BOCHK 进程仍进入 `exit_mmap`，RF 看到 `socket EOF after HELLO` / `Broken pipe`，所以该模式只证明不会复现卡死，不代表能保住目标进程生命周期。1.2.26 后该分支需要 exact range 命中才会生效，旧通用 loader-token 逻辑已移除。
 - 剩余：BOCHK 的 self-trace child 仍会让主进程 `TracerPid` 指向 App 自己的 watchdog child；RF 不再 ptrace 目标，但 App 原生自检仍可能把“被 trace 状态”作为业务信号。
 - 已验证失败：BOCHK 矩阵测试中，`RF_BOCHK_AUDIT=bytes-cold2` 的 normal inline hook 会改写 `libc!ether_ntoa_r` 入口字节并触发 `com.oplus.securitypermission:ui` / `AppStartConfirmDialogActivity`，随后主进程 ANR。进一步复测 `RF_BOCHK_AUDIT=bytes-noop`，即只对 `libc!getpid` 安装 silent normal inline hook，也会在 `spawn 已恢复` 后导致 host timeout，随后 adb 返回 `error: closed`；因此 normal inline hook 不能作为 BOCHK 稳定调试模式。
 - 已验证：首次尝试 `RF_BOCHK_AUDIT=bytes-noop-recomp` 时 host 侧没有该映射，未知 profile fallback 成 `nativeaudit bochk`，实际安装的是 `profile=all` 的 normal inline `prctl/open/openat`，不是 RECOMP。当前代码已把 `bytes-noop-recomp` 显式映射到 `nativeaudit bochk-bytes-noop-recomp`，未知 `RF_BOCHK_AUDIT` 也不再 fallback 到 `bochk/all`。2026-06-26 修复后 BOCHK 复测中，`libc!getpid` 走 RECOMP slot，原始入口字节前后不变，RF `rc=0` 且 adb 保持响应。
-- 已解决：真实 native hook 初始化 hook engine 后会分配一个 64KB 初始 exec pool。第一次 RECOMP 复测中该 pool 以匿名 `rwxp` 暴露在 `/proc/<pid>/maps`；当前 agent 会在 `init_hook_runtime()` 后通过 `PR_HIDEMAPS_REGISTER` 精确注册 `hook-exec` range。BOCHK 复测日志显示 `hide-maps registered hook-exec: 0x7a0dd20000-0x7a0dd30000`，20 秒后外部 maps 检查无 `rwxp`，匿名 executable 只剩系统 `[vdso]`，且无 security UI/Firefox 残留。这是 procfs 精确隐藏，不是 W^X 权限收敛。
+- 已解决：真实 native hook 初始化 hook engine 后会分配一个 64KB 初始 exec pool。第一次 RECOMP 复测中该 pool 以匿名 `rwxp` 暴露在 `/proc/<pid>/maps`；当前 agent 会在 `init_hook_runtime()` 后通过 `PR_HIDEMAPS_REGISTER` 精确注册 `hook-exec` range，并在初始化和脚本 eval 后把 hook exec pool 从 RWX seal 为 RX。BOCHK 复测日志显示 `hide-maps registered hook-exec: 0x7a0dd20000-0x7a0dd30000`，20 秒后外部 maps 检查无 `rwxp`，匿名 executable 只剩系统 `[vdso]`，且无 security UI/Firefox 残留。当前实现是“写入窗口短暂 RWX、长期 RX”的权限收敛加 procfs 精确隐藏，尚不是双映射 W^X。
 - 已验证：full-api noptrace + `Hook.RECOMP` 的 `RegisterNatives` 监听脚本可在 BOCHK 上工作。2026-06-26 复测使用 `/data/local/tmp/rf-noptrace-full --spawn com.bochk.app.aos --spawn-pure --quickjs-profile full -l /data/local/tmp/bochk_register_natives_recomp.js`，脚本成功 hook `JNIEnv->RegisterNatives`，捕获 `fiqlohqeo.*` 多个类注册到 `libbochk_aos.so+offset`；RF `rc=0`，adb 保持响应，BOCHK 前台仍是 `MainActivity`，外部 maps 无 `rwxp`，匿名 executable 只剩 `[vdso]`。
 - 已验证：full-api noptrace + `Hook.RECOMP` 的 `onLeave` 回调可修改目标线程看到的数据。2026-06-26 复测脚本 `tools/bochk_recomp_timeval_modify.js` hook `libc!gettimeofday`，第一次成功返回时把 `timeval.tv_usec` 从 `433613` 改成 `433614`；RF `rc=0`，adb 保持响应，BOCHK 前台仍是 `MainActivity`，外部 maps 无 RF token / `rwxp`，匿名 executable 只剩 `[vdso]`。这是 out-param 修改验证，不等同于 BOCHK 业务 native method 返回值修改已安全。
 - 已验证但不稳定：full-api noptrace + `Hook.RECOMP` 可以通过 `RegisterNatives.onEnter` 定位并 hook BOCHK 业务 native `fiqlohqeo.ap.d()Z`（`libbochk_aos.so+0x238ec0`），并在第一次命中时用 `retval.replace()` 把返回值从 `0` 改为 `1`。该轮 RF `rc=0` 且 adb 保持响应，但 BOCHK 随后退出并拉起 `com.oplus.securitypermission:ui` / launcher，说明这是“能改到业务返回值”的能力证明，不是稳定调试 profile。`RegisterNatives.onLeave` 安装版本则因 pre-resume 等待不足提前超时，没有形成有效证据。
 - 已验证失败：`RF_BOCHK_AUDIT=bytes-cold2-wx-maponly` 和 `bytes-cold2-wx-patchonly` 均会触发同类 `AppStartConfirmDialogActivity` 链路；`patchonly` 证明只安装 WXSHADOW hook、不做后续 maps probe 也足够触发。
 - 已解决：`nativeaudit` 的 passive profiles（`runtime` / `resolve` / `read-maps` / `maps-dump` / `bytes-getpid`）不再预初始化 hook runtime，也不会占用 native audit install 状态。2026-06-26 设备复测中，上述 profile 外部 maps 精确信号均为 `rwxp=0`、RF token=0、匿名 executable=0，`runtime` 日志确认 `hook-runtime=deferred`。该轮是在手机重启后 KPM 未加载的状态下完成的，因此只证明 native audit 自身不再引入匿名 `rwxp`，不替代 KPM-enabled 完整隐身复测。
+- 已验证：2026-06-29 复测确认设备侧 `/data/local/tmp/kpatch-next` 与 `/data/adb/modules/KPatch-Next/bin/kpatch` 哈希一致，当前 `anti-detect`、`kpm-hide-maps`、`recompile`、`wxshadow` 查询均通过 KPatch-Next CLI 完成；RF 运行时不再调用该 CLI，而是调用已加载 KPM 暴露的 `prctl` ABI。该轮 BOCHK smoke 使用 boot-loaded KPM（`anti-detect` 仍为 1.2.25）和新 noptrace host，`--spawn-pure --quickjs-profile full` 可完成 agent 连接、slot API smoke、`replaceSlot`/`restoreSlot`、以及 `Hook.RECOMP` `libc!getpid` onEnter 命中；RF `rc=0`，adb 保持响应。注意这轮没有热加载 `anti-detect` 1.2.26，因此不把 1.2.26 的 strict/exact-rule 行为计入设备验证。
 - 剩余：`Hook.RECOMP` 在 BOCHK 上已完成最小 `libc!getpid` noop、`RegisterNatives` JS `onEnter` 监听、`gettimeofday` JS `onLeave` out-param 修改，以及一次业务 native boolean 返回值翻转验证；稳定业务调试仍需换低影响目标函数、先观察后修改、分离 security UI 触发条件，并继续验证高频热路径和 JNI/ART 组合 hook。
-- 剩余：hook engine 的 trampoline/thunk pool 仍是长期 RWX 设计，只是当前通过 `kpm-hide-maps` 精确隐藏了 procfs maps 输出。要从权限语义上消掉 RWX，需要把 hook 元数据和可执行代码池拆分，再做写入期 RWX、完成后 RX 的权限收敛。
+- 剩余：hook engine 的 trampoline/thunk pool 已从长期 RWX 收敛为安装窗口 RWX、脚本执行后 RX；要进一步做到严格 W^X，还需要把可写元数据和可执行代码池拆分，或改成 memfd 双映射。
 
 BOCHK 的 `noptrace` / WXSHADOW 分阶段探测记录和复测顺序见
 [`docs/bochk-noptrace-test-notes.md`](docs/bochk-noptrace-test-notes.md)。
@@ -466,6 +468,7 @@ Java.ready(function() {
 | 高频 Java 方法 Hook | Managed DSL 动态编译器 | `method.dslImpl = script` |
 | Hook native 函数并继续跑原函数 | `Interceptor.attach` | `onEnter(args)` / `onLeave(retval)` |
 | 完全替换 native 函数 | `hook()` 或 `Interceptor.replace()` | `return value` / 条件性 `this.$orig()` |
+| 非 inline 替换导入槽/JNI fnPtr | `Module.findImportSlot()` + `Interceptor.replaceSlot()` | GOT/PLT/JNI table 指针槽替换 |
 | 高频 native Hook | `CModule` + `attachNative` / `hookNative` | `void cb(HookContext *ctx, void *data)` |
 | 查找 so、符号、导入导出 | `Module` | `findExportByName()` / `enumerateSymbols()` |
 | 读写目标进程内存 | `Memory` / `ptr()` | `p.readU32()` / `p.writeBytes()` |
@@ -475,7 +478,7 @@ Java.ready(function() {
 
 `noptrace` 构建中的脚本 API 仍来自同一个 agent，但 host 侧去掉了 ptrace attach、process remote-call、trace 命令和相关帮助文案；脚本要在恢复前执行时，统一通过 agent socket 发送。强检测目标建议优先使用 native-min agent；需要 `Java.use()`、`Module`、`File`、RPC 或 CModule 时再切 `quickjs-full-api`。
 
-`--quickjs-profile minimal` 是运行期 profile，不会改变二进制内容。full-api agent 中它会保留 `console`、`File`、`ptr`、native hook、`Jni`、`Memory`、`rpc` 等能力，跳过 `Module`、lazy `Java` 和 NativeFunction/Interceptor JS bootstrap 的启动注册，减少初始化阶段读取 maps 或解析 ART 状态的检测面。真正移除 TinyCC/CModule/RPC/File/JNI boot 等静态字符串，需要使用编译期 native-min。
+`--quickjs-profile minimal` 是运行期 profile，不会改变二进制内容。full-api agent 中它会保留 `console`、`File`、`ptr`、native hook、`Jni`、`Memory`、`rpc` 等能力，跳过 `Module`、lazy `Java` 和 NativeFunction/Interceptor JS bootstrap 的启动注册，减少初始化阶段读取 maps 或解析 ART 状态的检测面。`--quickjs-profile hardened` 使用同样的 minimal API surface，但在 hook-exec range 注册失败时 fail closed，避免强检测目标下静默带着未隐藏的 hook exec pool 继续运行。真正移除 TinyCC/CModule/RPC/File/JNI boot 等静态字符串，需要使用编译期 native-min。
 
 ### 常见场景
 
@@ -780,7 +783,8 @@ type JniEntry = { name: string; index: number; address: NativePointer }
 
 type JNINativeMethodInfo = {
   address: NativePointer; namePtr: NativePointer; sigPtr: NativePointer
-  fnPtr: NativePointer; name: string | null; sig: string | null
+  fnPtrSlot: NativePointer; fnPtr: NativePointer
+  name: string | null; sig: string | null
 }
 ```
 
@@ -1050,6 +1054,8 @@ hook(target, callback, true)            // true = WXSHADOW
 | `unhook(target)` | `AddressLike` | `boolean` |
 | `Interceptor.attach(target, {onEnter?, onLeave?}, stealth?)` | `AddressLike, Object, number?` | `InvocationListener` |
 | `Interceptor.replace(target, replacement, stealth?)` | `AddressLike, Function, number?` | `boolean` |
+| `Interceptor.replaceSlot(slot, replacement)` | `AddressLike, AddressLike` | `NativePointer` previous |
+| `Interceptor.restoreSlot(slot)` | `AddressLike` | `boolean` |
 | `Interceptor.detachAll()` | — | `undefined` |
 | `listener.detach()` | — | `boolean` |
 | `CModule(source, symbols?)` | `string, Object?` | `CModule` |
@@ -1789,6 +1795,7 @@ Memory.protect(dataAddr, 8, "r--");
 | `Module.enumerateModules()` | — | `ModuleInfo[]` |
 | `Module.enumerateExports(name)` | `string` | `{type, name, address}[]` |
 | `Module.enumerateImports(name)` | `string` | `{type, name, slot, address}[]` |
+| `Module.findImportSlot(name, symbol)` | `string, string` | `NativePointer \| null` |
 | `Module.enumerateSymbols(name)` | `string` | `{type, name, address, isGlobal, isDefined}[]` |
 | `Module.enumerateRanges(name, prot?)` | `string, "rwx" 风格` | `{base, size, protection, file:{path}}[]` |
 | `Module.load(path, flagsOrTagged?, tagged?)` | `string, int\|bool?, bool?` | `ModuleInfo` / 抛异常 |
@@ -1803,6 +1810,13 @@ Module.enumerateRanges("libc.so", "r-x");
 
 // 外部引用符号 + PLT/GOT slot 地址
 Module.enumerateImports("libart.so").filter(i => i.type === "function");
+
+// 非 inline 替换 GOT/PLT import slot；返回替换前的指针
+var slot = Module.findImportSlot("libtarget.so", "openat");
+if (slot !== null) {
+    var originalOpenat = Interceptor.replaceSlot(slot, replacementOpenat);
+    // Interceptor.restoreSlot(slot);
+}
 ```
 
 枚举的来源是模块的磁盘 ELF；memfd 或无文件支撑的合成模块返回空数组。

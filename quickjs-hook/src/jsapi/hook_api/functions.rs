@@ -8,8 +8,10 @@ use crate::jsapi::callback_util::{
     throw_internal_error,
 };
 use crate::jsapi::ptr::create_native_pointer;
-use crate::jsapi::util::is_addr_accessible;
+use crate::jsapi::util::{is_addr_accessible, proc_maps_entries, read_proc_self_maps};
 use crate::value::JSValue;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 use super::callback::{
     attach_on_enter_wrapper, attach_on_leave_wrapper, hook_callback_wrapper, native_attach_on_enter_wrapper,
@@ -18,6 +20,12 @@ use super::callback::{
 use super::cmodule::is_cmodule_code_address;
 use super::registry::{hook_error_message, init_registry, HookData, HookKind, StealthMode, HOOK_OK, HOOK_REGISTRY};
 use crate::jsapi::callback_util::with_registry_mut;
+
+static SLOT_REPLACEMENTS: OnceLock<Mutex<HashMap<u64, u64>>> = OnceLock::new();
+
+fn slot_replacements() -> &'static Mutex<HashMap<u64, u64>> {
+    SLOT_REPLACEMENTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 unsafe fn finalize_recomp_hook_slot(
     hook_addr: u64,
@@ -864,6 +872,97 @@ fn hook_error_str(code: i32) -> String {
         .unwrap_or_else(|_| "hook engine error".to_string())
 }
 
+fn runtime_page_size() -> usize {
+    let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if value > 0 {
+        value as usize
+    } else {
+        4096
+    }
+}
+
+fn prot_for_addr(addr: u64) -> Option<i32> {
+    let maps = read_proc_self_maps()?;
+    for entry in proc_maps_entries(&maps) {
+        if entry.contains(addr) {
+            return Some(entry.prot_flags());
+        }
+    }
+    None
+}
+
+fn page_span_for_range(addr: u64, len: usize) -> Option<(usize, usize)> {
+    if len == 0 {
+        return None;
+    }
+    let page_size = runtime_page_size();
+    if !page_size.is_power_of_two() {
+        return None;
+    }
+    let start = (addr as usize) & !(page_size - 1);
+    let end = (addr as usize).checked_add(len)?;
+    let end_aligned = end.checked_add(page_size - 1)? & !(page_size - 1);
+    Some((start, end_aligned.checked_sub(start)?))
+}
+
+unsafe fn write_pointer_slot(slot: u64, value: u64) -> Result<(), String> {
+    let pointer_size = std::mem::size_of::<u64>();
+    if slot < 0x10000 || !is_addr_accessible(slot, pointer_size) {
+        return Err(format!("slot {:#x} is not mapped", slot));
+    }
+
+    let original_prot = prot_for_addr(slot).ok_or_else(|| format!("slot {:#x} is not in /proc/self/maps", slot))?;
+    let (page_start, page_len) =
+        page_span_for_range(slot, pointer_size).ok_or_else(|| format!("slot {:#x} page range overflow", slot))?;
+
+    let mut changed_prot = false;
+    if (original_prot & libc::PROT_WRITE) == 0 {
+        let write_prot = original_prot | libc::PROT_WRITE;
+        if libc::mprotect(page_start as *mut libc::c_void, page_len, write_prot) != 0 {
+            return Err(format!(
+                "mprotect({:#x}, {}, {:#x}) failed: {}",
+                page_start,
+                page_len,
+                write_prot,
+                std::io::Error::last_os_error()
+            ));
+        }
+        changed_prot = true;
+    }
+
+    std::ptr::write_unaligned(slot as *mut u64, value);
+
+    if changed_prot && libc::mprotect(page_start as *mut libc::c_void, page_len, original_prot) != 0 {
+        return Err(format!(
+            "restore mprotect({:#x}, {}, {:#x}) failed: {}",
+            page_start,
+            page_len,
+            original_prot,
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    Ok(())
+}
+
+pub(crate) fn restore_all_slots() {
+    let entries = {
+        let mut guard = slot_replacements().lock().unwrap_or_else(|e| e.into_inner());
+        guard.drain().collect::<Vec<_>>()
+    };
+
+    for (slot, original) in entries {
+        unsafe {
+            if let Err(err) = write_pointer_slot(slot, original) {
+                crate::jsapi::console::output_message(&format!(
+                    "[hook cleanup] restoreSlot({:#x}) failed: {}",
+                    slot, err
+                ));
+            }
+        }
+    }
+}
+
 /// Interceptor.attach(target, callbacks, mode?)
 /// callbacks: `{ onEnter?(args) { ... }, onLeave?(retval) { ... } }`
 ///   - `this` 在 onEnter/onLeave 之间共享，用户可挂自定义字段跨阶段传状态
@@ -1056,6 +1155,92 @@ pub(crate) unsafe extern "C" fn js_interceptor_replace(
         StealthMode::Normal
     };
     install_hook(ctx, ptr_arg, replacement_arg, mode)
+}
+
+/// Interceptor.replaceSlot(slot, replacement) — non-inline pointer-slot hook.
+///
+/// The slot may be a GOT/PLT import cell or a JNI/native function table cell.
+/// Returns the previous slot value so scripts can keep an original pointer.
+pub(crate) unsafe extern "C" fn js_interceptor_replace_slot(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 2 {
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"Interceptor.replaceSlot requires slot and replacement\0".as_ptr() as *const _,
+        );
+    }
+
+    let slot = match extract_pointer_address(ctx, JSValue(*argv), "Interceptor.replaceSlot slot") {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+    let replacement = match extract_pointer_address(ctx, JSValue(*argv.add(1)), "Interceptor.replaceSlot replacement") {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+
+    if replacement < 0x10000 || !is_addr_accessible(replacement, 1) {
+        return ffi::JS_ThrowRangeError(
+            ctx,
+            b"Interceptor.replaceSlot replacement address is not mapped\0".as_ptr() as *const _,
+        );
+    }
+
+    if slot < 0x10000 || !is_addr_accessible(slot, std::mem::size_of::<u64>()) {
+        return ffi::JS_ThrowRangeError(
+            ctx,
+            b"Interceptor.replaceSlot slot address is not mapped\0".as_ptr() as *const _,
+        );
+    }
+
+    let previous = std::ptr::read_unaligned(slot as *const u64);
+    if let Err(err) = write_pointer_slot(slot, replacement) {
+        return throw_internal_error(ctx, format!("Interceptor.replaceSlot: {}", err));
+    }
+
+    {
+        let mut guard = slot_replacements().lock().unwrap_or_else(|e| e.into_inner());
+        guard.entry(slot).or_insert(previous);
+    }
+
+    create_native_pointer(ctx, previous).raw()
+}
+
+/// Interceptor.restoreSlot(slot) — restore a slot changed by replaceSlot().
+pub(crate) unsafe extern "C" fn js_interceptor_restore_slot(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 1 {
+        return ffi::JS_ThrowTypeError(ctx, b"Interceptor.restoreSlot requires slot\0".as_ptr() as *const _);
+    }
+
+    let slot = match extract_pointer_address(ctx, JSValue(*argv), "Interceptor.restoreSlot slot") {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+
+    let original = {
+        let mut guard = slot_replacements().lock().unwrap_or_else(|e| e.into_inner());
+        guard.remove(&slot)
+    };
+    let Some(original) = original else {
+        return JSValue::bool(false).raw();
+    };
+
+    if let Err(err) = write_pointer_slot(slot, original) {
+        let mut guard = slot_replacements().lock().unwrap_or_else(|e| e.into_inner());
+        guard.insert(slot, original);
+        return throw_internal_error(ctx, format!("Interceptor.restoreSlot: {}", err));
+    }
+
+    JSValue::bool(true).raw()
 }
 
 /// Interceptor.detachAll() — 拆除所有 hook（replace + attach 一起）

@@ -1160,8 +1160,8 @@ pub(crate) fn ensure_zymbiote_loaded() -> Result<(), String> {
     let already_initialized = ZYGOTE_PATCHES.get().is_some();
 
     if !already_initialized {
-        // 修补 SELinux 策略，允许子进程连接 abstract socket
-        #[cfg(not(feature = "noptrace"))]
+        // 修补 SELinux 策略，允许 host 读取 zygote maps 并让子进程连接 abstract socket。
+        // noptrace pure-spawn 仍需要先解析/patch zygote，因此也必须执行这一步。
         if let Err(e) = crate::selinux::patch_selinux() {
             log_warn!("SELinux 策略修补失败: {}（继续尝试注入）", e);
         }
@@ -3382,7 +3382,6 @@ fn cleanup_zygote_patches_with_pending_mode(mode: PendingConnectionCleanup) {
     patches.clear();
 
     // 还原 SELinux 状态
-    #[cfg(not(feature = "noptrace"))]
     crate::selinux::restore_selinux();
 }
 
