@@ -55,6 +55,9 @@ static AGENT_BUILD_FEATURE_MARKER: [u8; 8] = [
     0x0d,
 ];
 
+const PR_ANTIDETECT_RELEASE: libc::c_int = 0x41440002;
+const PR_HIDEMAPS_RELEASE: libc::c_int = 0x484d0002;
+
 use crate::communication::{
     flush_cached_logs, is_cmd_frame, is_qbdi_helper_frame, log_msg, log_msg_sync, register_stream_fd, send_bye,
     send_complete, send_eval_err, send_eval_ok, send_hello_raw_fd, send_rpc_err, send_rpc_ok, shutdown_log_writer,
@@ -265,6 +268,14 @@ impl StringTable {
     pub unsafe fn get_output_path(&self) -> Option<String> {
         self.read_string(self.output_path, self.output_path_len)
     }
+}
+
+fn release_anti_detect_state() -> i32 {
+    unsafe { libc::prctl(PR_ANTIDETECT_RELEASE, 0u64, 0u64, 0u64, 0u64) }
+}
+
+fn release_hide_maps_state() -> i32 {
+    unsafe { libc::prctl(PR_HIDEMAPS_RELEASE, 0u64, 0u64, 0u64, 0u64) }
 }
 
 static SHOULD_EXIT: AtomicBool = AtomicBool::new(false);
@@ -1031,6 +1042,22 @@ fn process_cmd(command: &str) {
                     "nativeaudit requires profile: bochk|bochk-wx|bochk-runtime|bochk-resolve|bochk-read-maps|bochk-bytes-noop|bochk-bytes-noop-wx|bochk-bytes-noop-recomp|bochk-bytes-cold2-wx|bochk-noop-wx|bochk-prctl-wx-silent|bochk-open-wx-silent|bochk-open-only-wx|bochk-openat-only-wx",
                 ),
             }
+        }
+        Some("anti-detect-release") => {
+            let rc = release_anti_detect_state();
+            send_eval_ok(&format!("anti-detect-release rc={}", rc));
+        }
+        Some("hide-maps-release") => {
+            let rc = release_hide_maps_state();
+            send_eval_ok(&format!("hide-maps-release rc={}", rc));
+        }
+        Some("kpm-release") => {
+            let anti_detect_rc = release_anti_detect_state();
+            let hide_maps_rc = release_hide_maps_state();
+            send_eval_ok(&format!(
+                "kpm-release anti-detect={} hide-maps={}",
+                anti_detect_rc, hide_maps_rc
+            ));
         }
         #[cfg(feature = "quickjs")]
         Some("jsinit") => dispatch_js_task("jsinit", init_js_and_respond),

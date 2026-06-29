@@ -141,6 +141,77 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn env_value_disabled(value: &str) -> bool {
+    let value = value.trim();
+    value.is_empty()
+        || value == "0"
+        || value.eq_ignore_ascii_case("false")
+        || value.eq_ignore_ascii_case("off")
+        || value.eq_ignore_ascii_case("no")
+        || value.eq_ignore_ascii_case("none")
+}
+
+fn should_release_kpm_on_shutdown() -> bool {
+    if let Ok(value) = std::env::var("RF_KPM_RELEASE_ON_SHUTDOWN") {
+        return !env_value_disabled(&value);
+    }
+    std::env::var("RF_ANTIDETECT")
+        .map(|value| !env_value_disabled(&value))
+        .unwrap_or(false)
+}
+
+fn force_stop_after_exit_enabled() -> bool {
+    env_flag("RF_FORCE_STOP_AFTER_EXIT")
+}
+
+fn extra_force_stop_packages() -> Vec<String> {
+    std::env::var("RF_FORCE_STOP_EXTRA_PACKAGES")
+        .ok()
+        .map(|value| {
+            value
+                .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn force_stop_package(package: &str, reason: &str) {
+    if package.trim().is_empty() {
+        return;
+    }
+
+    match std::process::Command::new("am").args(["force-stop", package]).output() {
+        Ok(output) if output.status.success() => {
+            log_info!("{}: force-stopped {}", reason, package);
+        }
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let detail = format!("{} {}", stdout.trim(), stderr.trim());
+            log_warn!("{}: am force-stop {} 返回非零: {}", reason, package, detail.trim());
+        }
+        Err(e) => {
+            log_warn!("{}: force-stop {} 失败: {}", reason, package, e);
+        }
+    }
+}
+
+fn force_stop_spawn_targets_after_exit(package: Option<&str>) {
+    if !force_stop_after_exit_enabled() {
+        return;
+    }
+
+    if let Some(package) = package {
+        force_stop_package(package, "RF_FORCE_STOP_AFTER_EXIT");
+    }
+    for package in extra_force_stop_packages() {
+        force_stop_package(&package, "RF_FORCE_STOP_EXTRA_PACKAGES");
+    }
+}
+
 fn env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name)
         .ok()
@@ -689,6 +760,13 @@ fn main() {
     let send_shutdown = |s: &Session| {
         if let Some(sender) = s.get_sender() {
             s.shutdown_requested.store(true, Ordering::Release);
+            if should_release_kpm_on_shutdown() {
+                if let Err(e) = send_command(sender, "kpm-release") {
+                    log_error!("发送 KPM release 失败: {}", e);
+                } else {
+                    log_info!("已请求释放当前进程 KPM profile/range");
+                }
+            }
             if let Err(e) = send_command(sender, "shutdown") {
                 log_error!("发送 shutdown 失败: {}", e);
             } else {
@@ -860,4 +938,5 @@ fn main() {
     if args.spawn.is_some() {
         spawn::cleanup_zygote_patches();
     }
+    force_stop_spawn_targets_after_exit(args.spawn.as_deref());
 }
