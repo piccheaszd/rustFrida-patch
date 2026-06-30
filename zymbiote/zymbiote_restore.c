@@ -3,7 +3,9 @@
  *
  * This code is streamed to the child over the zymbiote socket and executed from
  * an anonymous mapping. It waits until stage-0 has returned, then restores the
- * inherited zymbiote payload page and hook slots without ptrace or /proc/pid/mem.
+ * inherited zymbiote payload page without ptrace or /proc/pid/mem. Hook slots
+ * are restored only when the host passes trusted slot backups from the parent
+ * zygote patch record.
  */
 
 #include <stdbool.h>
@@ -73,6 +75,7 @@ typedef struct
     uint64_t capset_got_slot;
     uint64_t capset_original;
     uint64_t capset_got_protection;
+    uint64_t trust_payload_context;
 } RustFridaRestoreContext;
 
 typedef struct
@@ -398,7 +401,8 @@ rustfrida_scrub_inherited_stage1_tail(void)
 static void
 rustfrida_fill_slots_from_payload_context(RustFridaRestoreContext *ctx)
 {
-    if (ctx == NULL || ctx->payload_base == 0 || ctx->payload_context_offset == 0)
+    if (ctx == NULL || ctx->trust_payload_context == 0 ||
+        ctx->payload_base == 0 || ctx->payload_context_offset == 0)
         return;
 
     if (ctx->setargv0_slot == 0)

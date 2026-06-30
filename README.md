@@ -117,7 +117,7 @@ PROFILE=release tools/verify-build-matrix.sh
 - `noptrace --spawn-pure` 也需要读取和 patch `zygote64` 的 maps/内存；host 会在进入 zymbiote 注入前执行 SELinux policy patch。通过 adb 启动时优先使用 `adb shell "su -c '...'"`，避免 `adb shell su -c 'cmd; cmd'` 因本地/远端引号拆分导致后续片段落回 `u:r:shell:s0`，从而读 `/proc/zygote64/maps` 或 SELinux policy 时得到 `Permission denied`。
 - pure spawn 的 pre-resume 脚本统一通过 agent socket 发送；Java 主线程 eval 的 remote-agent 分支在 `noptrace` 下不可用。
 - `hello_entry()` 入口最前面安装 native early hook；不等待 JS、Java 初始化或 log writer。
-- target pure child 会把 zygote payload 备份和 hook 槽原值随 stage-1 一起下发；loader 在 agent entry 前启动 raw clone 清理线程，等 stage-0 退出 resume 等待后优先恢复 payload 页，再恢复 `setArgV0`/`setcontext` 槽。未匹配 child 不再只走 hook slot 自恢复：host 会下发 restore-only stage-1，由 child 侧恢复 payload 页和 hook 槽；找不到父 zygote patch 时会尝试从 child maps/backing file 重建 cleanup，失败则拒绝 hook-only fallback 并显式报警。
+- target pure child 会把 zygote payload 备份和 hook 槽原值随 stage-1 一起下发；loader 在 agent entry 前启动 raw clone 清理线程，等 stage-0 退出 resume 等待后优先恢复 payload 页，再恢复 `setArgV0`/`setcontext` 槽。未匹配 child 不再只走 hook slot 自恢复：host 会下发 restore-only stage-1。若仍持有父 zygote patch 记录，child 侧恢复 payload 页和已知 hook 槽；若父 patch 已先清理、只能从 child maps/backing file 合成 cleanup，则只执行 payload-only restore，不再从可能已恢复的 payload 页按固定 offset 推断 slot，避免把原始代码字节误判为 `setArgV0` / `setcontext` / `capset` 地址后产生 `failed=0xe` 噪声。
 - `noptrace` stage-1 会在 agent 读取完启动参数后清理临时字符串/指针表；子进程恢复后异步释放 stage-1 RW tail。host identity watcher 也会在 BOCHK self-trace / 伪装 child 中扫描并清零继承的 stage-1 tail 签名。
 - 当前不会强制 `munmap` stage-1 RX 或 linker veneer。BOCHK 实测中对 RX 段做完整 `munmap` / `mprotect` / 清零会导致目标退出或崩溃，因此先保留匿名 `r-xp` 以换稳定性和可调试性。
 - 如果加载了 `kpm-hide-maps` 1.1.2 或更新版本，stage-1 loader 会在进入 agent 前通过 `PR_HIDEMAPS_REGISTER` 注册 stage-1 RX 和 linker veneer 的精确范围；KPM 只过滤同一 `mm` 中精确匹配的 `/proc/<pid>/maps` 行，并在首次命中时动态校准当前内核的 `vm_area_struct.vm_mm` 偏移，避免不同 Android 6.1 结构布局导致注册成功但过滤失败。1.1.2 之后 maps token 扫描不再在 `show_map_vma` 热路径分配临时内存。
@@ -237,7 +237,7 @@ printf 'jseval 1+1\nexit\n' | adb shell su -c '/data/local/tmp/rf-noptrace --spa
 BOCHK 当前实测结论（2026-06-26）：
 
 - 已解决：`noptrace --spawn-pure` 不再对目标子进程执行 ptrace attach、寄存器改写或远程调用；BOCHK 可完成 agent 连接，`jsinit` 返回 `=> initialized`，`jseval 1+1` 返回 `=> 2`。
-- 已解决：zygote patch 在退出时恢复；未匹配 child 通过 restore-only stage-1 恢复；BOCHK self-trace child 会被 identity watcher 识别。
+- 已解决：zygote patch 在退出时恢复；未匹配 child 通过 restore-only stage-1 恢复。持有父 patch 记录时恢复 payload + hook 槽；父 patch 已释放后的合成 fallback 只恢复 payload 页，不再从 child payload context 推断 slot。BOCHK self-trace child 会被 identity watcher 识别。
 - 已解决：stage-1 临时字符串、指针表和 main process RW tail 已清理；self-trace child 中继承的 stage-1 tail 签名会被 host 侧清零。针对 stage-1 RX、tail、veneer 的直接内存扫描未再命中 `frida`、`quickjs`、`rustfrida-loader`、`stage1` 等字符串。
 - 已解决：当前 BOCHK pure-spawn + minimal QuickJS baseline 路径未观察到 `rwxp` VMA。
 - 已解决：`kpm-hide-maps` 1.1.2 已在 BOCHK 设备侧复测，stage-1 RX 和 linker veneer 注册返回 OK；外部读取主进程 `/proc/<pid>/maps` 时未观察到匿名 `r-xp` 或 `rwxp` 行，也未命中 `rustfrida` / `frida` / `libagent` / `wxshadow` / `recompile` 等 RF token。2026-06-26 复测中，KPM-enabled self maps probe 也未再暴露 stage-1 / veneer / RF token 行；KPM 首次命中时将 `vm_area_struct.vm_mm` offset 从 `0x40` 校准到 `0x10`，并在 `exit_mmap` 清理 2 个注册 range。这是 procfs 输出过滤，不是实际 `munmap`。
@@ -267,7 +267,7 @@ BOCHK 的 `noptrace` / WXSHADOW 分阶段探测记录和复测顺序见
 | 类别 | 当前状态 | 验证目标 |
 | --- | --- | --- |
 | 普通 arm64 App | 已在 ColorOS / Android 14 上用 `com.coloros.note` pure spawn 通过 | agent 连接、pre-resume 脚本执行、退出恢复 zygote patch |
-| 多进程 App | 部分覆盖；仍需专门枚举 secondary process | 未匹配 child 通过 restore-only stage-1 恢复 payload 页和 hook 槽，不留下 `libstagefright.so` 尾页覆盖 |
+| 多进程 App | 部分覆盖；仍需专门枚举 secondary process | 未匹配 child 通过 restore-only stage-1 恢复 payload 页；有父 patch 记录时同步恢复 hook 槽，合成 fallback 不再误读 payload context，不留下 `libstagefright.so` 尾页覆盖 |
 | 含 `:remote` / `:push` 的 App | 待专测 | 只消费目标进程 hello，非目标进程恢复后继续运行 |
 | 有 self-ptrace watchdog 的 App | 已用 `com.bochk.app.aos` 覆盖 RF 不 ptrace 目标、BOCHK 自己拉起 self-trace child 的路径 | `TracerPid` 不指向 RF；identity watcher 能识别 self-trace / 伪装 child 并清理继承的 stage-1 tail 签名 |
 | 早期 `JNI_OnLoad` 检测 App | 已用 `com.bochk.app.aos` 验证 pure spawn、minimal QuickJS REPL 和 `RegisterNatives` pre-resume smoke；BOCHK 后续 native hook 检测链路仍在拆分 | native early hook 在 JS/Java/log writer 前安装；stage-1 临时字符串不留在 RW tail |

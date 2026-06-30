@@ -97,6 +97,7 @@ struct RestoreStage1Context {
     capset_got_slot: u64,
     capset_original: u64,
     capset_got_protection: u64,
+    trust_payload_context: u64,
 }
 
 #[repr(C)]
@@ -120,6 +121,8 @@ struct ZygotePatch {
     page_size: u64,
     #[cfg_attr(not(feature = "noptrace"), allow(dead_code))]
     payload_context_offset: u64,
+    #[cfg_attr(not(feature = "noptrace"), allow(dead_code))]
+    trust_payload_context: bool,
     /// payload 的 backing 文件路径和偏移（用于 COW 场景下读取真正的原始数据）
     #[allow(dead_code)]
     payload_path: String,
@@ -647,6 +650,7 @@ fn synthesize_child_restore_cleanup(pid: u32, ppid: u32) -> Result<ZygotePatch, 
         payload_protection: loc.prot,
         page_size,
         payload_context_offset,
+        trust_payload_context: false,
         payload_path: loc.path,
         payload_file_offset: loc.file_offset,
         setargv0_slot: None,
@@ -719,6 +723,7 @@ fn send_restore_stage1(stream: &mut std::os::unix::net::UnixStream, cleanup: &Zy
         payload_protection: cleanup.payload_protection,
         page_size: cleanup.page_size,
         payload_context_offset: cleanup.payload_context_offset,
+        trust_payload_context: if cleanup.trust_payload_context { 1 } else { 0 },
         ..Default::default()
     };
     if let Some((slot, backup)) = cleanup.setargv0_slot {
@@ -801,7 +806,7 @@ fn request_child_side_restore(
             match synthesize_child_restore_cleanup(pid, ppid) {
                 Ok(cleanup) => {
                     log_verbose!(
-                        "已为未匹配子进程 {} 重建 restore cleanup: payload=0x{:x} size={} ctx_off=0x{:x}",
+                        "已为未匹配子进程 {} 重建 payload-only restore cleanup: payload=0x{:x} size={} ctx_off=0x{:x}",
                         pid,
                         cleanup.payload_base,
                         cleanup.payload_backup.len(),
@@ -826,7 +831,7 @@ fn request_child_side_restore(
             drain_until_eof(&mut stream, std::time::Duration::from_millis(100));
             drop(stream);
             log_verbose!(
-                "未匹配子进程 {} restore stage-1 已确认恢复 payload/hook: restored=0x{:x}",
+                "未匹配子进程 {} restore stage-1 已确认恢复: restored=0x{:x}",
                 pid,
                 status.restored
             );
@@ -2583,6 +2588,7 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
         payload_protection: loc.prot,
         page_size: page_size as u64,
         payload_context_offset: ctx_base_in_payload as u64,
+        trust_payload_context: true,
         payload_path: loc.path,
         payload_file_offset: loc.file_offset,
         setargv0_slot,
