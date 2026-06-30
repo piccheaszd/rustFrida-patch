@@ -280,6 +280,7 @@ fn release_hide_maps_state() -> i32 {
 
 static SHOULD_EXIT: AtomicBool = AtomicBool::new(false);
 static SHOULD_DETACH: AtomicBool = AtomicBool::new(false);
+static KPM_RELEASE_ON_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static SPAWN_RESUME_FLAG: AtomicU64 = AtomicU64::new(0);
 static STAGE1_BASE: AtomicU64 = AtomicU64::new(0);
 static STAGE1_SIZE: AtomicU64 = AtomicU64::new(0);
@@ -481,6 +482,14 @@ pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
     trace_entry_raw(ctrl_fd, b"[agent-trace] 34 command-loop-exit\n");
     if SHOULD_EXIT.load(Ordering::Relaxed) {
         log_msg_sync("收到 shutdown，开始退出清理\n".to_string());
+        if KPM_RELEASE_ON_SHUTDOWN.swap(false, Ordering::AcqRel) {
+            let anti_detect_rc = release_anti_detect_state();
+            let hide_maps_rc = release_hide_maps_state();
+            log_msg_sync(format!(
+                "kpm-release-on-shutdown anti-detect={} hide-maps={}\n",
+                anti_detect_rc, hide_maps_rc
+            ));
+        }
     } else if SHOULD_DETACH.load(Ordering::Relaxed) {
         log_msg_sync("收到 detach，跳过目标进程内清理，准备关闭 socket\n".to_string());
     }
@@ -1308,6 +1317,13 @@ fn process_cmd(command: &str) {
         }
         // shutdown — 先完整清理并输出日志，最后由 agent 主动关闭 socket
         Some("shutdown") => {
+            if command
+                .split_whitespace()
+                .skip(1)
+                .any(|arg| matches!(arg, "kpm-release" | "--kpm-release"))
+            {
+                KPM_RELEASE_ON_SHUTDOWN.store(true, Ordering::Release);
+            }
             SHOULD_EXIT.store(true, Ordering::Relaxed);
         }
         Some("detach") => {

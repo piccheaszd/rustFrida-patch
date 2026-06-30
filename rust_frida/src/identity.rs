@@ -35,6 +35,24 @@ struct ProcIdentity {
     maps_hint: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdentityClass {
+    Target,
+    TargetAlias,
+    SelfTraceChild,
+    UnmatchedChild,
+    ForeignProcess,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct UidProcess {
+    pub(crate) pid: i32,
+    pub(crate) ppid: i32,
+    pub(crate) uid: i32,
+    pub(crate) status_name: String,
+    pub(crate) cmdline_display: String,
+}
+
 pub(crate) fn audit_target(stage: &str, pid: i32, spec: &SpawnIdentitySpec) {
     let Some(info) = sample_process(pid, Some(&spec.package), true) else {
         log_warn!("进程身份审计({}): pid={} 已不存在", stage, pid);
@@ -52,19 +70,51 @@ pub(crate) fn audit_target(stage: &str, pid: i32, spec: &SpawnIdentitySpec) {
         info.uid
     );
 
-    if !is_expected_process(&info.cmdline_first, spec) {
-        log_warn!(
-            "检测到目标进程身份伪装({}): pid={} zygote-name={} cmdline={} status.Name={} ppid={} uid={}{}",
-            stage,
-            pid,
-            spec.expected_process,
-            printable(&info.cmdline_display),
-            printable(&info.status_name),
-            info.ppid,
-            info.uid,
-            maps_suffix(&info)
-        );
+    match classify_target_identity(&info, spec) {
+        IdentityClass::Target => {}
+        IdentityClass::TargetAlias => log_identity_alias(stage, &info, spec, IdentityClass::TargetAlias),
+        other => log_identity_mismatch(stage, &info, spec, other),
     }
+}
+
+pub(crate) fn process_uid(pid: i32) -> Option<i32> {
+    sample_process(pid, None, false).map(|info| info.uid)
+}
+
+pub(crate) fn collect_uid_processes(uid: i32) -> Vec<UidProcess> {
+    if uid < 0 {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    for pid in list_pids() {
+        let Some(info) = sample_process(pid, None, false) else {
+            continue;
+        };
+        if info.uid != uid {
+            continue;
+        }
+        out.push(UidProcess {
+            pid: info.pid,
+            ppid: info.ppid,
+            uid: info.uid,
+            status_name: info.status_name,
+            cmdline_display: info.cmdline_display,
+        });
+    }
+    out.sort_by_key(|p| p.pid);
+    out
+}
+
+pub(crate) fn describe_uid_process(process: &UidProcess) -> String {
+    format!(
+        "pid={} ppid={} uid={} cmdline={} status.Name={}",
+        process.pid,
+        process.ppid,
+        process.uid,
+        printable(&process.cmdline_display),
+        printable(&process.status_name)
+    )
 }
 
 pub(crate) fn start_spawn_identity_watcher(target_pid: i32, spec: SpawnIdentitySpec) {
@@ -102,68 +152,24 @@ fn watch_spawn_identity(target_pid: i32, spec: SpawnIdentitySpec, duration: Dura
                 continue;
             };
 
-            let is_target_pid = pid == target_pid;
-            let same_uid = target_uid == Some(cheap.uid);
-            let direct_child = cheap.ppid == target_pid;
-            if !is_target_pid && !same_uid && !direct_child {
+            if !should_watch_process(pid, &cheap, target_pid, target_uid) {
                 continue;
             }
 
-            let needs_maps = is_target_pid || same_uid || direct_child;
-            let info = if needs_maps {
-                sample_process(pid, Some(&spec.package), true).unwrap_or(cheap)
-            } else {
-                cheap
-            };
-
-            if is_target_pid && !is_expected_process(&info.cmdline_first, &spec) {
-                if seen.insert((pid, "target-spoof")) {
-                    log_warn!(
-                        "检测到目标进程 cmdline 伪装: pid={} tgid={} expected={} cmdline={} status.Name={}{}",
-                        info.pid,
-                        info.tgid,
-                        spec.expected_process,
-                        printable(&info.cmdline_display),
-                        printable(&info.status_name),
-                        maps_suffix(&info)
-                    );
-                }
+            let info = sample_process(pid, Some(&spec.package), true).unwrap_or(cheap);
+            if should_skip_expected_process(pid, &info, target_pid, &spec) {
                 continue;
             }
 
-            if pid == target_pid || is_target_family_name(&info.cmdline_first, &spec.package) {
+            let class = classify_watched_process(&info, &spec, target_pid, target_uid);
+            if class == IdentityClass::Target {
                 continue;
             }
-
-            if direct_child {
-                if seen.insert((pid, "spoof-child")) {
+            if seen.insert((pid, seen_key(class))) {
+                if should_scrub_class(class) {
                     scrubbed_inherited_stage1_tail(pid);
-                    log_warn!(
-                        "检测到疑似伪装 child: pid={} tgid={} ppid={} uid={} cmdline={} status.Name={} tracer={}{}",
-                        info.pid,
-                        info.tgid,
-                        info.ppid,
-                        info.uid,
-                        printable(&info.cmdline_display),
-                        printable(&info.status_name),
-                        info.tracer_pid,
-                        maps_suffix(&info)
-                    );
                 }
-            } else if same_uid && info.maps_has_package {
-                if seen.insert((pid, "package-maps-spoof")) {
-                    scrubbed_inherited_stage1_tail(pid);
-                    log_warn!(
-                        "检测到同 UID 伪装进程归属: pid={} tgid={} uid={} cmdline={} status.Name={} maps 包含 {}{}",
-                        info.pid,
-                        info.tgid,
-                        info.uid,
-                        printable(&info.cmdline_display),
-                        printable(&info.status_name),
-                        spec.package,
-                        maps_suffix(&info)
-                    );
-                }
+                log_classified_identity(watched_stage_name(class), &info, &spec, class);
             }
         }
 
@@ -214,6 +220,126 @@ fn scrub_inherited_stage1_tail(pid: i32) -> Result<usize, String> {
     }
 
     Ok(scrubbed)
+}
+
+fn classify_target_identity(info: &ProcIdentity, spec: &SpawnIdentitySpec) -> IdentityClass {
+    if is_expected_process(&info.cmdline_first, spec) {
+        IdentityClass::Target
+    } else if info.uid >= 10000 {
+        /*
+         * This PID was delivered by the current zygote hello/session.  Hardened
+         * apps such as BOCHK may rename it to a system-looking package; that is
+         * an alias for this target session, not proof that RF attached to the
+         * observed package name.
+         */
+        IdentityClass::TargetAlias
+    } else {
+        IdentityClass::ForeignProcess
+    }
+}
+
+fn classify_watched_process(
+    info: &ProcIdentity,
+    spec: &SpawnIdentitySpec,
+    target_pid: i32,
+    target_uid: Option<i32>,
+) -> IdentityClass {
+    let same_uid = target_uid == Some(info.uid);
+    let direct_child = info.ppid == target_pid;
+
+    if info.pid == target_pid {
+        return classify_target_identity(info, spec);
+    }
+    if same_uid && direct_child {
+        return IdentityClass::SelfTraceChild;
+    }
+    if same_uid && (info.maps_has_package || is_target_family_name(&info.cmdline_first, &spec.package)) {
+        return IdentityClass::TargetAlias;
+    }
+    if same_uid {
+        return IdentityClass::TargetAlias;
+    }
+    if direct_child {
+        return IdentityClass::UnmatchedChild;
+    }
+    IdentityClass::ForeignProcess
+}
+
+fn should_watch_process(pid: i32, info: &ProcIdentity, target_pid: i32, target_uid: Option<i32>) -> bool {
+    pid == target_pid || target_uid == Some(info.uid) || info.ppid == target_pid
+}
+
+fn should_skip_expected_process(pid: i32, info: &ProcIdentity, target_pid: i32, spec: &SpawnIdentitySpec) -> bool {
+    pid != target_pid && is_target_family_name(&info.cmdline_first, &spec.package)
+}
+
+fn seen_key(class: IdentityClass) -> &'static str {
+    match class {
+        IdentityClass::Target => "target",
+        IdentityClass::TargetAlias => "target-alias",
+        IdentityClass::SelfTraceChild => "self-trace-child",
+        IdentityClass::UnmatchedChild => "unmatched-child",
+        IdentityClass::ForeignProcess => "foreign-process",
+    }
+}
+
+fn watched_stage_name(class: IdentityClass) -> &'static str {
+    match class {
+        IdentityClass::Target => "watch-target",
+        IdentityClass::TargetAlias => "watch-target-alias",
+        IdentityClass::SelfTraceChild => "watch-self-trace-child",
+        IdentityClass::UnmatchedChild => "watch-unmatched-child",
+        IdentityClass::ForeignProcess => "watch-foreign-process",
+    }
+}
+
+fn should_scrub_class(class: IdentityClass) -> bool {
+    matches!(
+        class,
+        IdentityClass::TargetAlias | IdentityClass::SelfTraceChild | IdentityClass::UnmatchedChild
+    )
+}
+
+fn log_classified_identity(stage: &str, info: &ProcIdentity, spec: &SpawnIdentitySpec, class: IdentityClass) {
+    if matches!(class, IdentityClass::TargetAlias | IdentityClass::SelfTraceChild) {
+        log_identity_alias(stage, info, spec, class);
+    } else {
+        log_identity_mismatch(stage, info, spec, class);
+    }
+}
+
+fn log_identity_alias(stage: &str, info: &ProcIdentity, spec: &SpawnIdentitySpec, class: IdentityClass) {
+    log_info!(
+        "identity_alias({}): class={:?} pid={} tgid={} ppid={} uid={} requested={} observed_cmdline={} status.Name={} tracer={}{}",
+        stage,
+        class,
+        info.pid,
+        info.tgid,
+        info.ppid,
+        info.uid,
+        spec.package,
+        printable(&info.cmdline_display),
+        printable(&info.status_name),
+        info.tracer_pid,
+        maps_suffix(info)
+    );
+}
+
+fn log_identity_mismatch(stage: &str, info: &ProcIdentity, spec: &SpawnIdentitySpec, class: IdentityClass) {
+    log_warn!(
+        "identity_mismatch({}): class={:?} pid={} tgid={} ppid={} uid={} requested={} observed_cmdline={} status.Name={} tracer={}{}",
+        stage,
+        class,
+        info.pid,
+        info.tgid,
+        info.ppid,
+        info.uid,
+        spec.package,
+        printable(&info.cmdline_display),
+        printable(&info.status_name),
+        info.tracer_pid,
+        maps_suffix(info)
+    );
 }
 
 fn parse_map_range(line: &str) -> Option<(u64, u64, &str)> {

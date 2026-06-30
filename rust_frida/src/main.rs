@@ -164,6 +164,12 @@ fn force_stop_after_exit_enabled() -> bool {
     env_flag("RF_FORCE_STOP_AFTER_EXIT")
 }
 
+fn kill_spawn_uid_residuals_enabled() -> bool {
+    std::env::var("RF_KILL_SPAWN_UID_RESIDUALS")
+        .map(|value| !env_value_disabled(&value))
+        .unwrap_or(false)
+}
+
 fn extra_force_stop_packages() -> Vec<String> {
     std::env::var("RF_FORCE_STOP_EXTRA_PACKAGES")
         .ok()
@@ -176,6 +182,28 @@ fn extra_force_stop_packages() -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn package_uid(package: &str) -> Option<i32> {
+    if package.trim().is_empty() {
+        return None;
+    }
+    let output = std::process::Command::new("cmd")
+        .args(["package", "list", "packages", "-U", package])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.lines().find_map(|line| {
+        if !line.starts_with(&format!("package:{} ", package)) {
+            return None;
+        }
+        line.split_whitespace()
+            .find_map(|field| field.strip_prefix("uid:"))
+            .and_then(|uid| uid.parse::<i32>().ok())
+    })
 }
 
 fn force_stop_package(package: &str, reason: &str) {
@@ -199,17 +227,96 @@ fn force_stop_package(package: &str, reason: &str) {
     }
 }
 
-fn force_stop_spawn_targets_after_exit(package: Option<&str>) {
+fn log_uid_processes(label: &str, uid: Option<i32>) {
+    let Some(uid) = uid else {
+        return;
+    };
+    let processes = identity::collect_uid_processes(uid);
+    if processes.is_empty() {
+        log_info!("{}: no residual process for uid={}", label, uid);
+        return;
+    }
+    for process in processes {
+        log_warn!("{}: residual {}", label, identity::describe_uid_process(&process));
+    }
+}
+
+fn process_exists(pid: i32) -> bool {
+    std::path::Path::new(&format!("/proc/{}", pid)).exists()
+}
+
+fn kill_pid(pid: i32, signal: libc::c_int, label: &str) {
+    if pid <= 0 {
+        return;
+    }
+    let rc = unsafe { libc::kill(pid, signal) };
+    if rc == 0 {
+        log_warn!("{}: sent signal {} to pid={}", label, signal, pid);
+    } else {
+        log_warn!(
+            "{}: kill({}, {}) failed: {}",
+            label,
+            pid,
+            signal,
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+fn cleanup_spawn_uid_residuals(uid: Option<i32>) {
+    let Some(uid) = uid else {
+        return;
+    };
+    if uid < 10000 {
+        log_warn!(
+            "RF_FORCE_STOP_AFTER_EXIT: skip UID residual cleanup for non-app uid={}",
+            uid
+        );
+        return;
+    }
+
+    let processes = identity::collect_uid_processes(uid);
+    if processes.is_empty() {
+        log_info!("RF_FORCE_STOP_AFTER_EXIT: no UID residual after force-stop uid={}", uid);
+        return;
+    }
+
+    for process in &processes {
+        log_warn!(
+            "RF_FORCE_STOP_AFTER_EXIT: spawn-owned alias/residual after force-stop: {}",
+            identity::describe_uid_process(process)
+        );
+    }
+    if !kill_spawn_uid_residuals_enabled() {
+        log_warn!("RF_KILL_SPAWN_UID_RESIDUALS 未显式启用，保留上述同 UID 残留进程");
+        return;
+    }
+
+    for process in &processes {
+        kill_pid(process.pid, libc::SIGTERM, "RF_FORCE_STOP_AFTER_EXIT");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    for process in processes {
+        if process_exists(process.pid) {
+            kill_pid(process.pid, libc::SIGKILL, "RF_FORCE_STOP_AFTER_EXIT");
+        }
+    }
+}
+
+fn force_stop_spawn_targets_after_exit(package: Option<&str>, owner_uid: Option<i32>) {
     if !force_stop_after_exit_enabled() {
         return;
     }
 
+    log_uid_processes("RF_FORCE_STOP_AFTER_EXIT before package stop", owner_uid);
     if let Some(package) = package {
         force_stop_package(package, "RF_FORCE_STOP_AFTER_EXIT");
     }
     for package in extra_force_stop_packages() {
         force_stop_package(&package, "RF_FORCE_STOP_EXTRA_PACKAGES");
     }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    cleanup_spawn_uid_residuals(owner_uid);
 }
 
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -625,6 +732,9 @@ fn main() {
         }
     }
     let sender = session.get_sender().unwrap();
+    let spawn_owner_uid = target_pid
+        .and_then(identity::process_uid)
+        .or_else(|| args.spawn.as_deref().and_then(package_uid));
 
     if let (Some(pid), Some(spec)) = (target_pid, spawn_identity.as_ref()) {
         identity::audit_target("agent-connected", pid, spec);
@@ -760,17 +870,19 @@ fn main() {
     let send_shutdown = |s: &Session| {
         if let Some(sender) = s.get_sender() {
             s.shutdown_requested.store(true, Ordering::Release);
-            if should_release_kpm_on_shutdown() {
-                if let Err(e) = send_command(sender, "kpm-release") {
-                    log_error!("发送 KPM release 失败: {}", e);
-                } else {
-                    log_info!("已请求释放当前进程 KPM profile/range");
-                }
-            }
-            if let Err(e) = send_command(sender, "shutdown") {
+            let command = if should_release_kpm_on_shutdown() {
+                "shutdown kpm-release"
+            } else {
+                "shutdown"
+            };
+            if let Err(e) = send_command(sender, command) {
                 log_error!("发送 shutdown 失败: {}", e);
             } else {
-                log_info!("已发送 shutdown，等待 agent 主动断开连接...");
+                if should_release_kpm_on_shutdown() {
+                    log_info!("已发送 shutdown，agent 将释放当前进程 KPM profile/range 后主动断开连接...");
+                } else {
+                    log_info!("已发送 shutdown，等待 agent 主动断开连接...");
+                }
             }
         }
     };
@@ -938,5 +1050,5 @@ fn main() {
     if args.spawn.is_some() {
         spawn::cleanup_zygote_patches();
     }
-    force_stop_spawn_targets_after_exit(args.spawn.as_deref());
+    force_stop_spawn_targets_after_exit(args.spawn.as_deref(), spawn_owner_uid);
 }
